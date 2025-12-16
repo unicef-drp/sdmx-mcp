@@ -36,7 +36,7 @@ def _structure_url(flow_ref: str) -> str:
     # Practical approach: fetch dataflow with references=all to pull back related structures (DSD, codelists).
     # UNICEF documentation describes this approach. :contentReference[oaicite:5]{index=5}
     # flow_ref should typically look like: AGENCY:FLOW_ID(VERSION) or similar; keep it simple early.
-    return f"{BASE}/dataflow/{_encode_flow_path(flow_ref)}/?format=sdmx-json&detail=full&references=all"
+    return f"{BASE}/dataflow/{_flow_path_for(flow_ref)}/?format=sdmx-json&detail=full&references=all"
 
 
 def _encode_flow_path(flow_ref: str) -> str:
@@ -85,9 +85,49 @@ def _extract_dataflows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return flows
 
 
-def _flow_ref_for(df_id: str, version: str | None = None) -> str:
+def _flow_ref_for(df_id: str, version: str | None = None, agency: str | None = None) -> str:
     version = version or "latest"
-    return f"all/{df_id}/{version}"
+    agency = agency or "all"
+    return f"{agency}/{df_id}/{version}"
+
+
+def _flow_identifiers(flow_ref: str) -> tuple[str, str, str]:
+    text = (flow_ref or "").strip()
+    if not text:
+        raise ValueError("flowRef must not be empty.")
+
+    agency = ""
+    df_id = ""
+    version = ""
+
+    def _parts_from_delimiter(value: str, delimiter: str) -> tuple[str, str, str]:
+        bits = [segment.strip() for segment in value.split(delimiter) if segment.strip()]
+        parsed_agency = bits[0] if bits else ""
+        parsed_id = bits[1] if len(bits) > 1 else ""
+        parsed_version = bits[2] if len(bits) > 2 else ""
+        return parsed_agency, parsed_id, parsed_version
+
+    if "," in text:
+        agency, df_id, version = _parts_from_delimiter(text, ",")
+    elif "/" in text:
+        agency, df_id, version = _parts_from_delimiter(text, "/")
+    elif ":" in text:
+        agency, remainder = text.split(":", 1)
+        remainder = remainder.strip()
+        if "(" in remainder and remainder.endswith(")"):
+            df_id = remainder[: remainder.index("(")].strip()
+            version = remainder[remainder.index("(") + 1 : -1].strip()
+        else:
+            df_id = remainder
+    else:
+        df_id = text
+
+    if not df_id:
+        raise ValueError("flowRef must include a dataflow id.")
+
+    agency = agency or "all"
+    version = version or "latest"
+    return agency, df_id, version
 
 
 def _flow_path_for(flow_ref: str) -> str:
@@ -96,12 +136,15 @@ def _flow_path_for(flow_ref: str) -> str:
     - Accepts bare flow ids (e.g. "BRAZIL_CO") and expands to all/{id}/latest.
     - Leaves explicit paths (with '/') untouched.
     """
-    normalized = flow_ref.strip().strip("/")
-    if not normalized:
-        raise ValueError("flowRef must not be empty.")
-    if "/" not in normalized:
-        normalized = _flow_ref_for(normalized)
-    return _encode_flow_path(normalized)
+    agency, df_id, version = _flow_identifiers(flow_ref)
+    path = "/".join(part for part in (agency, df_id, version) if part)
+    return _encode_flow_path(path)
+
+
+def _data_path_for(flow_ref: str) -> str:
+    agency, df_id, version = _flow_identifiers(flow_ref)
+    ident = ",".join(part for part in (agency, df_id, version) if part)
+    return quote(ident, safe=",")
 
 
 def _extract_data_structures(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -222,6 +265,7 @@ async def search_dataflows(query: str, limit: int = 10) -> list[dict[str, Any]]:
         df_id = df.get("id") or df.get("ID")
         if not isinstance(df_id, str):
             continue
+        agency = df.get("agencyID") or df.get("agencyId") or "all"
         name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
         desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
         text = f"{df_id} {name} {desc}".lower()
@@ -230,9 +274,10 @@ async def search_dataflows(query: str, limit: int = 10) -> list[dict[str, Any]]:
         matches.append(
             {
                 "id": df_id,
+                "agencyID": agency,
                 "name": name,
                 "description": desc,
-                "flowRef": _flow_ref_for(df_id, df.get("version")),
+                "flowRef": _flow_ref_for(df_id, df.get("version"), agency),
             }
         )
         if len(matches) >= limit:
@@ -297,7 +342,7 @@ async def query_data(
         raise ValueError("Provide either a key or filters to identify the data slice.")
 
     # Standard SDMX pattern: /data/{flowRef}/{key}?startPeriod=...&endPeriod=...&format=...
-    flow_path = _flow_path_for(flowRef)
+    flow_path = _data_path_for(flowRef)
     url = (
         f"{BASE}/data/{flow_path}/{quote(key)}"
         f"?startPeriod={quote(startPeriod)}&endPeriod={quote(endPeriod)}&format={quote(format)}"
