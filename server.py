@@ -12,7 +12,8 @@ logging.basicConfig(level=logging.INFO)
 
 BASE = "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest"
 
-mcp = FastMCP("unicef-sdmx", json_response=True)
+# Bind to all interfaces so DNS rebinding protection isn't auto-enabled for localhost-only hosts.
+mcp = FastMCP("unicef-sdmx", json_response=True, host="0.0.0.0")
 
 # Small caches to keep things fast and reduce load.
 _dataflow_cache = TTLCache(maxsize=1, ttl=60 * 60 * 6)  # 6h
