@@ -1,2 +1,3 @@
-{"question":"Show me latest child marriage rates in South Asia","agency":"UNICEF","filters":{"REF_AREA":"AFG,IND,NPL,PAK,BGD,LKA,BTN,MDV","INDICATOR":"PT_CM","SEX":"T"},"lastNObservations":3,"format":"csv"}
-{"question":"Give me nutrition indicators for Kenya over the last 5 years","agency":"UNICEF","filters":{"REF_AREA":"KEN","INDICATOR":"NUTRITION"},"startPeriod":"2020","endPeriod":"2025","format":"csv"}
+{"question":"Show me the latest under-five mortality rate in South Asia, with a country table and a short narrative summary.","agency":"UNICEF","lastNObservations":3,"format":"csv"}
+{"question":"Show me the latest stunting and wasting prevalence for children under 5 in South Asia, side-by-side by country.","agency":"UNICEF","lastNObservations":3,"format":"csv"}
+{"question":"Compare immunization coverage and under-five mortality in South Asia for the latest available year, and explain the pattern in plain language.","agency":"UNICEF","lastNObservations":3,"format":"csv"}

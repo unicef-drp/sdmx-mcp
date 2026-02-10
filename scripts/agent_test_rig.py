@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,13 @@ import server
 REGION_REF_AREA = {
     "south asia": "AFG,IND,NPL,PAK,BGD,LKA,BTN,MDV",
 }
+
+FLOW_KEYWORDS = [
+    ("child mortality", ["CME", "MORTALITY"]),
+    ("mortality", ["CME", "MORTALITY"]),
+    ("child marriage", ["PT_CM", "CHILD MARRIAGE"]),
+    ("marriage", ["PT_CM", "CHILD MARRIAGE"]),
+]
 
 
 def _load_json(value: str | None) -> dict[str, Any]:
@@ -49,6 +57,13 @@ def _log(verbose: bool, message: str) -> None:
         print(message, file=sys.stderr)
 
 
+def _slugify(text: str, max_len: int = 64) -> str:
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "").strip().lower()).strip("-")
+    if not value:
+        value = "case"
+    return value[:max_len].rstrip("-")
+
+
 def _infer_ref_area(question: str) -> str | None:
     text = (question or "").lower()
     for key, value in REGION_REF_AREA.items():
@@ -57,7 +72,65 @@ def _infer_ref_area(question: str) -> str | None:
     return None
 
 
-async def _run_case(case: dict[str, Any], verbose: bool = False) -> dict[str, Any]:
+async def _default_dimension_code(
+    flow_ref: str,
+    dimension: str,
+    queries: list[str],
+    verbose: bool,
+) -> str | None:
+    for query in queries:
+        try:
+            codes = await server.list_codes(flowRef=flow_ref, dimension=dimension, query=query, limit=5)
+        except Exception:
+            continue
+        if codes:
+            code_id = codes[0].get("id")
+            if isinstance(code_id, str) and code_id:
+                _log(verbose, f"Defaulted {dimension}={code_id} based on codelist match for '{query}'.")
+                return code_id
+    return None
+
+
+def _flow_score(question: str, flow: dict[str, Any]) -> int:
+    text = f"{flow.get('id','')} {flow.get('name','')} {flow.get('description','')}".upper()
+    score = 0
+    q = (question or "").lower()
+    for phrase, tokens in FLOW_KEYWORDS:
+        if phrase in q:
+            for token in tokens:
+                if token in text:
+                    score += 5
+    if flow.get("agencyID") == "UNICEF":
+        score += 2
+    if "DRAFT" in text:
+        score -= 5
+    return score
+
+
+def _select_flow_from_search(question: str, search: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not search:
+        return None
+    scored = sorted(search, key=lambda item: _flow_score(question, item), reverse=True)
+    return scored[0]
+
+
+def _filter_flows_by_agency(search: list[dict[str, Any]], agency: str | None) -> list[dict[str, Any]]:
+    if not agency:
+        return search
+    filtered = [item for item in search if item.get("agencyID") == agency]
+    return filtered if filtered else search
+
+
+def _missing_dimensions(dimensions: list[dict[str, Any]], filters: dict[str, Any]) -> list[str]:
+    wanted = []
+    for dim in dimensions:
+        dim_id = dim.get("id")
+        if isinstance(dim_id, str) and dim_id not in filters:
+            wanted.append(dim_id)
+    return wanted
+
+
+async def _run_case(case: dict[str, Any], verbose: bool = False, journey: bool = False) -> dict[str, Any]:
     question = case.get("question", "").strip()
     if not question:
         raise ValueError("Each case needs a non-empty 'question'.")
@@ -69,6 +142,7 @@ async def _run_case(case: dict[str, Any], verbose: bool = False) -> dict[str, An
 
     top_flows = int(case.get("top_flows", 8))
     search = await server.search_dataflows(query=question, limit=top_flows)
+    search = _filter_flows_by_agency(search, agency)
     grouped = await server.list_dataflows_grouped(
         query=question,
         limitPerTheme=int(case.get("limit_per_theme", 10)),
@@ -77,16 +151,10 @@ async def _run_case(case: dict[str, Any], verbose: bool = False) -> dict[str, An
     flow_ref = case.get("flowRef")
     filters = case.get("filters") or {}
     if not flow_ref and search:
-        # prefer non-draft flows
-        candidates = [
-            item
-            for item in search
-            if "DRAFT" not in str(item.get("id", "")).upper()
-            and "DRAFT" not in str(item.get("agencyID", "")).upper()
-        ]
-        pick = candidates[0] if candidates else search[0]
-        flow_ref = pick.get("flowRef")
-        _log(verbose, f"Selected dataflow: {pick.get('id')} ({flow_ref})")
+        pick = _select_flow_from_search(question, search)
+        if pick:
+            flow_ref = pick.get("flowRef")
+            _log(verbose, f"Selected dataflow: {pick.get('id')} ({flow_ref})")
     indicator_value = None
     if isinstance(filters, dict):
         indicator_value = filters.get("INDICATOR")
@@ -114,21 +182,48 @@ async def _run_case(case: dict[str, Any], verbose: bool = False) -> dict[str, An
         dimensions = await server.list_dimensions(flowRef=flow_ref)
 
         resolved_filters = dict(filters) if isinstance(filters, dict) else {}
-        if "REF_AREA" not in resolved_filters:
-            inferred = _infer_ref_area(question)
-            if inferred:
-                resolved_filters["REF_AREA"] = inferred
-                _log(verbose, f"Inferred REF_AREA={inferred} from question.")
-        if "SEX" not in resolved_filters:
-            resolved_filters["SEX"] = "T"
-            _log(verbose, "Defaulted SEX=T.")
-        if not case.get("lastNObservations") and not (case.get("startPeriod") and case.get("endPeriod")):
-            case["lastNObservations"] = 3
-            _log(verbose, "Defaulted lastNObservations=3.")
+        if journey:
+            if "REF_AREA" not in resolved_filters:
+                inferred = _infer_ref_area(question)
+                if inferred:
+                    resolved_filters["REF_AREA"] = inferred
+                    _log(verbose, f"Inferred REF_AREA={inferred} from question.")
+            if "SEX" not in resolved_filters:
+                default_sex = await _default_dimension_code(
+                    flow_ref,
+                    "SEX",
+                    ["total", "both", "all", "total sex", "both sexes"],
+                    verbose,
+                )
+                if default_sex:
+                    resolved_filters["SEX"] = default_sex
+            if not case.get("lastNObservations") and not (case.get("startPeriod") and case.get("endPeriod")):
+                case["lastNObservations"] = 3
+                _log(verbose, "Defaulted lastNObservations=3.")
+            missing = _missing_dimensions(dimensions, resolved_filters)
+            if missing:
+                _log(verbose, f"Missing dimensions (left blank): {', '.join(missing)}")
 
         if resolved_filters and (case.get("lastNObservations") or (case.get("startPeriod") and case.get("endPeriod"))):
-            resolved_filters = dict(filters)
             indicator_value = resolved_filters.get("INDICATOR")
+            # Primary candidate ranking from question text in journey mode.
+            if journey and question:
+                try:
+                    ranked = await server.find_indicator_candidates(
+                        flowRef=flow_ref,
+                        query=question,
+                        limit=10,
+                    )
+                    ranked_ids = [
+                        item.get("id")
+                        for item in ranked
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    indicator_candidates.extend(
+                        [code for code in ranked_ids if code not in indicator_candidates]
+                    )
+                except Exception:
+                    pass
             if isinstance(indicator_value, str):
                 indicator_token = indicator_value.replace("+", ",").split(",")[0].strip()
                 if indicator_token:
@@ -186,8 +281,8 @@ async def _run_case(case: dict[str, Any], verbose: bool = False) -> dict[str, An
                     pass
             if not indicator_candidates:
                 indicator_candidates.append("")
-            try:
-                for candidate in indicator_candidates:
+            for candidate in indicator_candidates:
+                try:
                     if candidate:
                         resolved_filters["INDICATOR"] = candidate
                         _log(verbose, f"Trying INDICATOR={candidate}...")
@@ -225,8 +320,17 @@ async def _run_case(case: dict[str, Any], verbose: bool = False) -> dict[str, An
                             continue
                     indicator_attempts.append({"indicator": candidate, "status": "ok"})
                     break
-            except Exception as exc:
-                data_error = f"{type(exc).__name__}: {exc}"
+                except Exception as exc:
+                    indicator_attempts.append(
+                        {"indicator": candidate, "status": "error", "message": f"{type(exc).__name__}: {exc}"}
+                    )
+                    if verbose:
+                        print(
+                            f"Error for indicator '{candidate}' ({type(exc).__name__}). Moving to next match.",
+                            file=sys.stderr,
+                        )
+                    data_error = f"{type(exc).__name__}: {exc}"
+                    continue
 
     return {
         "question": question,
@@ -264,11 +368,21 @@ async def _run(args: argparse.Namespace) -> None:
             }
         ]
 
+    output_dir = Path(args.save_output_dir) if args.save_output_dir else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
     for i, case in enumerate(cases, start=1):
-        result = await _run_case(case, verbose=args.verbose)
+        result = await _run_case(case, verbose=args.verbose, journey=args.journey)
         if len(cases) > 1:
             print(f"# case {i}")
         print(json.dumps(result, indent=2))
+        if output_dir:
+            question = case.get("question") if isinstance(case, dict) else None
+            slug = _slugify(str(question) if question else f"case-{i}")
+            out_path = output_dir / f"{i:02d}-{slug}.json"
+            out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            _log(args.verbose, f"Saved output to {out_path}")
 
 
 def main() -> None:
@@ -298,6 +412,15 @@ def main() -> None:
         "--verbose",
         action="store_true",
         help="Print progress when iterating through indicator matches.",
+    )
+    parser.add_argument(
+        "--journey",
+        action="store_true",
+        help="Use agentic journey defaults: infer REF_AREA, choose flow from question, rank indicators by question.",
+    )
+    parser.add_argument(
+        "--save-output-dir",
+        help="Optional directory to save one JSON result file per case.",
     )
     args = parser.parse_args()
     asyncio.run(_run(args))

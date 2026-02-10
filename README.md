@@ -1,121 +1,208 @@
 # UNICEF SDMX MCP
 
-This repository hosts a [FastMCP](https://github.com/modelcontextprotocol/servers/tree/main/python/fastmcp) server that exposes UNICEF’s SDMX data service. The server can be run locally with `uv`, containerized with Docker, or deployed to Fly.io.
+MCP server for the UNICEF SDMX warehouse (`https://sdmx.data.unicef.org/ws/public/sdmxapi/rest`) built with FastMCP.
 
-## 1. Test locally
+This project lets an LLM client do a full guided data journey:
+- pick agency
+- discover/select dataflow
+- inspect dimensions and codelists
+- rank candidate indicators
+- query data (CSV or SDMX-JSON)
 
-```
+## What This Repo Contains
+
+- `server.py`: MCP tools and SDMX integration logic.
+- `scripts/agent_test_rig.py`: direct tool-call harness that simulates an agent workflow.
+- `scripts/agent_test_scenarios.example.jsonl`: regression/demo scenarios.
+- `scripts/list_theme_prefixes.py`: helper to inspect dataflow ID prefixes.
+- `theme_prefixes_domain.csv`: curated prefix-to-domain mapping used for grouping.
+
+## Local Run
+
+```bash
 git clone https://github.com/<you>/sdmx_mcp.git
 cd sdmx_mcp
-rm -rf .venv .uv-cache __pycache__
 UV_CACHE_DIR="$PWD/.uv-cache" uv sync
 UV_CACHE_DIR="$PWD/.uv-cache" uv run fastmcp run server.py --transport stdio
 ```
 
-Notes:
-- `UV_CACHE_DIR` keeps uv’s cache inside the repo, avoiding macOS permission prompts.
-- The STDIO transport is what MCP-aware clients expect.
+HTTP mode (local):
 
-Manual HTTP test:
+```bash
+UV_CACHE_DIR="$PWD/.uv-cache" uv run fastmcp run server.py --transport streamable-http --host 127.0.0.1 --port 8000 --path /mcp
 ```
-UV_CACHE_DIR="$PWD/.uv-cache" uv run fastmcp run server.py --transport http --host 127.0.0.1 --port 8000 --path /mcp
-curl -X POST http://127.0.0.1:8000/mcp \
+
+Test endpoint:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/mcp \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-## 2. Docker workflow
+## Docker
 
-1. Build the image:
-   ```
-   docker build -t sdmx-mcp:latest .
-   ```
-2. Run locally:
-   ```
-   docker run --rm -p 8000:8000 sdmx-mcp:latest
-   ```
-3. Test:
-   ```
-   curl -X POST http://localhost:8000/mcp \
-     -H "Content-Type: application/json" \
-     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-   ```
+Build and run:
 
-## 3. Deploy to Fly.io
-
+```bash
+docker build -t sdmx-mcp:latest .
+docker run --rm -p 8000:8000 sdmx-mcp:latest
 ```
+
+Container command uses:
+- `fastmcp run server.py --transport streamable-http --path /mcp`
+
+## Fly.io Deploy
+
+```bash
 fly auth login
-fly launch --no-deploy  # already configured via fly.toml
 fly deploy --build-arg UV_CACHE_DIR=/app/.uv-cache
 ```
 
-Runtime expectations:
-- App name: `sdmx-mcp` (see `fly.toml`).
-- Port 8000 exposed via Fly’s `http_service`.
-- FastMCP command: `fastmcp run server.py --transport http --host 0.0.0.0 --port 8000 --path /`.
-
 Sanity check:
-```
-curl -X POST https://sdmx-mcp.fly.dev/mcp \
+
+```bash
+curl -sS --max-time 20 -X POST https://sdmx-mcp.fly.dev/mcp \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-## 4. Test in the FastMCP Inspector
+## MCP Tools (Function Catalog)
 
-Start the Inspector UI (local):
-```
-UV_CACHE_DIR="$PWD/.uv-cache" uv run fastmcp dev server.py --ui-port 3333 --server-port 8000
-```
+All tools are defined in `server.py`.
 
-In the Inspector, set "Server URL" to:
-- Local: `http://127.0.0.1:8000/mcp`
-- Fly: `https://sdmx-mcp.fly.dev/mcp`
+1. `list_agencies(limit=50)`
+- Purpose: list agencies discovered from SDMX dataflows.
+- Returns: `[{id,name,description}]`.
 
-## 5. Agent test rig (direct tool-call harness)
+2. `search_dataflows(query, limit=10)`
+- Purpose: keyword search across dataflow ID/name/description.
+- Returns: scored matches with `flowRef` and `themeHint`.
 
-Use this to exercise an agent-like workflow (agencies -> flows -> dimensions -> data query) without wiring a full LLM loop yet.
+3. `list_dataflows_grouped(query=None, prefixMap=None, limitPerTheme=50)`
+- Purpose: group dataflows by inferred/curated theme prefix.
+- Returns: `[{themeCode,themeLabel,flows:[...]}]`.
 
-Single case:
-```
+4. `get_default_theme_prefix_map()`
+- Purpose: return built-in prefix-to-theme map.
+
+5. `list_theme_prefixes(limit=50)`
+- Purpose: scan dataflows and report common prefixes with counts/examples.
+
+6. `list_theme_prefix_conflicts(limit=100)`
+- Purpose: show prefixes mapping to multiple domains in `theme_prefixes_domain.csv`.
+
+7. `describe_flow(flowRef)`
+- Purpose: summary of a flow plus parsed dimension metadata.
+- Returns: `{id,agencyID,version,name,description,dimensions}`.
+
+8. `list_dimensions(flowRef)`
+- Purpose: ordered dimensions with concept/codelist references.
+
+9. `list_codes(flowRef, dimension, query=None, limit=50)`
+- Purpose: list codes for one dimension, optional text filter.
+
+10. `find_indicator_candidates(flowRef, query, limit=10)`
+- Purpose: rank `INDICATOR` codes by relevance to user text.
+
+11. `get_flow_structure(flowRef)`
+- Purpose: fetch/cache structure payload (`references=all`).
+
+12. `build_key(flowRef, selections)`
+- Purpose: build SDMX key from dimension selections.
+- Notes: supports list/comma syntax for multi-code segments.
+
+13. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', maxObs=50000, filters=None, lastNObservations=None)`
+- Purpose: run data query with bounded extraction guardrails.
+- Key behaviors:
+  - requires either (`startPeriod` + `endPeriod`) or `lastNObservations`
+  - supports `filters` to auto-build key from dimension order
+  - supports `format='csv'` and returns `raw_csv`
+  - parses SDMX XML error payloads into structured `error.message`
+
+## Agent Test Rig
+
+`scripts/agent_test_rig.py` (direct call harness) simulates the intended LLM flow.
+
+Capabilities:
+- selects best flow from question
+- infers `REF_AREA` for South Asia
+- resolves defaults from codelists (no hardcoded code assumptions)
+- ranks indicator candidates
+- iterates indicators until data is found
+- logs attempts verbosely
+- saves per-case JSON outputs
+
+Single run:
+
+```bash
 python scripts/agent_test_rig.py \
-  --question "Show me latest child marriage rates in South Asia" \
+  --question "Show me latest child mortality rates in South Asia" \
   --agency UNICEF \
-  --filters '{"REF_AREA":"AFG,IND,NPL,PAK,BGD,LKA,BTN,MDV","INDICATOR":"PT_CM","SEX":"T"}' \
-  --last-n 3 \
-  --format csv
+  --journey --verbose \
+  --last-n 3 --format csv
 ```
 
-Batch mode with JSONL:
-```
-python scripts/agent_test_rig.py --scenarios scripts/agent_test_scenarios.example.jsonl
+Scenario batch:
+
+```bash
+python scripts/agent_test_rig.py \
+  --scenarios scripts/agent_test_scenarios.example.jsonl \
+  --journey --verbose \
+  --save-output-dir demo_outputs
 ```
 
-Prefix/domain curation helper:
-```
-python scripts/list_theme_prefixes.py --format csv --limit 100 > theme_prefixes.csv
-```
+### Demo Scenarios Included
 
-## 6. MCP client configuration example
+In `scripts/agent_test_scenarios.example.jsonl`:
+- latest under-five mortality in South Asia
+- latest stunting and wasting in South Asia
+- immunization vs mortality comparison in South Asia
 
-`~/.config/mcp/servers/unicef-sdmx.json`:
+## Connector Setup
+
+### Claude (Connector / Integrations)
+
+If Claude supports remote MCP connectors in your plan/UI:
+- add connector URL: `https://sdmx-mcp.fly.dev/mcp`
+- test with a first prompt like: "List UNICEF agencies"
+
+### Claude Desktop (config fallback)
+
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
-  "command": "uv",
-  "args": [
-    "run",
-    "fastmcp",
-    "run",
-    "server.py",
-    "--transport",
-    "stdio"
-  ],
-  "cwd": "/Users/<you>/git/sdmx_mcp",
-  "env": {
-    "UV_CACHE_DIR": "/Users/<you>/git/sdmx_mcp/.uv-cache"
+  "mcpServers": {
+    "unicef-sdmx": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://sdmx-mcp.fly.dev/mcp"]
+    }
   }
 }
 ```
 
-Restart your MCP-compatible client (Claude Desktop, Cursor, etc.) and enable the `unicef-sdmx` server.
+Restart Claude Desktop after editing.
+
+## Troubleshooting
+
+1. `406 Not Acceptable`
+- Cause: client `Accept` header mismatch for endpoint/transport.
+- Check: use `/mcp` and include `Accept: application/json` for JSON-RPC POST tests.
+
+2. `Missing session ID`
+- Some MCP transport/client paths require a full MCP handshake session flow.
+- Validate with `tools/list` via known-good client first.
+
+3. `404 Not Found`
+- Usually wrong path. Use `/mcp` (not `/`).
+
+4. Data query 404 with SDMX message `No data for data query against the dataflow`
+- Query syntax is valid but the selected dimensional slice has no observations.
+- Use `find_indicator_candidates` + iterative attempts in the rig.
+
+## Presentation Notes
+
+For a live demo, use the scenario file plus `--save-output-dir` and keep the saved JSON outputs as known-good artifacts.

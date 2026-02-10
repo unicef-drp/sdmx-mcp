@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 BASE = "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest"
 
 # Bind to all interfaces so DNS rebinding protection isn't auto-enabled for localhost-only hosts.
-mcp = FastMCP("unicef-sdmx", json_response=True, host="0.0.0.0")
+mcp = FastMCP("unicef-sdmx", json_response=True, host="0.0.0.0", stateless_http=True)
 
 # Starter mapping for common flow id prefixes to human-friendly labels.
 FALLBACK_THEME_PREFIX_MAP: dict[str, str] = {
