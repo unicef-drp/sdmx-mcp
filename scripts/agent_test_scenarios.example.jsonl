@@ -1,0 +1,2 @@
+{"question":"Show me latest child marriage rates in South Asia","agency":"UNICEF","filters":{"REF_AREA":"AFG,IND,NPL,PAK,BGD,LKA,BTN,MDV","INDICATOR":"PT_CM","SEX":"T"},"lastNObservations":3,"format":"csv"}
+{"question":"Give me nutrition indicators for Kenya over the last 5 years","agency":"UNICEF","filters":{"REF_AREA":"KEN","INDICATOR":"NUTRITION"},"startPeriod":"2020","endPeriod":"2025","format":"csv"}

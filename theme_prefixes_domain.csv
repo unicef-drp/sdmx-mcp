@@ -1,0 +1,74 @@
+prefix,count,example_id,example_name,domain
+CME,43,CME,Child Mortality,Child Mortality
+CME,43,CME_CAUSE_OF_DEATH,CME Cause of death,Child Mortality
+CME,43,CME_COUNTRY_PROFILES_DATA,CME Country profiles data,Child Mortality
+PT,8,PT,Child Protection,Child Protection
+PT,8,PT_CM,Child Marriage,Child Protection
+PT,8,PT_CM_SUBNATIONAL,Child Marriage - Subnational,Child Protection
+SDG,8,SDG_PROG_ASSESSMENT,SDG Progress assessment,Sustainable development goals
+SDG,8,SDG_CONSULT_2020_1,SDG consultation 2020,Sustainable development goals
+SDG,8,SDG_CONSULT_2021,SDG Consultation 2021,Sustainable development goals
+CRAVE,6,CRAVE_2020_1,CRAVE Consultation 2020,Country Reporting and Validation Exercise
+CRAVE,6,CRAVE_2021,Crave Consultation 2021,Country Reporting and Validation Exercise
+CRAVE,6,CRAVE_2022,Crave Consultation 2022,Country Reporting and Validation Exercise
+CCRI,5,CCRI,Children's  Climate and Environment Risk Index,Children's  Climate and Environment Risk Index
+CCRI,5,CCRI_DRM_KHM,Children's  Climate and Environment Risk Index,Children's  Climate and Environment Risk Index
+CCRI,5,CCRI_DRM_KHM_RAW,Children's  Climate and Environment Risk Index,Children's  Climate and Environment Risk Index
+WASH,5,WASH_HEALTHCARE_FACILITY,WASH Healthcare Facility,"Water, Sanitation, and Hygiene"
+WASH,5,WASH_HOUSEHOLDS,WASH Households,"Water, Sanitation, and Hygiene"
+WASH,5,WASH_HOUSEHOLD_MH,WASH Household Menstrual Health,"Water, Sanitation, and Hygiene"
+DF,4,DF_EAPRO_CROSS_SECTOR,EAPRO Cross Sector Indicators,East Asia Pacific Regional Office
+DF,4,DF_SDG_GLH,SDG Harmonized Global Dataflow,Sustainable development goals
+DF,4,DF_SITREP_COVID19,UNICEF Situation Reports for COVID19,COVID
+EDUCATION,3,EDUCATION,EDU - Access and Completion (HH Survey Data),Education
+EDUCATION,3,EDUCATION_FLS,EDU - Learning and Skills,Education
+EDUCATION,3,EDUCATION_UIS_SDG,EDU - SDG Indicators (UIS Database),Education
+BRAZIL,2,BRAZIL_CO,Brazil Country Office,Brazil Country Office
+BRAZIL,2,BRAZIL_CO_SELO,Brazil SELO,Brazil Country Office
+MALAWI,2,MALAWI_CO,Malawi Country Office,Malawi Country Office
+MALAWI,2,MALAWI_CO_DRAFT,[DRAFT] Malawi CO,Malawi Country Office
+COVID,2,COVID,COVID-19 Baseline Indicators April 2020,COVID
+COVID,2,COVID_CASES,Covid cases and deaths,COVID
+DM,2,DM,Demography,Demography
+DM,2,DM_PROJECTIONS,Projection Demography,Demography
+SOWC,2,SOWC_DATA_SNAPSHOT_2024,SOWC Data snapshot 2024,State of the World's Children
+SOWC,2,SOWC_DATA_SNAPSHOT_2023,SOWC data snapshot 2023,State of the World's Children
+DRAFT,2,DRAFT_ECD,[DRAFT] ECD,Early Childhood Development
+DRAFT,2,DRAFT_HAZARD_EXPOSURE,[DRAFT] Global hazard exposure,Hazards and Vulnerabilities
+UNPD,2,UNPD_DEMOGRAPHY,UNPD Demography,Demography
+UNPD,2,UNPD_DM_PROJECTIONS,Projection Demography data mirrored from UNPD,Demography
+CAP2030,1,CAP2030,CAP 2030,CAP 2030
+CD2030,1,CD2030,Coundown 2030,Coundown 2030
+CDCOV,1,CDCOV,Countdown - coverage indicators,Coundown 2030
+CDDEM,1,CDDEM,Countdown - demographic indicators,Coundown 2030
+CDDRIVER,1,CDDRIVER,Countdown - drivers indicators,Coundown 2030
+CDEQUIPLOT,1,CDEQUIPLOT,Countdown - coverage - equiplot data,Coundown 2030
+CDT2,1,CDT2,Countdown - tier 2 indicators,Coundown 2030
+CONSOLIDATED,1,CONSOLIDATED,CD2030 All,Coundown 2030
+ECACID,1,ECACID,ECA Child Inequity Database,Eastern and Central Europe Regional Office
+TRANSMONEE,1,TRANSMONEE,ECARO for TransMonEE,Eastern and Central Europe Regional Office
+EDU,1,EDU,MENARO Education,Middle East and North Africa Regional Office
+MENARO,1,MENARO,UNICEF Middle East and North Africa,Middle East and North Africa Regional Office
+PARAGUAY,1,PARAGUAY,Paraguay,Paraguay Country Office
+PAKISTAN,1,PAKISTAN_CO,Pakistan Survey Data,Pakistan Country Office
+CRBA,1,CRBA,Children's Rights and Business Atlas,Children's Rights and Business Atlas
+ROSA,1,ROSA,UNICEF South Asia,UNICEF South Asia Regional Office
+CAUSE,1,CAUSE_OF_DEATH,Cause of death,Demography
+CHILD,1,CHILD_RELATED_SDG,Child-related SDGs 2020,Sustainable development goals
+CHLD,1,CHLD_PVTY,Child Poverty,Child Poverty
+ECD,1,ECD,Early Childhood Development,Early Childhood Development
+ECONOMIC,1,ECONOMIC,Economic,Child Poverty
+FUNCTIONAL,1,FUNCTIONAL_DIFF,Functional difficulties,Early Childhood Development
+GENDER,1,GENDER,Gender,Gender
+GLOBAL,1,GLOBAL_DATAFLOW,Cross-sector indicators,Global UNICEF Situation Indicators
+HIV,1,HIV_AIDS,HIV/AIDS,"Maternal, child and newborn health"
+IMMUNISATION,1,IMMUNISATION,Immunisation,"Maternal, child and newborn health"
+MG,1,MG,Migration,Demography
+MNCH,1,MNCH,"Maternal, child and newborn health","Maternal, child and newborn health"
+NUTRITION,1,NUTRITION,Nutrition,Nutrition
+SOC,1,SOC_PROTECTION,Social protection,Social protection
+WT,1,WT,Transition to Work,Child Protection
+AFG,1,AFG_CO,Afghanistan CO,Afghanistan Country Office
+KENYA,1,KENYA_CO,Kenya CO,Kenya  Country Office
+SOAC,1,SOAC_DATA_SNAPSHOT_2025,State of teh Africa Children 2025 snapshot,State of the World's Children
+LACRO,1,LACRO_DATA_PORTAL_TEST,LACRO Data Portal,Latin America and Caribbean Regional Office

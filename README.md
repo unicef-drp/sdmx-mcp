@@ -72,7 +72,31 @@ In the Inspector, set "Server URL" to:
 - Local: `http://127.0.0.1:8000/mcp`
 - Fly: `https://sdmx-mcp.fly.dev/mcp`
 
-## 5. MCP client configuration example
+## 5. Agent test rig (direct tool-call harness)
+
+Use this to exercise an agent-like workflow (agencies -> flows -> dimensions -> data query) without wiring a full LLM loop yet.
+
+Single case:
+```
+python scripts/agent_test_rig.py \
+  --question "Show me latest child marriage rates in South Asia" \
+  --agency UNICEF \
+  --filters '{"REF_AREA":"AFG,IND,NPL,PAK,BGD,LKA,BTN,MDV","INDICATOR":"PT_CM","SEX":"T"}' \
+  --last-n 3 \
+  --format csv
+```
+
+Batch mode with JSONL:
+```
+python scripts/agent_test_rig.py --scenarios scripts/agent_test_scenarios.example.jsonl
+```
+
+Prefix/domain curation helper:
+```
+python scripts/list_theme_prefixes.py --format csv --limit 100 > theme_prefixes.csv
+```
+
+## 6. MCP client configuration example
 
 `~/.config/mcp/servers/unicef-sdmx.json`:
 
