@@ -114,12 +114,14 @@ All tools are defined in `server.py`.
 - Purpose: build SDMX key from dimension selections.
 - Notes: supports list/comma syntax for multi-code segments.
 
-13. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', maxObs=50000, filters=None, lastNObservations=None)`
+13. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
   - requires either (`startPeriod` + `endPeriod`) or `lastNObservations`
   - supports `filters` to auto-build key from dimension order
+  - leaves unspecified dimensions as empty key segments (`.` wildcard)
   - supports `format='csv'` and returns `raw_csv`
+  - supports optional `labels` parameter (for example `labels=both` with CSV)
   - parses SDMX XML error payloads into structured `error.message`
 
 ## Agent Test Rig
@@ -128,8 +130,9 @@ All tools are defined in `server.py`.
 
 Capabilities:
 - selects best flow from question
+- retries discovery with topic hints when full-sentence flow search is sparse
 - infers `REF_AREA` for South Asia
-- resolves defaults from codelists (no hardcoded code assumptions)
+- does not auto-fill non-essential dimensions, leaving unspecified dimensions as SDMX wildcards
 - ranks indicator candidates
 - iterates indicators until data is found
 - logs attempts verbosely
@@ -142,7 +145,7 @@ python scripts/agent_test_rig.py \
   --question "Show me latest child mortality rates in South Asia" \
   --agency UNICEF \
   --journey --verbose \
-  --last-n 3 --format csv
+  --last-n 3 --format csv --labels both
 ```
 
 Scenario batch:
@@ -206,3 +209,9 @@ Restart Claude Desktop after editing.
 ## Presentation Notes
 
 For a live demo, use the scenario file plus `--save-output-dir` and keep the saved JSON outputs as known-good artifacts.
+
+## Latest Robustness Updates
+
+- Unspecified dimensions are now kept as empty SDMX key segments (`.` wildcard) instead of being auto-filled.
+- `query_data` supports optional `labels` for SDMX CSV output (`labels=both` works well for readable demos).
+- Journey-mode flow discovery in the test rig now uses fallback topic hints (for example, wasting/stunting -> nutrition).

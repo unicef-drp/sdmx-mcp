@@ -895,6 +895,7 @@ async def query_data(
     startPeriod: Optional[str] = None,
     endPeriod: Optional[str] = None,
     format: str = "sdmx-json",
+    labels: Optional[str] = None,
     maxObs: int = 50_000,
     filters: dict[str, Any] | None = None,
     lastNObservations: Optional[int] = None,
@@ -923,6 +924,8 @@ async def query_data(
     if lastNObservations is not None:
         params.append(f"lastNObservations={int(lastNObservations)}")
     params.append(f"format={quote(format)}")
+    if labels:
+        params.append(f"labels={quote(labels)}")
     url = f"{BASE}/data/{flow_path}/{quote(key, safe='+.')}?{'&'.join(params)}"
 
     if format.lower() == "csv":
@@ -937,9 +940,13 @@ async def query_data(
                 },
                 "notes": {"maxObs": maxObs, "format": "csv"},
             }
-        return {"query_url": url, "raw_csv": text, "notes": {"maxObs": maxObs, "format": "csv"}}
+        return {
+            "query_url": url,
+            "raw_csv": text,
+            "notes": {"maxObs": maxObs, "format": "csv", "labels": labels},
+        }
 
     raw = await _get_json(url)
 
     # Minimal guardrail: if server returns huge payloads, you can add a response-size check here.
-    return {"query_url": url, "raw": raw, "notes": {"maxObs": maxObs, "format": format}}
+    return {"query_url": url, "raw": raw, "notes": {"maxObs": maxObs, "format": format, "labels": labels}}

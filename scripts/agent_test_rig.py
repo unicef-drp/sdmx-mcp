@@ -20,9 +20,26 @@ REGION_REF_AREA = {
 
 FLOW_KEYWORDS = [
     ("child mortality", ["CME", "MORTALITY"]),
+    ("under-five mortality", ["CME", "MORTALITY", "U5MR"]),
     ("mortality", ["CME", "MORTALITY"]),
+    ("nutrition", ["NUTRITION", "NUTR"]),
+    ("stunting", ["NUTRITION", "NUTR", "STUNT"]),
+    ("wasting", ["NUTRITION", "NUTR", "WAST"]),
+    ("immunization", ["IMM", "VACC", "IMMUN"]),
+    ("vaccine", ["IMM", "VACC", "IMMUN"]),
     ("child marriage", ["PT_CM", "CHILD MARRIAGE"]),
     ("marriage", ["PT_CM", "CHILD MARRIAGE"]),
+]
+
+FLOW_QUERY_HINTS = [
+    ("wasting", ["nutrition", "NUTRITION", "NUTR"]),
+    ("stunting", ["nutrition", "NUTRITION", "NUTR"]),
+    ("nutrition", ["nutrition", "NUTRITION", "NUTR"]),
+    ("immunization", ["immunization", "IMM", "vaccine"]),
+    ("vaccine", ["immunization", "IMM", "vaccine"]),
+    ("child mortality", ["child mortality", "CME", "mortality"]),
+    ("mortality", ["child mortality", "CME", "mortality"]),
+    ("child marriage", ["child marriage", "PT_CM"]),
 ]
 
 
@@ -72,25 +89,6 @@ def _infer_ref_area(question: str) -> str | None:
     return None
 
 
-async def _default_dimension_code(
-    flow_ref: str,
-    dimension: str,
-    queries: list[str],
-    verbose: bool,
-) -> str | None:
-    for query in queries:
-        try:
-            codes = await server.list_codes(flowRef=flow_ref, dimension=dimension, query=query, limit=5)
-        except Exception:
-            continue
-        if codes:
-            code_id = codes[0].get("id")
-            if isinstance(code_id, str) and code_id:
-                _log(verbose, f"Defaulted {dimension}={code_id} based on codelist match for '{query}'.")
-                return code_id
-    return None
-
-
 def _flow_score(question: str, flow: dict[str, Any]) -> int:
     text = f"{flow.get('id','')} {flow.get('name','')} {flow.get('description','')}".upper()
     score = 0
@@ -105,6 +103,34 @@ def _flow_score(question: str, flow: dict[str, Any]) -> int:
     if "DRAFT" in text:
         score -= 5
     return score
+
+
+def _candidate_flow_queries(question: str) -> list[str]:
+    text = (question or "").strip()
+    if not text:
+        return []
+    q = text.lower()
+    candidates: list[str] = [text]
+    for phrase, hints in FLOW_QUERY_HINTS:
+        if phrase in q:
+            for hint in hints:
+                if hint not in candidates:
+                    candidates.append(hint)
+    return candidates
+
+
+async def _discover_flows(question: str, top_flows: int, agency: str | None) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for query in _candidate_flow_queries(question):
+        matches = await server.search_dataflows(query=query, limit=top_flows)
+        matches = _filter_flows_by_agency(matches, agency)
+        for item in matches:
+            flow_ref = item.get("flowRef")
+            if isinstance(flow_ref, str) and flow_ref and flow_ref not in seen:
+                seen.add(flow_ref)
+                found.append(item)
+    return found
 
 
 def _select_flow_from_search(question: str, search: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -141,12 +167,16 @@ async def _run_case(case: dict[str, Any], verbose: bool = False, journey: bool =
         agencies = [a for a in agencies if a.get("id") == agency]
 
     top_flows = int(case.get("top_flows", 8))
-    search = await server.search_dataflows(query=question, limit=top_flows)
-    search = _filter_flows_by_agency(search, agency)
+    search = await _discover_flows(question, top_flows, agency)
     grouped = await server.list_dataflows_grouped(
         query=question,
         limitPerTheme=int(case.get("limit_per_theme", 10)),
     )
+    if not grouped and journey:
+        grouped = await server.list_dataflows_grouped(
+            query=None,
+            limitPerTheme=int(case.get("limit_per_theme", 10)),
+        )
 
     flow_ref = case.get("flowRef")
     filters = case.get("filters") or {}
@@ -188,15 +218,6 @@ async def _run_case(case: dict[str, Any], verbose: bool = False, journey: bool =
                 if inferred:
                     resolved_filters["REF_AREA"] = inferred
                     _log(verbose, f"Inferred REF_AREA={inferred} from question.")
-            if "SEX" not in resolved_filters:
-                default_sex = await _default_dimension_code(
-                    flow_ref,
-                    "SEX",
-                    ["total", "both", "all", "total sex", "both sexes"],
-                    verbose,
-                )
-                if default_sex:
-                    resolved_filters["SEX"] = default_sex
             if not case.get("lastNObservations") and not (case.get("startPeriod") and case.get("endPeriod")):
                 case["lastNObservations"] = 3
                 _log(verbose, "Defaulted lastNObservations=3.")
@@ -293,6 +314,7 @@ async def _run_case(case: dict[str, Any], verbose: bool = False, journey: bool =
                         endPeriod=case.get("endPeriod"),
                         lastNObservations=case.get("lastNObservations"),
                         format=case.get("format", "csv"),
+                        labels=case.get("labels"),
                     )
                     if isinstance(data, dict) and data.get("error"):
                         error_message = data["error"].get("message") if isinstance(data["error"], dict) else None
@@ -363,6 +385,7 @@ async def _run(args: argparse.Namespace) -> None:
                 "endPeriod": args.end_period,
                 "lastNObservations": args.last_n,
                 "format": args.format,
+                "labels": args.labels,
                 "top_flows": args.top_flows,
                 "limit_per_theme": args.limit_per_theme,
             }
@@ -397,6 +420,7 @@ def main() -> None:
     parser.add_argument("--end-period", help="SDMX endPeriod (YYYY or YYYY-MM).")
     parser.add_argument("--last-n", type=int, help="Use lastNObservations instead of full period slices.")
     parser.add_argument("--format", default="csv", help="Query format, e.g. csv or sdmx-json.")
+    parser.add_argument("--labels", help="Optional SDMX labels parameter (e.g., both).")
     parser.add_argument("--top-flows", type=int, default=8, help="Top flow candidates to return.")
     parser.add_argument(
         "--limit-per-theme",
