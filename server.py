@@ -1,4 +1,6 @@
 import logging
+import os
+import re
 import csv
 from collections import Counter
 from pathlib import Path
@@ -14,10 +16,51 @@ from mcp.server.fastmcp import FastMCP
 # IMPORTANT for STDIO servers: do not print() to stdout.
 logging.basicConfig(level=logging.INFO)
 
-BASE = "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest"
+DEFAULT_BASE = "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest"
+BASE = os.getenv("SDMX_BASE_URL", DEFAULT_BASE).strip().rstrip("/")
+MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
+USER_AGENT = os.getenv("SDMX_USER_AGENT", "sdmx-mcp/0.1").strip() or "sdmx-mcp/0.1"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_csv(name: str) -> list[str]:
+    raw = os.getenv(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _env_regex(name: str) -> re.Pattern[str] | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    return re.compile(raw, re.IGNORECASE)
+
+
+FLOW_ID_ALLOW_RE = _env_regex("SDMX_DATAFLOW_ID_ALLOW_REGEX")
+FLOW_ID_DENY_RE = _env_regex("SDMX_DATAFLOW_ID_DENY_REGEX")
+FLOW_ID_ALLOW_PREFIXES = tuple(_env_csv("SDMX_DATAFLOW_ID_ALLOW_PREFIXES"))
+FLOW_ID_DENY_PREFIXES = tuple(_env_csv("SDMX_DATAFLOW_ID_DENY_PREFIXES"))
+AGENCY_ALLOWLIST = set(_env_csv("SDMX_AGENCY_ALLOWLIST"))
+EXCLUDE_DRAFT = _env_bool("SDMX_EXCLUDE_DRAFT", default=False)
+SCOPE_ACTIVE = any(
+    [
+        FLOW_ID_ALLOW_RE,
+        FLOW_ID_DENY_RE,
+        FLOW_ID_ALLOW_PREFIXES,
+        FLOW_ID_DENY_PREFIXES,
+        AGENCY_ALLOWLIST,
+        EXCLUDE_DRAFT,
+    ]
+)
+ENFORCE_SCOPE = _env_bool("SDMX_ENFORCE_SCOPE", default=SCOPE_ACTIVE)
 
 # Bind to all interfaces so DNS rebinding protection isn't auto-enabled for localhost-only hosts.
-mcp = FastMCP("unicef-sdmx", json_response=True, host="0.0.0.0", stateless_http=True)
+mcp = FastMCP(MCP_NAME, json_response=True, host="0.0.0.0", stateless_http=True)
 
 # Starter mapping for common flow id prefixes to human-friendly labels.
 FALLBACK_THEME_PREFIX_MAP: dict[str, str] = {
@@ -38,27 +81,36 @@ _structure_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 _dimension_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 
 
+def _theme_prefix_csv_path() -> Path:
+    raw_path = os.getenv("SDMX_THEME_PREFIX_CSV", "").strip()
+    if not raw_path:
+        return THEME_PREFIX_CSV
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return Path(__file__).resolve().parent / path
+
+
 async def _get_json(url: str) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers={"User-Agent": "unicef-sdmx-mcp/0.1"})
+        r = await client.get(url, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
         return r.json()
 
 
 async def _get_text_with_status(url: str) -> tuple[int, str]:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers={"User-Agent": "unicef-sdmx-mcp/0.1"})
+        r = await client.get(url, headers={"User-Agent": USER_AGENT})
         return r.status_code, r.text
 
 
 def _dataflow_url() -> str:
-    # UNICEF service builder defaults to SDMX 2.1 (XML), but FastMCP expects JSON for parsing.
+    # Request SDMX-JSON explicitly for predictable parsing across registries.
     return f"{BASE}/dataflow/all/all/latest/?format=sdmx-json&detail=full&references=none"
 
 
 def _structure_url(flow_ref: str) -> str:
-    # Practical approach: fetch dataflow with references=all to pull back related structures (DSD, codelists).
-    # UNICEF documentation describes this approach. :contentReference[oaicite:5]{index=5}
+    # Pull related structures (DSD, codelists) in one request when supported.
     # flow_ref should typically look like: AGENCY:FLOW_ID(VERSION) or similar; keep it simple early.
     return f"{BASE}/dataflow/{_flow_path_for(flow_ref)}/?format=sdmx-json&detail=full&references=all"
 
@@ -91,6 +143,47 @@ def _coerce_text(value: Any) -> str:
 def _query_tokens(query: str) -> list[str]:
     tokens = [part.strip().lower() for part in query.replace("/", " ").split() if part.strip()]
     return [token for token in tokens if len(token) >= 3]
+
+
+def _is_draft_flow(df_id: str, name: str = "", description: str = "") -> bool:
+    text = f"{df_id} {name} {description}".upper()
+    return "DRAFT" in text
+
+
+def _flow_in_scope(df_id: str, agency: str = "", name: str = "", description: str = "") -> bool:
+    flow_id = (df_id or "").strip()
+    agency_id = (agency or "").strip()
+    if not flow_id:
+        return False
+    upper_flow = flow_id.upper()
+    if AGENCY_ALLOWLIST and agency_id not in AGENCY_ALLOWLIST:
+        return False
+    if EXCLUDE_DRAFT and _is_draft_flow(flow_id, name, description):
+        return False
+    if FLOW_ID_ALLOW_PREFIXES and not any(upper_flow.startswith(prefix.upper()) for prefix in FLOW_ID_ALLOW_PREFIXES):
+        return False
+    if FLOW_ID_DENY_PREFIXES and any(upper_flow.startswith(prefix.upper()) for prefix in FLOW_ID_DENY_PREFIXES):
+        return False
+    if FLOW_ID_ALLOW_RE and not FLOW_ID_ALLOW_RE.search(flow_id):
+        return False
+    if FLOW_ID_DENY_RE and FLOW_ID_DENY_RE.search(flow_id):
+        return False
+    return True
+
+
+def _extract_scoped_dataflows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    flows = _extract_dataflows(payload)
+    scoped: list[dict[str, Any]] = []
+    for df in flows:
+        df_id = df.get("id") or df.get("ID")
+        if not isinstance(df_id, str):
+            continue
+        agency = df.get("agencyID") or df.get("agencyId") or "all"
+        name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
+        desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
+        if _flow_in_scope(df_id, agency=agency, name=name, description=desc):
+            scoped.append(df)
+    return scoped
 
 
 def _match_score(text: str, query: str) -> int:
@@ -269,7 +362,7 @@ def _theme_prefix_conflicts_from_csv(path: Path) -> list[dict[str, Any]]:
 
 
 def _default_theme_prefix_map() -> dict[str, str]:
-    from_csv = _load_theme_prefix_map_from_csv(THEME_PREFIX_CSV)
+    from_csv = _load_theme_prefix_map_from_csv(_theme_prefix_csv_path())
     if not from_csv:
         return dict(FALLBACK_THEME_PREFIX_MAP)
     merged = dict(FALLBACK_THEME_PREFIX_MAP)
@@ -335,6 +428,14 @@ def _flow_path_for(flow_ref: str) -> str:
     agency, df_id, version = _flow_identifiers(flow_ref)
     path = "/".join(part for part in (agency, df_id, version) if part)
     return _encode_flow_path(path)
+
+
+def _assert_flowref_in_scope(flow_ref: str) -> None:
+    if not ENFORCE_SCOPE:
+        return
+    agency, df_id, _version = _flow_identifiers(flow_ref)
+    if not _flow_in_scope(df_id, agency=agency):
+        raise ValueError("flowRef is outside configured scope (check SDMX_DATAFLOW_* and SDMX_AGENCY_* settings).")
 
 
 def _data_path_for(flow_ref: str) -> str:
@@ -571,7 +672,7 @@ def _build_key_from_filters(dimension_order: list[str], filters: dict[str, Any])
     return ".".join(parts)
 
 
-@mcp.resource("sdmx://unicef/dataflows")
+@mcp.resource("sdmx://registry/dataflows")
 async def dataflows_resource() -> dict[str, Any]:
     """Cached SDMX dataflows list (SDMX-JSON)."""
     if "dataflows" not in _dataflow_cache:
@@ -582,13 +683,19 @@ async def dataflows_resource() -> dict[str, Any]:
 @mcp.tool()
 async def list_agencies(limit: int = 50) -> list[dict[str, Any]]:
     """
-    List agencies from the UNICEF SDMX service with optional descriptions.
+    List agencies from the configured SDMX service with optional descriptions.
     """
     payload = await dataflows_resource()
     agencies = _extract_agencies(payload)
+    scoped_flows = _extract_scoped_dataflows(payload)
+    scoped_agency_ids = {
+        str(df.get("agencyID") or df.get("agencyId") or "")
+        for df in scoped_flows
+        if str(df.get("agencyID") or df.get("agencyId") or "")
+    }
     if not agencies:
-        # Fall back to agencies inferred from dataflows if explicit agency lists are absent.
-        flows = _extract_dataflows(payload)
+        # Fall back to agencies inferred from scoped dataflows if explicit agency lists are absent.
+        flows = scoped_flows
         for df in flows:
             agency = df.get("agencyID") or df.get("agencyId")
             if isinstance(agency, str):
@@ -598,6 +705,10 @@ async def list_agencies(limit: int = 50) -> list[dict[str, Any]]:
     for agency in agencies:
         agency_id = agency.get("id") or agency.get("ID")
         if not isinstance(agency_id, str) or agency_id in seen:
+            continue
+        if AGENCY_ALLOWLIST and agency_id not in AGENCY_ALLOWLIST:
+            continue
+        if scoped_agency_ids and agency_id not in scoped_agency_ids:
             continue
         seen.add(agency_id)
         results.append(
@@ -615,11 +726,11 @@ async def list_agencies(limit: int = 50) -> list[dict[str, Any]]:
 @mcp.tool()
 async def search_dataflows(query: str, limit: int = 10) -> list[dict[str, Any]]:
     """
-    Search UNICEF SDMX dataflows by id/name/description.
+    Search configured SDMX dataflows by id/name/description.
     Returns lightweight matches with a flowRef you can pass to other tools.
     """
     payload = await dataflows_resource()
-    flows = _extract_dataflows(payload)
+    flows = _extract_scoped_dataflows(payload)
     matches: list[dict[str, Any]] = []
     q = query.strip()
 
@@ -665,7 +776,7 @@ async def list_dataflows_grouped(
     Optionally pass prefixMap to map id prefixes to human-friendly labels.
     """
     payload = await dataflows_resource()
-    flows = _extract_dataflows(payload)
+    flows = _extract_scoped_dataflows(payload)
     if prefixMap is None:
         prefixMap = DEFAULT_THEME_PREFIX_MAP
     q = (query or "").strip()
@@ -718,7 +829,7 @@ async def list_theme_prefixes(limit: int = 50) -> list[dict[str, Any]]:
     Scan dataflows and return common id prefixes with counts and examples.
     """
     payload = await dataflows_resource()
-    flows = _extract_dataflows(payload)
+    flows = _extract_scoped_dataflows(payload)
     counts: dict[str, dict[str, Any]] = {}
     for df in flows:
         df_id = df.get("id") or df.get("ID")
@@ -742,7 +853,7 @@ async def list_theme_prefix_conflicts(limit: int = 100) -> list[dict[str, Any]]:
     """
     List prefixes that map to multiple domains in theme_prefixes_domain.csv.
     """
-    conflicts = _theme_prefix_conflicts_from_csv(THEME_PREFIX_CSV)
+    conflicts = _theme_prefix_conflicts_from_csv(_theme_prefix_csv_path())
     return conflicts[:limit]
 
 
@@ -751,8 +862,9 @@ async def describe_flow(flowRef: str) -> dict[str, Any]:
     """
     Return a human-friendly summary of a dataflow, including dimension info.
     """
+    _assert_flowref_in_scope(flowRef)
     payload = await get_flow_structure(flowRef)
-    flows = _extract_dataflows(payload)
+    flows = _extract_scoped_dataflows(payload)
     flow_meta: dict[str, Any] = {}
     agency, df_id, version = _flow_identifiers(flowRef)
     for df in flows:
@@ -777,6 +889,7 @@ async def list_dimensions(flowRef: str) -> list[dict[str, Any]]:
     """
     List ordered dimensions for a flow with codelist references.
     """
+    _assert_flowref_in_scope(flowRef)
     payload = await get_flow_structure(flowRef)
     return _dimension_metadata(payload)
 
@@ -791,6 +904,7 @@ async def list_codes(
     """
     List codes for a specific dimension, optionally filtered by a query string.
     """
+    _assert_flowref_in_scope(flowRef)
     payload = await get_flow_structure(flowRef)
     dims = _dimension_metadata(payload)
     dim_id = dimension.strip().upper()
@@ -838,6 +952,7 @@ async def find_indicator_candidates(
     """
     Rank indicator codes by matching query text against codelist labels/descriptions.
     """
+    _assert_flowref_in_scope(flowRef)
     payload = await get_flow_structure(flowRef)
     dims = _dimension_metadata(payload)
     target = next((d for d in dims if d.get("id") == "INDICATOR"), None)
@@ -863,6 +978,7 @@ async def get_flow_structure(flowRef: str) -> dict[str, Any]:
     """
     Fetch and cache a flow's structure payload (DSD + codelists via references=all).
     """
+    _assert_flowref_in_scope(flowRef)
     if flowRef not in _structure_cache:
         _structure_cache[flowRef] = await _get_json(_structure_url(flowRef))
     return _structure_cache[flowRef]
@@ -874,6 +990,7 @@ async def build_key(flowRef: str, selections: dict[str, Any] | None = None) -> d
     Build an SDMX key string from human-friendly dimension selections.
     Pass a mapping of dimension names to a single value or list of values.
     """
+    _assert_flowref_in_scope(flowRef)
     if not selections:
         raise ValueError("selections must include at least one dimension.")
     dimension_order = await _dimension_order_for_flow(flowRef)
@@ -905,6 +1022,7 @@ async def query_data(
     - Requires a bounded time window unless caller explicitly accepts the risk.
     - Returns raw SDMX-JSON and a minimal 'query_url' for reproducibility.
     """
+    _assert_flowref_in_scope(flowRef)
     if not (startPeriod and endPeriod) and not lastNObservations:
         raise ValueError("Provide start/end periods or lastNObservations to avoid unbounded extracts.")
 
