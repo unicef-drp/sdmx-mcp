@@ -444,6 +444,51 @@ def _data_path_for(flow_ref: str) -> str:
     return quote(ident, safe=",")
 
 
+async def _data_path_for_query(flow_ref: str) -> str:
+    """
+    Build a data query flow path.
+    If version is 'latest', resolve it to a concrete version from dataflow metadata
+    because some SDMX /data endpoints reject 'latest' in flowRef.
+    """
+    agency, df_id, version = _flow_identifiers(flow_ref)
+    chosen_agency = agency
+    chosen_version = version
+
+    if version.lower() == "latest":
+        payload = await dataflows_resource()
+        flows = _extract_dataflows(payload)
+        matches: list[tuple[str, str]] = []
+        for df in flows:
+            match_id = df.get("id") or df.get("ID")
+            if not isinstance(match_id, str) or match_id != df_id:
+                continue
+            match_agency = df.get("agencyID") or df.get("agencyId") or "all"
+            match_version = df.get("version")
+            if match_version is None:
+                continue
+            match_version_text = str(match_version).strip()
+            if not match_version_text:
+                continue
+            matches.append((str(match_agency), match_version_text))
+
+        selected: tuple[str, str] | None = None
+        if agency and agency != "all":
+            selected = next((item for item in matches if item[0] == agency), None)
+        elif len(matches) == 1:
+            selected = matches[0]
+        elif matches:
+            # Stable preference for UNICEF flows when agency is ambiguous.
+            selected = next((item for item in matches if item[0] == "UNICEF"), matches[0])
+
+        if selected:
+            selected_agency, selected_version = selected
+            chosen_agency = agency if agency and agency != "all" else selected_agency
+            chosen_version = selected_version
+
+    ident = ",".join(part for part in (chosen_agency, df_id, chosen_version) if part)
+    return quote(ident, safe=",")
+
+
 def _extract_data_structures(payload: dict[str, Any]) -> list[dict[str, Any]]:
     structures: list[dict[str, Any]] = []
     for root_key in ("structure", "data"):
@@ -1034,7 +1079,7 @@ async def query_data(
         raise ValueError("Provide either a key or filters to identify the data slice.")
 
     # Standard SDMX pattern: /data/{flowRef}/{key}?startPeriod=...&endPeriod=...&format=...
-    flow_path = _data_path_for(flowRef)
+    flow_path = await _data_path_for_query(flowRef)
     params: list[str] = []
     if startPeriod and endPeriod:
         params.append(f"startPeriod={quote(startPeriod)}")
