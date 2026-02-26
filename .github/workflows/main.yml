@@ -17,7 +17,11 @@ jobs:
           fetch-depth: 0
       - name: Install gitleaks
         run: |
-          curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh \
-            | sh -s -- -b /usr/local/bin
+          set -euo pipefail
+          VERSION="8.24.2"
+          ARCHIVE="gitleaks_${VERSION}_linux_x64.tar.gz"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${ARCHIVE}" -o "/tmp/${ARCHIVE}"
+          tar -xzf "/tmp/${ARCHIVE}" -C /tmp
+          install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
       - name: Run gitleaks
         run: gitleaks detect --source . --verbose
