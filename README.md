@@ -1,6 +1,8 @@
 # SDMX MCP
 
-MCP server for SDMX registries, built with FastMCP.
+MCP server for SDMX registries, built with FastMCP. 
+
+You can try it out over the UNICEF Data Warehouse: https://sdmx-mcp.fly.dev/ (NOTE: this is not an official UNICEF MCP release and should not be used as a replacement for actually pulling the datatsets using the warehosue APIs: https://sdmx.data.unicef.org/webservice/data.html)
 
 The server is registry-agnostic: users can point it at any SDMX REST endpoint and optionally scope which dataflows are exposed (for example, exclude draft flows).
 
