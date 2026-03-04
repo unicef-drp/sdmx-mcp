@@ -579,6 +579,101 @@ def _normalize_selection_values(value: Any) -> str:
     return ""
 
 
+def _selection_tokens(value: Any) -> list[str]:
+    normalized = _normalize_selection_values(value)
+    if not normalized:
+        return []
+    return [token for token in normalized.split("+") if token]
+
+
+def _codelist_codes(codelist: dict[str, Any]) -> list[dict[str, Any]]:
+    codes = codelist.get("codes") or codelist.get("code") or []
+    if isinstance(codes, dict):
+        codes = list(codes.values())
+    if not isinstance(codes, list):
+        return []
+    return [code for code in codes if isinstance(code, dict)]
+
+
+def _canonical_code_id(codes: list[dict[str, Any]], token: str) -> str | None:
+    wanted = token.strip()
+    if not wanted:
+        return None
+    wanted_lower = wanted.lower()
+    for code in codes:
+        code_id = code.get("id") or code.get("ID")
+        if isinstance(code_id, str) and code_id.lower() == wanted_lower:
+            return code_id
+    return None
+
+
+def _matching_code_label(codes: list[dict[str, Any]], token: str) -> tuple[str, str] | None:
+    wanted = token.strip().lower()
+    if not wanted:
+        return None
+    for code in codes:
+        code_id = code.get("id") or code.get("ID")
+        if not isinstance(code_id, str):
+            continue
+        name = _coerce_text(code.get("name")) or _coerce_text(code.get("names"))
+        if name and name.strip().lower() == wanted:
+            return code_id, name
+    return None
+
+
+async def _normalize_filters_to_code_ids(flowRef: str, filters: dict[str, Any]) -> dict[str, Any]:
+    payload = await get_flow_structure(flowRef)
+    dims = {str(dim.get("id")): dim for dim in _dimension_metadata(payload) if isinstance(dim.get("id"), str)}
+    codelists = _codelist_map(payload)
+    normalized_filters: dict[str, Any] = {}
+
+    for raw_dim, raw_value in filters.items():
+        dim_id = str(raw_dim).upper()
+        dim_meta = dims.get(dim_id)
+        if not dim_meta:
+            normalized_filters[dim_id] = raw_value
+            continue
+
+        codelist_ref = dim_meta.get("codelist")
+        if not isinstance(codelist_ref, str) or not codelist_ref.strip():
+            normalized_filters[dim_id] = raw_value
+            continue
+
+        codelist = codelists.get(codelist_ref) or codelists.get(_codelist_key(codelist_ref))
+        if not codelist:
+            normalized_filters[dim_id] = raw_value
+            continue
+
+        codes = _codelist_codes(codelist)
+        if not codes:
+            normalized_filters[dim_id] = raw_value
+            continue
+
+        canonical_tokens: list[str] = []
+        for token in _selection_tokens(raw_value):
+            canonical = _canonical_code_id(codes, token)
+            if canonical:
+                canonical_tokens.append(canonical)
+                continue
+
+            label_match = _matching_code_label(codes, token)
+            if label_match:
+                code_id, label = label_match
+                raise ValueError(
+                    f"Dimension '{dim_id}' must use code IDs, not labels. "
+                    f"Use '{code_id}' instead of '{label}'."
+                )
+
+            raise ValueError(
+                f"Unknown code ID '{token}' for dimension '{dim_id}'. "
+                "Use list_codes to retrieve valid code IDs."
+            )
+
+        normalized_filters[dim_id] = "+".join(canonical_tokens)
+
+    return normalized_filters
+
+
 async def _dimension_order_for_flow(flowRef: str) -> list[str]:
     cache_key = flowRef.strip()
     if cache_key in _dimension_cache:
@@ -922,13 +1017,15 @@ async def build_key(flowRef: str, selections: dict[str, Any] | None = None) -> d
     if not selections:
         raise ValueError("selections must include at least one dimension.")
     dimension_order = await _dimension_order_for_flow(flowRef)
-    key = _build_key_from_filters(dimension_order, selections)
+    normalized_selections = await _normalize_filters_to_code_ids(flowRef, selections)
+    key = _build_key_from_filters(dimension_order, normalized_selections)
     return {
         "key": key,
         "dimensionOrder": dimension_order,
         "notes": {
             "multipleValues": "Use arrays or comma-separated strings to include multiple codes per dimension.",
             "placeholders": "Dimensions without selections are filled automatically with empty segments.",
+            "codeIdsOnly": "For codelist-backed dimensions, selections must use code IDs exactly as returned by list_codes.",
         },
     }
 
@@ -955,7 +1052,8 @@ async def query_data(
 
     if filters:
         dimension_order = await _dimension_order_for_flow(flowRef)
-        key = _build_key_from_filters(dimension_order, filters)
+        normalized_filters = await _normalize_filters_to_code_ids(flowRef, filters)
+        key = _build_key_from_filters(dimension_order, normalized_filters)
 
     if not key:
         raise ValueError("Provide either a key or filters to identify the data slice.")

@@ -189,6 +189,8 @@ If Claude supports remote MCP connectors in your plan/UI:
 
 Restart Claude Desktop after editing.
 
+For codelist-backed dimensions, `build_key` and `query_data(filters=...)` must use code IDs (as returned by `list_codes`), not display labels.
+
 ## Troubleshooting
 
 1. `406 Not Acceptable`
