@@ -160,6 +160,7 @@ curl -sS --max-time 20 -X POST https://<your-app>.fly.dev/mcp \
 13. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
 
 For codelist-backed dimensions, `build_key` and `query_data(filters=...)` must use code IDs (as returned by `list_codes`), not display labels.
+If a caller passes a manual `key` with too few segments, `query_data` pads missing trailing dimensions as wildcard segments automatically.
 
 ## Troubleshooting
 
