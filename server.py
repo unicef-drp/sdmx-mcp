@@ -711,6 +711,27 @@ def _build_key_from_filters(dimension_order: list[str], filters: dict[str, Any])
     return ".".join(parts)
 
 
+def _normalize_manual_key(key: str, dimension_order: list[str]) -> str:
+    """
+    Normalize a manually provided SDMX key to the expected dimension count.
+    If trailing dimensions are omitted, pad them as empty wildcard segments.
+    """
+    raw = (key or "").strip()
+    if not raw:
+        raise ValueError("key must not be empty.")
+
+    parts = raw.split(".")
+    expected = len(dimension_order)
+    if len(parts) > expected:
+        raise ValueError(
+            f"Key has too many segments ({len(parts)}). Expected {expected} for dimensions: "
+            f"{', '.join(dimension_order)}"
+        )
+    if len(parts) < expected:
+        parts.extend([""] * (expected - len(parts)))
+    return ".".join(parts)
+
+
 @mcp.resource("sdmx://unicef/dataflows")
 async def dataflows_resource() -> dict[str, Any]:
     """Cached SDMX dataflows list (SDMX-JSON)."""
@@ -1054,6 +1075,9 @@ async def query_data(
         dimension_order = await _dimension_order_for_flow(flowRef)
         normalized_filters = await _normalize_filters_to_code_ids(flowRef, filters)
         key = _build_key_from_filters(dimension_order, normalized_filters)
+    elif key:
+        dimension_order = await _dimension_order_for_flow(flowRef)
+        key = _normalize_manual_key(key, dimension_order)
 
     if not key:
         raise ValueError("Provide either a key or filters to identify the data slice.")
