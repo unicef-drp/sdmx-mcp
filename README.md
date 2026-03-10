@@ -156,13 +156,20 @@ curl -sS --max-time 20 -X POST https://<your-app>.fly.dev/mcp \
 7. `describe_flow(flowRef)`
 8. `list_dimensions(flowRef)`
 9. `list_codes(flowRef, dimension, query=None, limit=50)`
-10. `find_indicator_candidates(flowRef, query, limit=10)`
-11. `get_flow_structure(flowRef)`
-12. `build_key(flowRef, selections)`
-13. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
+10. `find_indicator_candidates(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
+11. `search_indicators(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)` (alias of `find_indicator_candidates`)
+12. `get_flow_structure(flowRef)`
+13. `build_key(flowRef, selections)`
+14. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
 
 For codelist-backed dimensions, `build_key` and `query_data(filters=...)` must use code IDs (as returned by `list_codes`), not display labels.
 If a caller passes a manual `key` with too few segments, `query_data` pads missing trailing dimensions as wildcard segments automatically.
+
+Recommended discovery sequence:
+1. `find_indicator_candidates(query)` to find indicator IDs across scoped flows.
+2. Use each candidate's `recommendedFlowRef` (or inspect `dataflows`) to choose a flow.
+3. `list_codes(flowRef, "GEO", query=...)` and other dimension tools to constrain the slice.
+4. `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
 
 ## Troubleshooting
 
