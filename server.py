@@ -410,7 +410,7 @@ async def _data_path_for_query(flow_ref: str) -> str:
     chosen_version = version
 
     if version.lower() == "latest":
-        payload = await search_data()
+        payload = await _cached_dataflows()
         flows = _extract_scoped_dataflows(payload)
         matches: list[tuple[str, str]] = []
         for df in flows:
@@ -788,9 +788,8 @@ def _normalize_manual_key(key: str, dimension_order: list[str]) -> str:
     return ".".join(parts)
 
 
-@mcp.resource("sdmx://unicef/dataflows")
-async def search_data() -> dict[str, Any]:
-    """Search data catalog (cached SDMX dataflows)."""
+async def _cached_dataflows() -> dict[str, Any]:
+    """Internal cached SDMX dataflows payload for discovery tools."""
     if "dataflows" not in _dataflow_cache:
         _dataflow_cache["dataflows"] = await _get_json(_dataflow_url())
     return _dataflow_cache["dataflows"]
@@ -801,7 +800,7 @@ async def list_agencies(limit: int = 50) -> list[dict[str, Any]]:
     """
     List agencies from the UNICEF SDMX service with optional descriptions.
     """
-    payload = await search_data()
+    payload = await _cached_dataflows()
     scoped_flows = _extract_scoped_dataflows(payload)
     scoped_agency_ids = {
         str(df.get("agencyID") or df.get("agencyId"))
@@ -847,7 +846,7 @@ async def search_dataflows(query: str, limit: int = 10) -> list[dict[str, Any]]:
     Search UNICEF SDMX dataflows by id/name/description.
     Returns lightweight matches with a flowRef you can pass to other tools.
     """
-    payload = await search_data()
+    payload = await _cached_dataflows()
     flows = _extract_scoped_dataflows(payload)
     matches: list[dict[str, Any]] = []
     q = query.strip()
@@ -893,7 +892,7 @@ async def list_dataflows_grouped(
     List dataflows grouped by a theme hint inferred from flow IDs.
     Optionally pass prefixMap to map id prefixes to human-friendly labels.
     """
-    payload = await search_data()
+    payload = await _cached_dataflows()
     flows = _extract_scoped_dataflows(payload)
     if prefixMap is None:
         prefixMap = DEFAULT_THEME_PREFIX_MAP
@@ -946,7 +945,7 @@ async def list_theme_prefixes(limit: int = 50) -> list[dict[str, Any]]:
     """
     Scan dataflows and return common id prefixes with counts and examples.
     """
-    payload = await search_data()
+    payload = await _cached_dataflows()
     flows = _extract_scoped_dataflows(payload)
     counts: dict[str, dict[str, Any]] = {}
     for df in flows:
@@ -1081,7 +1080,7 @@ async def find_indicator_candidates(
             raise ValueError("INDICATOR dimension not found for this flow.")
         return _ranked_code_matches(codes, q, limit=limit)
 
-    payload = await search_data()
+    payload = await _cached_dataflows()
     flows = _extract_scoped_dataflows(payload)
     if flowQuery:
         flow_q = flowQuery.strip().lower()
