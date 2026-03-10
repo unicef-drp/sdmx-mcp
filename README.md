@@ -104,17 +104,20 @@ All tools are defined in `server.py`.
 9. `list_codes(flowRef, dimension, query=None, limit=50)`
 - Purpose: list codes for one dimension, optional text filter.
 
-10. `find_indicator_candidates(flowRef, query, limit=10)`
-- Purpose: rank `INDICATOR` codes by relevance to user text.
+10. `find_indicator_candidates(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
+- Purpose: rank `INDICATOR` codes by relevance to user text; when `flowRef` is omitted, scan scoped flows.
 
-11. `get_flow_structure(flowRef)`
+11. `search_indicators(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
+- Purpose: alias of `find_indicator_candidates`.
+
+12. `get_flow_structure(flowRef)`
 - Purpose: fetch/cache structure payload (`references=all`).
 
-12. `build_key(flowRef, selections)`
+13. `build_key(flowRef, selections)`
 - Purpose: build SDMX key from dimension selections.
 - Notes: supports list/comma syntax for multi-code segments.
 
-13. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
+14. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
   - requires either (`startPeriod` + `endPeriod`) or `lastNObservations`
@@ -191,6 +194,12 @@ Restart Claude Desktop after editing.
 
 For codelist-backed dimensions, `build_key` and `query_data(filters=...)` must use code IDs (as returned by `list_codes`), not display labels.
 If a caller passes a manual `key` with too few segments, `query_data` pads missing trailing dimensions as wildcard segments automatically.
+
+Recommended discovery sequence:
+1. `find_indicator_candidates(query)` to find indicator IDs across scoped flows.
+2. Use each candidate's `recommendedFlowRef` (or inspect `dataflows`) to choose a flow.
+3. `list_codes(flowRef, "GEO", query=...)` and other dimension tools to constrain the slice.
+4. `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
 
 ## Troubleshooting
 

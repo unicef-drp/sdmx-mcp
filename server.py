@@ -1,5 +1,6 @@
 import logging
 import csv
+import os
 from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
@@ -15,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO)
 
 BASE = "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest"
+AGENCY_ALLOWLIST = {item.strip() for item in os.getenv("SDMX_AGENCY_ALLOWLIST", "").split(",") if item.strip()}
 
 # Bind to all interfaces so DNS rebinding protection isn't auto-enabled for localhost-only hosts.
 mcp = FastMCP("unicef-sdmx", json_response=True, host="0.0.0.0", stateless_http=True)
@@ -107,6 +109,14 @@ def _match_score(text: str, query: str) -> int:
 
 
 def _ranked_code_matches(codes: list[dict[str, Any]], query: str, limit: int = 10) -> list[dict[str, Any]]:
+    ranked = _scored_code_matches(codes, query)
+    trimmed = ranked[:limit]
+    for item in trimmed:
+        item.pop("_score", None)
+    return trimmed
+
+
+def _scored_code_matches(codes: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
     q = (query or "").strip()
     if not q:
         return []
@@ -132,10 +142,44 @@ def _ranked_code_matches(codes: list[dict[str, Any]], query: str, limit: int = 1
             }
         )
     ranked.sort(key=lambda item: item.get("_score", 0), reverse=True)
-    trimmed = ranked[:limit]
-    for item in trimmed:
-        item.pop("_score", None)
-    return trimmed
+    return ranked
+
+
+def _indicator_codes_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    dims = _dimension_metadata(payload)
+    target = next((d for d in dims if d.get("id") == "INDICATOR"), None)
+    if not target:
+        return []
+    codelist_id = target.get("codelist")
+    if not isinstance(codelist_id, str) or not codelist_id.strip():
+        return []
+    codelists = _codelist_map(payload)
+    codelist = codelists.get(codelist_id) or codelists.get(_codelist_key(codelist_id))
+    if not codelist:
+        return []
+    return _codelist_codes(codelist)
+
+
+def _is_cross_sectional_flow(df_id: str, name: str = "", description: str = "") -> bool:
+    text = f"{df_id} {name} {description}".lower()
+    return any(marker in text for marker in ("cross-sectional", "cross sectional", "cross_sectional"))
+
+
+def _pick_recommended_flow(candidates: list[dict[str, Any]], query: str) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+
+    def _rank(item: dict[str, Any]) -> tuple[int, int, int, str]:
+        agency = str(item.get("agencyID") or "")
+        flow_name = str(item.get("flowName") or "")
+        flow_desc = str(item.get("flowDescription") or "")
+        flow_id = str(item.get("flowID") or "")
+        flow_score = _match_score(f"{flow_id} {flow_name} {flow_desc}".lower(), query)
+        cross_penalty = 1 if item.get("isCrossSectional") else 0
+        unicef_bonus = 1 if agency == "UNICEF" else 0
+        return (flow_score, unicef_bonus, -cross_penalty, flow_id)
+
+    return max(candidates, key=_rank)
 
 
 def _extract_dataflows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -157,6 +201,18 @@ def _extract_dataflows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         elif isinstance(dataflows, list):
             flows.extend([df for df in dataflows if isinstance(df, dict)])
     return flows
+
+
+def _extract_scoped_dataflows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    flows = _extract_dataflows(payload)
+    if not AGENCY_ALLOWLIST:
+        return flows
+    scoped: list[dict[str, Any]] = []
+    for df in flows:
+        agency = df.get("agencyID") or df.get("agencyId")
+        if isinstance(agency, str) and agency in AGENCY_ALLOWLIST:
+            scoped.append(df)
+    return scoped
 
 
 def _extract_agencies(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -355,7 +411,7 @@ async def _data_path_for_query(flow_ref: str) -> str:
 
     if version.lower() == "latest":
         payload = await dataflows_resource()
-        flows = _extract_dataflows(payload)
+        flows = _extract_scoped_dataflows(payload)
         matches: list[tuple[str, str]] = []
         for df in flows:
             match_id = df.get("id") or df.get("ID")
@@ -780,7 +836,7 @@ async def search_dataflows(query: str, limit: int = 10) -> list[dict[str, Any]]:
     Returns lightweight matches with a flowRef you can pass to other tools.
     """
     payload = await dataflows_resource()
-    flows = _extract_dataflows(payload)
+    flows = _extract_scoped_dataflows(payload)
     matches: list[dict[str, Any]] = []
     q = query.strip()
 
@@ -826,7 +882,7 @@ async def list_dataflows_grouped(
     Optionally pass prefixMap to map id prefixes to human-friendly labels.
     """
     payload = await dataflows_resource()
-    flows = _extract_dataflows(payload)
+    flows = _extract_scoped_dataflows(payload)
     if prefixMap is None:
         prefixMap = DEFAULT_THEME_PREFIX_MAP
     q = (query or "").strip()
@@ -879,7 +935,7 @@ async def list_theme_prefixes(limit: int = 50) -> list[dict[str, Any]]:
     Scan dataflows and return common id prefixes with counts and examples.
     """
     payload = await dataflows_resource()
-    flows = _extract_dataflows(payload)
+    flows = _extract_scoped_dataflows(payload)
     counts: dict[str, dict[str, Any]] = {}
     for df in flows:
         df_id = df.get("id") or df.get("ID")
@@ -992,31 +1048,133 @@ async def list_codes(
 
 @mcp.tool()
 async def find_indicator_candidates(
-    flowRef: str,
     query: str,
+    flowRef: str | None = None,
     limit: int = 10,
+    flowQuery: str | None = None,
+    flowLimit: int = 200,
 ) -> list[dict[str, Any]]:
     """
     Rank indicator codes by matching query text against codelist labels/descriptions.
+    If flowRef is omitted, scan scoped flows and return indicator candidates with matching dataflows.
     """
-    payload = await get_flow_structure(flowRef)
-    dims = _dimension_metadata(payload)
-    target = next((d for d in dims if d.get("id") == "INDICATOR"), None)
-    if not target:
-        raise ValueError("INDICATOR dimension not found for this flow.")
-    codelist_id = target.get("codelist")
-    if not codelist_id:
-        raise ValueError("INDICATOR dimension does not have a codelist reference.")
-    codelists = _codelist_map(payload)
-    codelist = codelists.get(codelist_id) or codelists.get(_codelist_key(codelist_id))
-    if not codelist:
-        raise ValueError(f"Codelist '{codelist_id}' not found in structure payload.")
-    codes = codelist.get("codes") or codelist.get("code") or []
-    if isinstance(codes, dict):
-        codes = list(codes.values())
-    if not isinstance(codes, list):
-        codes = []
-    return _ranked_code_matches(codes, query, limit=limit)
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    if flowRef:
+        payload = await get_flow_structure(flowRef)
+        codes = _indicator_codes_from_payload(payload)
+        if not codes:
+            raise ValueError("INDICATOR dimension not found for this flow.")
+        return _ranked_code_matches(codes, q, limit=limit)
+
+    payload = await dataflows_resource()
+    flows = _extract_scoped_dataflows(payload)
+    if flowQuery:
+        flow_q = flowQuery.strip().lower()
+        scored_flows: list[tuple[int, dict[str, Any]]] = []
+        for df in flows:
+            df_id = str(df.get("id") or df.get("ID") or "")
+            name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
+            desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
+            score = _match_score(f"{df_id} {name} {desc}".lower(), flow_q)
+            if score > 0:
+                scored_flows.append((score, df))
+        scored_flows.sort(key=lambda item: item[0], reverse=True)
+        flows = [item[1] for item in scored_flows]
+
+    if flowLimit > 0:
+        flows = flows[:flowLimit]
+
+    merged: dict[str, dict[str, Any]] = {}
+
+    for df in flows:
+        df_id = str(df.get("id") or df.get("ID") or "").strip()
+        if not df_id:
+            continue
+        agency = str(df.get("agencyID") or df.get("agencyId") or "all")
+        version = str(df.get("version") or "latest")
+        flow_ref = _flow_ref_for(df_id, version, agency)
+        flow_name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
+        flow_desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
+
+        try:
+            structure = await get_flow_structure(flow_ref)
+        except Exception:
+            continue
+
+        codes = _indicator_codes_from_payload(structure)
+        if not codes:
+            continue
+        for item in _scored_code_matches(codes, q):
+            code_id = str(item.get("id") or "").strip()
+            if not code_id:
+                continue
+            bucket = merged.setdefault(
+                code_id,
+                {
+                    "id": code_id,
+                    "name": item.get("name") or "",
+                    "description": item.get("description") or "",
+                    "_score": int(item.get("_score") or 0),
+                    "dataflows": [],
+                },
+            )
+
+            item_score = int(item.get("_score") or 0)
+            if item_score > int(bucket.get("_score") or 0):
+                bucket["_score"] = item_score
+                bucket["name"] = item.get("name") or bucket.get("name") or ""
+                bucket["description"] = item.get("description") or bucket.get("description") or ""
+
+            flow_candidates: list[dict[str, Any]] = bucket["dataflows"]
+            if any(existing.get("flowRef") == flow_ref for existing in flow_candidates):
+                continue
+            flow_candidates.append(
+                {
+                    "flowRef": flow_ref,
+                    "agencyID": agency,
+                    "flowID": df_id,
+                    "flowName": flow_name,
+                    "flowDescription": flow_desc,
+                    "isCrossSectional": _is_cross_sectional_flow(df_id, flow_name, flow_desc),
+                }
+            )
+
+    ranked = sorted(
+        merged.values(),
+        key=lambda item: (int(item.get("_score") or 0), len(item.get("dataflows") or [])),
+        reverse=True,
+    )[:limit]
+
+    for item in ranked:
+        candidates = item.get("dataflows") or []
+        recommended = _pick_recommended_flow(candidates, q)
+        item["recommendedFlowRef"] = recommended.get("flowRef") if isinstance(recommended, dict) else None
+        item.pop("_score", None)
+
+    return ranked
+
+
+@mcp.tool()
+async def search_indicators(
+    query: str,
+    flowRef: str | None = None,
+    limit: int = 10,
+    flowQuery: str | None = None,
+    flowLimit: int = 200,
+) -> list[dict[str, Any]]:
+    """
+    Alias for find_indicator_candidates with identical behavior and parameters.
+    """
+    return await find_indicator_candidates(
+        query=query,
+        flowRef=flowRef,
+        limit=limit,
+        flowQuery=flowQuery,
+        flowLimit=flowLimit,
+    )
 
 
 @mcp.tool()
