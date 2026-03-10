@@ -171,9 +171,6 @@ Recommended discovery sequence:
 3. `list_codes(flowRef, "GEO", query=...)` and other dimension tools to constrain the slice.
 4. `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
 
-For codelist-backed dimensions, `build_key` and `query_data(filters=...)` must use code IDs (as returned by `list_codes`), not display labels.
-If a caller passes a manual `key` with too few segments, `query_data` pads missing trailing dimensions as wildcard segments automatically.
-
 ## Troubleshooting
 
 1. `406 Not Acceptable`
