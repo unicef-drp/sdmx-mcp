@@ -8,6 +8,10 @@ primary_region = 'fra'
 
 [build]
 
+[deploy]
+  [deploy.release_command_vm]
+    memory = '2048mb'
+
 [http_service]
   internal_port = 8000
   force_https = true
@@ -17,6 +21,6 @@ primary_region = 'fra'
   processes = ['app']
 
 [[vm]]
-  memory = '256mb'
+  memory = '2048mb'
   cpus = 1
-  memory_mb = 256
+  memory_mb = 2048
