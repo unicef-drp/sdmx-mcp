@@ -1848,10 +1848,12 @@ async def list_codes(
     dimension: str,
     query: str | None = None,
     limit: int = 50,
+    includeHierarchyHints: bool = True,
 ) -> list[dict[str, Any]]:
     """
     List codes for a specific dimension, optionally filtered by a query string.
-    Results are enriched with hierarchy matches when related hierarchical codelists are available.
+    Results can be enriched with hierarchy-aware hints so callers can see whether
+    a code looks atomic, aggregate, or structurally ambiguous at discovery time.
     """
     _assert_flowref_in_scope(flowRef)
     payload = await get_flow_structure(flowRef)
@@ -1874,7 +1876,18 @@ async def list_codes(
     if not isinstance(codes, list):
         codes = []
     q = (query or "").strip().lower()
-    hierarchy_context = await _dimension_hierarchy_context(flowRef, payload, dim_id)
+    code_map = {
+        str(code.get("id") or code.get("ID")): code
+        for code in codes
+        if isinstance(code, dict) and isinstance(code.get("id") or code.get("ID"), str)
+    }
+    parent_links = _code_parent_links(code_map)
+    reverse_parent_links: dict[str, str] = {}
+    for parent_id, children in parent_links.items():
+        for child_id in children:
+            reverse_parent_links[child_id] = parent_id
+
+    hierarchy_context = await _dimension_hierarchy_context(flowRef, payload, dim_id) if includeHierarchyHints else []
     hierarchy_edges: dict[str, dict[str, set[str]]] = {}
     for item in hierarchy_context:
         hierarchy_ref = str(item.get("hierarchyRef") or "")
@@ -1890,35 +1903,55 @@ async def list_codes(
             continue
         name = _coerce_text(code.get("name")) or _coerce_text(code.get("names"))
         desc = _coerce_text(code.get("description")) or _coerce_text(code.get("descriptions"))
+        codelist_children = sorted(parent_links.get(code_id, set()))
         hierarchy_matches: list[dict[str, Any]] = []
-        for item in hierarchy_context:
-            hierarchy_ref = str(item.get("hierarchyRef") or "")
-            edges = hierarchy_edges.get(hierarchy_ref) or {}
-            descendants = _ref_area_descendants(edges, code_id) if edges else []
-            if not descendants:
-                continue
-            members = _leaf_members(edges, descendants)
-            hierarchy_matches.append(
-                {
-                    "hierarchyRef": hierarchy_ref,
-                    "name": item.get("name") or "",
-                    "memberCount": len(members),
-                    "memberPreview": members[:10],
-                }
-            )
+        if includeHierarchyHints:
+            for item in hierarchy_context:
+                hierarchy_ref = str(item.get("hierarchyRef") or "")
+                edges = hierarchy_edges.get(hierarchy_ref) or {}
+                descendants = _ref_area_descendants(edges, code_id) if edges else []
+                if not descendants:
+                    continue
+                members = _leaf_members(edges, descendants)
+                hierarchy_matches.append(
+                    {
+                        "hierarchyRef": hierarchy_ref,
+                        "name": item.get("name") or "",
+                        "memberCount": len(members),
+                        "memberPreview": members[:10],
+                    }
+                )
         hierarchy_text = " ".join(
             f"{match.get('hierarchyRef','')} {match.get('name','')}" for match in hierarchy_matches
         )
         text = f"{code_id} {name} {desc} {hierarchy_text}".lower()
         if q and q not in text:
             continue
+        has_children = bool(codelist_children) or bool(hierarchy_matches)
+        structural_evidence_available = includeHierarchyHints and (bool(parent_links) or bool(hierarchy_context))
+        if has_children:
+            kind = "aggregate"
+        elif structural_evidence_available:
+            kind = "leaf"
+        else:
+            kind = "unknown"
         results.append(
             {
                 "id": code_id,
                 "name": name,
                 "description": desc,
-                "isAggregate": bool(hierarchy_matches),
-                "hierarchyMatches": hierarchy_matches,
+                "kind": kind,
+                "expandable": has_children,
+                "hasChildren": has_children,
+                "memberCount": max(
+                    [len(codelist_children)] + [int(match.get("memberCount") or 0) for match in hierarchy_matches],
+                    default=0,
+                ),
+                "hierarchySource": (hierarchy_matches[0].get("hierarchyRef") if hierarchy_matches else ""),
+                "childrenPreview": codelist_children[:10],
+                "parentCode": reverse_parent_links.get(code_id) or "",
+                "hierarchyMatches": hierarchy_matches if includeHierarchyHints else [],
+                "hierarchyHintsIncluded": includeHierarchyHints,
             }
         )
         if len(results) >= limit:
