@@ -161,6 +161,8 @@ curl -sS --max-time 20 -X POST https://<your-app>.fly.dev/mcp \
 12. `get_flow_structure(flowRef)`
 13. `build_key(flowRef, selections)`
 14. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
+14. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+15. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
 
 For codelist-backed dimensions, `build_key` and `query_data(filters=...)` must use code IDs (as returned by `list_codes`), not display labels.
 If a caller passes a manual `key` with too few segments, `query_data` pads missing trailing dimensions as wildcard segments automatically.
@@ -169,7 +171,8 @@ Recommended discovery sequence:
 1. `find_indicator_candidates(query)` to find indicator IDs across scoped flows.
 2. Use each candidate's `recommendedFlowRef` (or inspect `dataflows`) to choose a flow.
 3. `list_codes(flowRef, "GEO", query=...)` and other dimension tools to constrain the slice.
-4. `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
+4. `validate_query_scope(flowRef, filters=...)` or `build_key(...)` then `validate_query_scope(...)`.
+5. Only if the preflight resolves, call `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
 
 ## Troubleshooting
 
