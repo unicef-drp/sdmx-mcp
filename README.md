@@ -155,14 +155,19 @@ curl -sS --max-time 20 -X POST https://<your-app>.fly.dev/mcp \
 6. `list_theme_prefix_conflicts(limit=100)`
 7. `describe_flow(flowRef)`
 8. `list_dimensions(flowRef)`
-9. `list_codes(flowRef, dimension, query=None, limit=50)`
-10. `find_indicator_candidates(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
-11. `search_indicators(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)` (alias of `find_indicator_candidates`)
-12. `get_flow_structure(flowRef)`
-13. `build_key(flowRef, selections)`
-14. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
-14. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
-15. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
+9. `list_codes(flowRef, dimension, query=None, limit=50, includeHierarchyHints=True)`
+10. `search_reference_candidates(flowRef, query, dimension=None, limit=20)`
+11. `find_indicator_candidates(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
+12. `search_indicators(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)` (alias of `find_indicator_candidates`)
+13. `get_flow_structure(flowRef)`
+14. `build_key(flowRef, selections)`
+15. `list_hierarchical_codelists(agency=None, query=None, limit=50)`
+16. `describe_hierarchical_codelist(hierarchyRef)`
+17. `resolve_hierarchy(flowRef, dimension, code)`
+18. `expand_dimension_group(flowRef, dimension, code)`
+19. `resolve_dimension_fallback(flowRef, dimension, code, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+20. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+21. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
 
 For codelist-backed dimensions, `build_key` and `query_data(filters=...)` must use code IDs (as returned by `list_codes`), not display labels.
 If a caller passes a manual `key` with too few segments, `query_data` pads missing trailing dimensions as wildcard segments automatically.
@@ -171,8 +176,9 @@ Recommended discovery sequence:
 1. `find_indicator_candidates(query)` to find indicator IDs across scoped flows.
 2. Use each candidate's `recommendedFlowRef` (or inspect `dataflows`) to choose a flow.
 3. `list_codes(flowRef, "GEO", query=...)` and other dimension tools to constrain the slice.
-4. `validate_query_scope(flowRef, filters=...)` or `build_key(...)` then `validate_query_scope(...)`.
-5. Only if the preflight resolves, call `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
+4. If a selected code may be aggregate, call `resolve_hierarchy(...)` or `resolve_dimension_fallback(...)`.
+5. `validate_query_scope(flowRef, filters=...)` or `build_key(...)` then `validate_query_scope(...)`.
+6. Only if the preflight resolves, call `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
 
 ## Troubleshooting
 
