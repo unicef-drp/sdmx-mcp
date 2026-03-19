@@ -101,9 +101,10 @@ All tools are defined in `server.py`.
 8. `list_dimensions(flowRef)`
 - Purpose: ordered dimensions with concept/codelist references.
 
-9. `list_codes(flowRef, dimension, query=None, limit=50)`
+9. `list_codes(flowRef, dimension, query=None, limit=50, includeHierarchyHints=True)`
 - Purpose: list codes for one dimension, optional text filter.
-- Behavior: when related hierarchical codelists are available, results are enriched with `isAggregate` and `hierarchyMatches` so agents can discover aggregate nodes and member previews during normal code lookup.
+- Behavior: when `includeHierarchyHints=True`, results are enriched with lightweight structure hints such as `kind` (`leaf`, `aggregate`, or `unknown`), `expandable`, `hasChildren`, `memberCount`, `hierarchySource`, `childrenPreview`, `parentCode`, and `hierarchyMatches`.
+- Design: this makes `list_codes` the main code-discovery surface, while `expand_dimension_group` remains the explicit expansion step.
 
 10. `search_reference_candidates(flowRef, query, dimension=None, limit=20)`
 - Purpose: search group-like reference structures across ordinary codelists, codes, and hierarchical codelists.
