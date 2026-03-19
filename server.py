@@ -1,5 +1,6 @@
 import logging
 import csv
+import json
 import os
 from collections import Counter
 from pathlib import Path
@@ -51,6 +52,14 @@ async def _get_text_with_status(url: str) -> tuple[int, str]:
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(url, headers={"User-Agent": "unicef-sdmx-mcp/0.1"})
         return r.status_code, r.text
+
+
+def _source_scope() -> dict[str, Any]:
+    agencies = sorted(AGENCY_ALLOWLIST) if AGENCY_ALLOWLIST else []
+    return {
+        "allowedAgencies": agencies,
+        "policy": "Use only observations returned from these official SDMX flows. If unresolved, do not supplement with external facts.",
+    }
 
 
 def _dataflow_url() -> str:
@@ -530,6 +539,141 @@ def _parse_sdmx_error(text: str) -> str | None:
         if tag == "Text" and elem.text:
             return elem.text.strip()
     return None
+
+
+def _looks_like_json(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("{") or stripped.startswith("[")
+
+
+async def _resolved_flow_details(flowRef: str) -> dict[str, str]:
+    requested_agency, flow_id, requested_version = _flow_identifiers(flowRef)
+    flow_path = await _data_path_for_query(flowRef)
+    decoded = flow_path.replace("%2C", ",")
+    agency, _, version = (decoded.split(",") + ["", "", ""])[:3]
+    return {
+        "requestedFlowRef": flowRef,
+        "agencyID": agency or requested_agency,
+        "flowID": flow_id,
+        "version": version or requested_version,
+        "resolvedFlowRef": f"{agency or requested_agency}/{flow_id}/{version or requested_version}",
+    }
+
+
+def _query_context(
+    *,
+    flow_details: dict[str, str],
+    key: str,
+    query_url: str,
+    dimension_order: list[str] | None,
+    format: str,
+    labels: str | None,
+    startPeriod: str | None,
+    endPeriod: str | None,
+    lastNObservations: int | None,
+    filters: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "sourceScope": _source_scope(),
+        "provenance": {
+            **flow_details,
+            "key": key,
+            "dimensionOrder": dimension_order or [],
+            "queryURL": query_url,
+            "format": format,
+            "labels": labels,
+            "startPeriod": startPeriod,
+            "endPeriod": endPeriod,
+            "lastNObservations": lastNObservations,
+            "filters": filters or {},
+        },
+    }
+
+
+def _resolved_response(
+    *,
+    flow_details: dict[str, str],
+    key: str,
+    query_url: str,
+    dimension_order: list[str] | None,
+    format: str,
+    labels: str | None,
+    startPeriod: str | None,
+    endPeriod: str | None,
+    lastNObservations: int | None,
+    filters: dict[str, Any] | None,
+    maxObs: int,
+    raw_json: dict[str, Any] | None = None,
+    raw_csv: str | None = None,
+) -> dict[str, Any]:
+    payload = _query_context(
+        flow_details=flow_details,
+        key=key,
+        query_url=query_url,
+        dimension_order=dimension_order,
+        format=format,
+        labels=labels,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        filters=filters,
+    )
+    payload.update(
+        {
+            "status": "resolved",
+            "assistant_guidance": "Use only the observations returned here. Cite the agency, flow, key, and query URL when summarizing.",
+            "notes": {"maxObs": maxObs, "format": format, "labels": labels},
+        }
+    )
+    if raw_csv is not None:
+        payload["raw_csv"] = raw_csv
+    if raw_json is not None:
+        payload["raw"] = raw_json
+    return payload
+
+
+def _unresolved_response(
+    *,
+    flow_details: dict[str, str],
+    key: str,
+    query_url: str,
+    dimension_order: list[str] | None,
+    format: str,
+    labels: str | None,
+    startPeriod: str | None,
+    endPeriod: str | None,
+    lastNObservations: int | None,
+    filters: dict[str, Any] | None,
+    maxObs: int,
+    status_code: int | None,
+    raw_text: str,
+    message: str | None = None,
+) -> dict[str, Any]:
+    payload = _query_context(
+        flow_details=flow_details,
+        key=key,
+        query_url=query_url,
+        dimension_order=dimension_order,
+        format=format,
+        labels=labels,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        filters=filters,
+    )
+    payload.update(
+        {
+            "status": "unresolved_from_official_flows",
+            "assistant_guidance": "Do not supplement this with non-MCP facts. State that the UNICEF/UNPD flow query did not resolve and report the attempted flow, key, and query URL.",
+            "error": {
+                "status": status_code,
+                "message": message or _parse_sdmx_error(raw_text) or "Query did not resolve from official UNICEF/UNPD flows.",
+                "raw": raw_text,
+            },
+            "notes": {"maxObs": maxObs, "format": format, "labels": labels},
+        }
+    )
+    return payload
 
 
 def _codelist_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1221,6 +1365,40 @@ async def build_key(flowRef: str, selections: dict[str, Any] | None = None) -> d
 
 
 @mcp.tool()
+async def validate_query_scope(
+    flowRef: str,
+    key: Optional[str] = None,
+    filters: dict[str, Any] | None = None,
+    startPeriod: Optional[str] = None,
+    endPeriod: Optional[str] = None,
+    lastNObservations: Optional[int] = 1,
+    labels: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Preflight whether a concrete query resolves from the official UNICEF/UNPD flows.
+    This is intended to fail early before any narrative answer is attempted.
+    """
+    result = await query_data(
+        flowRef=flowRef,
+        key=key,
+        filters=filters,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        format="sdmx-json",
+        labels=labels,
+        maxObs=1,
+    )
+    return {
+        "status": result.get("status"),
+        "sourceScope": result.get("sourceScope"),
+        "provenance": result.get("provenance"),
+        "assistant_guidance": result.get("assistant_guidance"),
+        "error": result.get("error"),
+    }
+
+
+@mcp.tool()
 async def query_data(
     flowRef: str,
     key: Optional[str] = None,
@@ -1240,6 +1418,9 @@ async def query_data(
     if not (startPeriod and endPeriod) and not lastNObservations:
         raise ValueError("Provide start/end periods or lastNObservations to avoid unbounded extracts.")
 
+    dimension_order: list[str] | None = None
+    normalized_filters: dict[str, Any] | None = None
+
     if filters:
         dimension_order = await _dimension_order_for_flow(flowRef)
         normalized_filters = await _normalize_filters_to_code_ids(flowRef, filters)
@@ -1252,7 +1433,8 @@ async def query_data(
         raise ValueError("Provide either a key or filters to identify the data slice.")
 
     # Standard SDMX pattern: /data/{flowRef}/{key}?startPeriod=...&endPeriod=...&format=...
-    flow_path = await _data_path_for_query(flowRef)
+    flow_details = await _resolved_flow_details(flowRef)
+    flow_path = _data_path_for(flow_details["resolvedFlowRef"])
     params: list[str] = []
     if startPeriod and endPeriod:
         params.append(f"startPeriod={quote(startPeriod)}")
@@ -1267,22 +1449,103 @@ async def query_data(
     if format.lower() == "csv":
         status, text = await _get_text_with_status(url)
         if status >= 400:
-            return {
-                "query_url": url,
-                "error": {
-                    "status": status,
-                    "message": _parse_sdmx_error(text),
-                    "raw": text,
-                },
-                "notes": {"maxObs": maxObs, "format": "csv"},
-            }
-        return {
-            "query_url": url,
-            "raw_csv": text,
-            "notes": {"maxObs": maxObs, "format": "csv", "labels": labels},
-        }
+            return _unresolved_response(
+                flow_details=flow_details,
+                key=key,
+                query_url=url,
+                dimension_order=dimension_order,
+                format="csv",
+                labels=labels,
+                startPeriod=startPeriod,
+                endPeriod=endPeriod,
+                lastNObservations=lastNObservations,
+                filters=normalized_filters,
+                maxObs=maxObs,
+                status_code=status,
+                raw_text=text,
+            )
+        return _resolved_response(
+            flow_details=flow_details,
+            key=key,
+            query_url=url,
+            dimension_order=dimension_order,
+            format="csv",
+            labels=labels,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=lastNObservations,
+            filters=normalized_filters,
+            maxObs=maxObs,
+            raw_csv=text,
+        )
 
-    raw = await _get_json(url)
+    status, text = await _get_text_with_status(url)
+    if status >= 400:
+        return _unresolved_response(
+            flow_details=flow_details,
+            key=key,
+            query_url=url,
+            dimension_order=dimension_order,
+            format=format,
+            labels=labels,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=lastNObservations,
+            filters=normalized_filters,
+            maxObs=maxObs,
+            status_code=status,
+            raw_text=text,
+        )
 
-    # Minimal guardrail: if server returns huge payloads, you can add a response-size check here.
-    return {"query_url": url, "raw": raw, "notes": {"maxObs": maxObs, "format": format, "labels": labels}}
+    if not _looks_like_json(text):
+        return _unresolved_response(
+            flow_details=flow_details,
+            key=key,
+            query_url=url,
+            dimension_order=dimension_order,
+            format=format,
+            labels=labels,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=lastNObservations,
+            filters=normalized_filters,
+            maxObs=maxObs,
+            status_code=status,
+            raw_text=text,
+            message="Expected SDMX JSON but received a non-JSON response.",
+        )
+
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError:
+        return _unresolved_response(
+            flow_details=flow_details,
+            key=key,
+            query_url=url,
+            dimension_order=dimension_order,
+            format=format,
+            labels=labels,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=lastNObservations,
+            filters=normalized_filters,
+            maxObs=maxObs,
+            status_code=status,
+            raw_text=text,
+            message="Received a malformed JSON payload from the official flow.",
+        )
+
+    return _resolved_response(
+        flow_details=flow_details,
+        key=key,
+        query_url=url,
+        dimension_order=dimension_order,
+        format=format,
+        labels=labels,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        filters=normalized_filters,
+        maxObs=maxObs,
+        raw_json=raw,
+    )

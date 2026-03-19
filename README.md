@@ -117,7 +117,11 @@ All tools are defined in `server.py`.
 - Purpose: build SDMX key from dimension selections.
 - Notes: supports list/comma syntax for multi-code segments.
 
-14. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
+14. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+- Purpose: preflight whether a concrete UNICEF/UNPD query resolves before any narrative answer is attempted.
+- Returns: structured source-bound status with `status`, `sourceScope`, `provenance`, optional `error`, and `assistant_guidance`.
+
+15. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
   - requires either (`startPeriod` + `endPeriod`) or `lastNObservations`
@@ -125,7 +129,10 @@ All tools are defined in `server.py`.
   - leaves unspecified dimensions as empty key segments (`.` wildcard)
   - supports `format='csv'` and returns `raw_csv`
   - supports optional `labels` parameter (for example `labels=both` with CSV)
+  - returns explicit `status` of either `resolved` or `unresolved_from_official_flows`
+  - always includes `sourceScope`, `provenance`, and `assistant_guidance`
   - parses SDMX XML error payloads into structured `error.message`
+  - on unresolved queries, callers should stop and report the failed official query instead of supplementing with external facts
 
 ## Agent Test Rig
 
@@ -199,7 +206,8 @@ Recommended discovery sequence:
 1. `find_indicator_candidates(query)` to find indicator IDs across scoped flows.
 2. Use each candidate's `recommendedFlowRef` (or inspect `dataflows`) to choose a flow.
 3. `list_codes(flowRef, "GEO", query=...)` and other dimension tools to constrain the slice.
-4. `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
+4. `validate_query_scope(flowRef, filters=...)` or `build_key(...)` then `validate_query_scope(...)`.
+5. Only if the preflight resolves, call `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
 
 ## Troubleshooting
 
