@@ -1025,6 +1025,81 @@ async def _get_hierarchical_edges(hierarchy_ref: str) -> dict[str, set[str]]:
     return edges
 
 
+def _hierarchy_dimension_candidates(
+    *,
+    hierarchy_id: str,
+    hierarchy_name: str,
+    dimensions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    text = f"{hierarchy_id} {hierarchy_name}".lower()
+    matches: list[dict[str, Any]] = []
+    for dim in dimensions:
+        dim_id = str(dim.get("id") or "").upper()
+        codelist = str(dim.get("codelist") or "")
+        codelist_key = _codelist_key(codelist).lower() if codelist else ""
+        score = 0
+        reasons: list[str] = []
+        if dim_id and dim_id.lower() in text:
+            score += 20
+            reasons.append("hierarchy id/name mentions the dimension")
+        if codelist_key and codelist_key in text:
+            score += 40
+            reasons.append("hierarchy id/name matches the dimension codelist")
+        if dim_id == "REF_AREA" and hierarchy_id.upper() == "UNICEF_REPORTING_REGIONS":
+            score += 60
+            reasons.append("official UNICEF reporting-regions hierarchy is preferred for REF_AREA")
+        if score > 0:
+            matches.append(
+                {
+                    "dimension": dim_id,
+                    "codelist": codelist,
+                    "score": score,
+                    "reasons": reasons,
+                }
+            )
+    matches.sort(key=lambda item: int(item.get("score") or 0), reverse=True)
+    return matches
+
+
+async def _structure_hierarchy_summaries(flowRef: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    flow_details = await _resolved_flow_details(flowRef)
+    agency = flow_details.get("agencyID") or "all"
+    dimensions = _dimension_metadata(payload)
+    catalog = await _list_hierarchical_codelists_for_agency(agency)
+    summaries: list[dict[str, Any]] = []
+    for item in catalog:
+        hierarchy_id = str(item.get("id") or "")
+        version = str(item.get("version") or "latest")
+        hierarchy_ref = _flow_ref_for(hierarchy_id, version, str(item.get("agencyID") or agency))
+        dimension_matches = _hierarchy_dimension_candidates(
+            hierarchy_id=hierarchy_id,
+            hierarchy_name=str(item.get("name") or ""),
+            dimensions=dimensions,
+        )
+        if not dimension_matches:
+            continue
+        edges = await _get_hierarchical_edges(hierarchy_ref)
+        all_children = {child for children in edges.values() for child in children}
+        roots = sorted(code for code in edges if code not in all_children)[:10]
+        summaries.append(
+            {
+                "hierarchyRef": hierarchy_ref,
+                "id": hierarchy_id,
+                "version": version,
+                "name": item.get("name") or "",
+                "description": item.get("description") or "",
+                "dimensionMatches": dimension_matches[:3],
+                "rootCodes": roots,
+                "rootCount": len(roots),
+            }
+        )
+    summaries.sort(
+        key=lambda item: max((int(match.get("score") or 0) for match in item.get("dimensionMatches", [])), default=0),
+        reverse=True,
+    )
+    return summaries[:10]
+
+
 async def _preferred_ref_area_hierarchy(payload: dict[str, Any]) -> tuple[dict[str, set[str]], str]:
     official = await _official_reporting_region_hierarchy()
     if official:
@@ -1664,7 +1739,15 @@ async def get_flow_structure(flowRef: str) -> dict[str, Any]:
     """
     if flowRef not in _structure_cache:
         _structure_cache[flowRef] = await _get_json(_structure_url(flowRef))
-    return _structure_cache[flowRef]
+    payload = _structure_cache[flowRef]
+    hierarchy_summaries = await _structure_hierarchy_summaries(flowRef, payload)
+    enriched = dict(payload)
+    enriched["hierarchicalCodelists"] = hierarchy_summaries
+    enriched["assistant_guidance"] = (
+        "If a selected code looks aggregate, inspect hierarchicalCodelists or use resolve_hierarchy / "
+        "resolve_dimension_fallback before retrying with member codes."
+    )
+    return enriched
 
 
 @mcp.tool()
