@@ -105,41 +105,45 @@ All tools are defined in `server.py`.
 - Purpose: list codes for one dimension, optional text filter.
 - Behavior: when related hierarchical codelists are available, results are enriched with `isAggregate` and `hierarchyMatches` so agents can discover aggregate nodes and member previews during normal code lookup.
 
-10. `find_indicator_candidates(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
+10. `search_reference_candidates(flowRef, query, dimension=None, limit=20)`
+- Purpose: search group-like reference structures across ordinary codelists, codes, and hierarchical codelists.
+- Use when a user query implies a region, category, country group, or other aggregate concept, especially when reference data debt means the grouping lives in a normal codelist rather than a formal hierarchy.
+
+11. `find_indicator_candidates(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
 - Purpose: rank `INDICATOR` codes by relevance to user text; when `flowRef` is omitted, scan scoped flows.
 
-11. `search_indicators(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
+12. `search_indicators(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
 - Purpose: alias of `find_indicator_candidates`.
 
-12. `get_flow_structure(flowRef)`
+13. `get_flow_structure(flowRef)`
 - Purpose: fetch/cache structure payload (`references=all`).
 
-13. `build_key(flowRef, selections)`
+14. `build_key(flowRef, selections)`
 - Purpose: build SDMX key from dimension selections.
 - Notes: supports list/comma syntax for multi-code segments.
 
-14. `list_hierarchical_codelists(agency=None, query=None, limit=50)`
+15. `list_hierarchical_codelists(agency=None, query=None, limit=50)`
 - Purpose: list hierarchical codelists available for an agency.
 
-15. `describe_hierarchical_codelist(hierarchyRef)`
+16. `describe_hierarchical_codelist(hierarchyRef)`
 - Purpose: describe one hierarchical codelist and expose root codes.
 
-16. `resolve_hierarchy(flowRef, dimension, code)`
+17. `resolve_hierarchy(flowRef, dimension, code)`
 - Purpose: choose the best matching hierarchy for a flow dimension/code.
 - Returns: `status` of `resolved`, `ambiguous`, or `unresolved`.
 - Behavior: if more than one hierarchy plausibly matches, the MCP returns ambiguity instead of guessing.
 
-17. `expand_dimension_group(flowRef, dimension, code)`
+18. `expand_dimension_group(flowRef, dimension, code)`
 - Purpose: expand an aggregate dimension code into descendant/member codes using the resolved hierarchy.
 
-18. `resolve_dimension_fallback(flowRef, dimension, code, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+19. `resolve_dimension_fallback(flowRef, dimension, code, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
 - Purpose: validate an aggregate dimension query and, if unresolved, return a hierarchy-based retry plan using member codes.
 
-19. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+20. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
 - Purpose: preflight whether a concrete UNICEF/UNPD query resolves before any narrative answer is attempted.
 - Returns: structured source-bound status with `status`, `sourceScope`, `provenance`, optional `error`, and `assistant_guidance`.
 
-20. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
+21. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
   - requires either (`startPeriod` + `endPeriod`) or `lastNObservations`

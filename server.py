@@ -928,6 +928,31 @@ def _dimension_code_map(payload: dict[str, Any], dimension_id: str) -> dict[str,
     return mapping
 
 
+def _dimension_codelist(payload: dict[str, Any], dimension_id: str) -> dict[str, Any] | None:
+    dims = _dimension_metadata(payload)
+    target = next((d for d in dims if d.get("id") == dimension_id.strip().upper()), None)
+    if not target:
+        return None
+    codelist_id = target.get("codelist")
+    if not isinstance(codelist_id, str) or not codelist_id.strip():
+        return None
+    codelists = _codelist_map(payload)
+    return codelists.get(codelist_id) or codelists.get(_codelist_key(codelist_id))
+
+
+def _codelist_meta(payload: dict[str, Any], dimension_id: str) -> dict[str, Any]:
+    codelist = _dimension_codelist(payload, dimension_id)
+    if not codelist:
+        return {}
+    codelist_id = str(codelist.get("id") or codelist.get("ID") or "")
+    return {
+        "id": codelist_id,
+        "name": _coerce_text(codelist.get("name")) or _coerce_text(codelist.get("names")),
+        "description": _coerce_text(codelist.get("description")) or _coerce_text(codelist.get("descriptions")),
+        "key": _codelist_key(codelist_id) if codelist_id else "",
+    }
+
+
 def _ref_area_code_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return _dimension_code_map(payload, "REF_AREA")
 
@@ -1108,6 +1133,173 @@ async def _dimension_hierarchy_context(flowRef: str, payload: dict[str, Any], di
         if any(str(match.get("dimension") or "").upper() == dimension_id.upper() for match in matches):
             relevant.append(item)
     return relevant
+
+
+def _group_likelihood(text: str) -> int:
+    lowered = text.lower()
+    score = 0
+    for token in (
+        "region",
+        "subregion",
+        "country group",
+        "countries",
+        "group",
+        "cluster",
+        "category",
+        "categories",
+        "class",
+        "domain",
+        "area",
+        "programme region",
+    ):
+        if token in lowered:
+            score += 5
+    return score
+
+
+async def _search_reference_candidates(
+    flowRef: str,
+    query: str,
+    dimension: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    payload = await get_flow_structure(flowRef)
+    dimensions = _dimension_metadata(payload)
+    wanted_dimension = dimension.strip().upper() if dimension else None
+    results: list[dict[str, Any]] = []
+
+    for dim in dimensions:
+        dim_id = str(dim.get("id") or "").upper()
+        if wanted_dimension and dim_id != wanted_dimension:
+            continue
+        codelist_meta = _codelist_meta(payload, dim_id)
+        code_map = _dimension_code_map(payload, dim_id)
+        if codelist_meta:
+            codelist_text = " ".join(
+                part for part in (
+                    codelist_meta.get("id", ""),
+                    codelist_meta.get("key", ""),
+                    codelist_meta.get("name", ""),
+                    codelist_meta.get("description", ""),
+                    dim_id,
+                    str(dim.get("name") or ""),
+                ) if part
+            ).lower()
+            score = _match_score(codelist_text, query) + _group_likelihood(codelist_text)
+            if score > 0:
+                results.append(
+                    {
+                        "kind": "codelist",
+                        "dimension": dim_id,
+                        "dimensionName": dim.get("name") or "",
+                        "id": codelist_meta.get("id") or "",
+                        "name": codelist_meta.get("name") or "",
+                        "description": codelist_meta.get("description") or "",
+                        "score": score,
+                        "reason": "matched codelist metadata",
+                    }
+                )
+
+        hierarchy_context = await _dimension_hierarchy_context(flowRef, payload, dim_id)
+        hierarchy_edges: dict[str, dict[str, set[str]]] = {}
+        for item in hierarchy_context:
+            hierarchy_ref = str(item.get("hierarchyRef") or "")
+            if not hierarchy_ref:
+                continue
+            hierarchy_edges[hierarchy_ref] = await _get_hierarchical_edges(hierarchy_ref)
+            text = " ".join(
+                part for part in (
+                    str(item.get("id") or ""),
+                    str(item.get("name") or ""),
+                    str(item.get("description") or ""),
+                    hierarchy_ref,
+                    dim_id,
+                ) if part
+            ).lower()
+            score = _match_score(text, query) + _group_likelihood(text)
+            if score > 0:
+                results.append(
+                    {
+                        "kind": "hierarchical_codelist",
+                        "dimension": dim_id,
+                        "dimensionName": dim.get("name") or "",
+                        "id": item.get("id") or "",
+                        "name": item.get("name") or "",
+                        "description": item.get("description") or "",
+                        "hierarchyRef": hierarchy_ref,
+                        "score": score,
+                        "reason": "matched hierarchical codelist metadata",
+                    }
+                )
+
+        for code_id, code in code_map.items():
+            name = _code_name(code)
+            desc = _coerce_text(code.get("description")) or _coerce_text(code.get("descriptions"))
+            hierarchy_matches: list[dict[str, Any]] = []
+            for item in hierarchy_context:
+                hierarchy_ref = str(item.get("hierarchyRef") or "")
+                edges = hierarchy_edges.get(hierarchy_ref) or {}
+                descendants = _ref_area_descendants(edges, code_id) if edges else []
+                if not descendants:
+                    continue
+                members = _leaf_members(edges, descendants)
+                hierarchy_matches.append(
+                    {
+                        "hierarchyRef": hierarchy_ref,
+                        "memberCount": len(members),
+                        "memberPreview": members[:10],
+                    }
+                )
+            text = " ".join(
+                part for part in (
+                    code_id,
+                    name,
+                    desc,
+                    codelist_meta.get("id", ""),
+                    codelist_meta.get("name", ""),
+                    codelist_meta.get("description", ""),
+                    dim_id,
+                    str(dim.get("name") or ""),
+                ) if part
+            ).lower()
+            score = _match_score(text, query)
+            if hierarchy_matches:
+                score += _group_likelihood(text) + 5
+            if score <= 0:
+                continue
+            results.append(
+                {
+                    "kind": "code",
+                    "dimension": dim_id,
+                    "dimensionName": dim.get("name") or "",
+                    "id": code_id,
+                    "name": name,
+                    "description": desc,
+                    "codelist": codelist_meta.get("id") or "",
+                    "codelistName": codelist_meta.get("name") or "",
+                    "isAggregate": bool(hierarchy_matches),
+                    "hierarchyMatches": hierarchy_matches,
+                    "score": score,
+                    "reason": "matched code metadata",
+                }
+            )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in sorted(results, key=lambda entry: int(entry.get("score") or 0), reverse=True):
+        key = (
+            str(item.get("kind") or ""),
+            str(item.get("dimension") or ""),
+            str(item.get("id") or item.get("hierarchyRef") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        item.pop("score", None)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 async def _preferred_ref_area_hierarchy(payload: dict[str, Any]) -> tuple[dict[str, set[str]], str]:
@@ -1647,6 +1839,28 @@ async def list_codes(
 
 
 @mcp.tool()
+async def search_reference_candidates(
+    flowRef: str,
+    query: str,
+    dimension: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """
+    Search group-like reference structures across ordinary codelists, codes, and hierarchical codelists.
+    Use this when a user query implies a region, category, country group, or other aggregate concept.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    return await _search_reference_candidates(
+        flowRef=flowRef,
+        query=q,
+        dimension=dimension,
+        limit=limit,
+    )
+
+
+@mcp.tool()
 async def find_indicator_candidates(
     query: str,
     flowRef: str | None = None,
@@ -1789,7 +2003,8 @@ async def get_flow_structure(flowRef: str) -> dict[str, Any]:
     enriched = dict(payload)
     enriched["hierarchicalCodelists"] = hierarchy_summaries
     enriched["assistant_guidance"] = (
-        "If a selected code looks aggregate, inspect hierarchicalCodelists or use resolve_hierarchy / "
+        "If a selected code looks aggregate, or a query implies a region, category, or country group, "
+        "inspect hierarchicalCodelists or use search_reference_candidates / resolve_hierarchy / "
         "resolve_dimension_fallback before retrying with member codes."
     )
     return enriched
