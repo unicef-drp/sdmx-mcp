@@ -1100,6 +1100,16 @@ async def _structure_hierarchy_summaries(flowRef: str, payload: dict[str, Any]) 
     return summaries[:10]
 
 
+async def _dimension_hierarchy_context(flowRef: str, payload: dict[str, Any], dimension_id: str) -> list[dict[str, Any]]:
+    summaries = await _structure_hierarchy_summaries(flowRef, payload)
+    relevant = []
+    for item in summaries:
+        matches = item.get("dimensionMatches") or []
+        if any(str(match.get("dimension") or "").upper() == dimension_id.upper() for match in matches):
+            relevant.append(item)
+    return relevant
+
+
 async def _preferred_ref_area_hierarchy(payload: dict[str, Any]) -> tuple[dict[str, set[str]], str]:
     official = await _official_reporting_region_hierarchy()
     if official:
@@ -1562,6 +1572,7 @@ async def list_codes(
 ) -> list[dict[str, Any]]:
     """
     List codes for a specific dimension, optionally filtered by a query string.
+    Results are enriched with hierarchy matches when related hierarchical codelists are available.
     """
     payload = await get_flow_structure(flowRef)
     dims = _dimension_metadata(payload)
@@ -1583,6 +1594,13 @@ async def list_codes(
     if not isinstance(codes, list):
         codes = []
     q = (query or "").strip().lower()
+    hierarchy_context = await _dimension_hierarchy_context(flowRef, payload, dim_id)
+    hierarchy_edges: dict[str, dict[str, set[str]]] = {}
+    for item in hierarchy_context:
+        hierarchy_ref = str(item.get("hierarchyRef") or "")
+        if not hierarchy_ref:
+            continue
+        hierarchy_edges[hierarchy_ref] = await _get_hierarchical_edges(hierarchy_ref)
     results: list[dict[str, Any]] = []
     for code in codes:
         if not isinstance(code, dict):
@@ -1592,10 +1610,37 @@ async def list_codes(
             continue
         name = _coerce_text(code.get("name")) or _coerce_text(code.get("names"))
         desc = _coerce_text(code.get("description")) or _coerce_text(code.get("descriptions"))
-        text = f"{code_id} {name} {desc}".lower()
+        hierarchy_matches: list[dict[str, Any]] = []
+        for item in hierarchy_context:
+            hierarchy_ref = str(item.get("hierarchyRef") or "")
+            edges = hierarchy_edges.get(hierarchy_ref) or {}
+            descendants = _ref_area_descendants(edges, code_id) if edges else []
+            if not descendants:
+                continue
+            members = _leaf_members(edges, descendants)
+            hierarchy_matches.append(
+                {
+                    "hierarchyRef": hierarchy_ref,
+                    "name": item.get("name") or "",
+                    "memberCount": len(members),
+                    "memberPreview": members[:10],
+                }
+            )
+        hierarchy_text = " ".join(
+            f"{match.get('hierarchyRef','')} {match.get('name','')}" for match in hierarchy_matches
+        )
+        text = f"{code_id} {name} {desc} {hierarchy_text}".lower()
         if q and q not in text:
             continue
-        results.append({"id": code_id, "name": name, "description": desc})
+        results.append(
+            {
+                "id": code_id,
+                "name": name,
+                "description": desc,
+                "isAggregate": bool(hierarchy_matches),
+                "hierarchyMatches": hierarchy_matches,
+            }
+        )
         if len(results) >= limit:
             break
     return results

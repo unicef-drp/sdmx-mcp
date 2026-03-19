@@ -103,6 +103,7 @@ All tools are defined in `server.py`.
 
 9. `list_codes(flowRef, dimension, query=None, limit=50)`
 - Purpose: list codes for one dimension, optional text filter.
+- Behavior: when related hierarchical codelists are available, results are enriched with `isAggregate` and `hierarchyMatches` so agents can discover aggregate nodes and member previews during normal code lookup.
 
 10. `find_indicator_candidates(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
 - Purpose: rank `INDICATOR` codes by relevance to user text; when `flowRef` is omitted, scan scoped flows.
