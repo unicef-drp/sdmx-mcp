@@ -39,6 +39,8 @@ THEME_PREFIX_CSV = Path(__file__).resolve().parent / "theme_prefixes_domain.csv"
 _dataflow_cache = TTLCache(maxsize=1, ttl=60 * 60 * 6)  # 6h
 _structure_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 _dimension_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
+_hierarchical_codelist_cache = TTLCache(maxsize=32, ttl=60 * 60 * 24)  # 24h
+_hierarchical_catalog_cache = TTLCache(maxsize=8, ttl=60 * 60 * 24)  # 24h
 
 
 async def _get_json(url: str) -> dict[str, Any]:
@@ -72,6 +74,10 @@ def _structure_url(flow_ref: str) -> str:
     # UNICEF documentation describes this approach. :contentReference[oaicite:5]{index=5}
     # flow_ref should typically look like: AGENCY:FLOW_ID(VERSION) or similar; keep it simple early.
     return f"{BASE}/dataflow/{_flow_path_for(flow_ref)}/?format=sdmx-json&detail=full&references=all"
+
+
+def _hierarchical_codelist_url(agency: str, hierarchical_codelist_id: str, version: str = "latest") -> str:
+    return f"{BASE}/hierarchicalcodelist/{quote(agency)}/{quote(hierarchical_codelist_id)}/{quote(version)}"
 
 
 def _encode_flow_path(flow_ref: str) -> str:
@@ -541,6 +547,92 @@ def _parse_sdmx_error(text: str) -> str | None:
     return None
 
 
+def _tag_name(element: ET.Element) -> str:
+    return element.tag.split("}")[-1]
+
+
+def _element_text(node: ET.Element, tag_name: str) -> str:
+    for elem in node.iter():
+        if _tag_name(elem) == tag_name and elem.text:
+            text = elem.text.strip()
+            if text:
+                return text
+    return ""
+
+
+def _hierarchical_ref_id(node: ET.Element) -> str | None:
+    for elem in node.iter():
+        tag = _tag_name(elem)
+        if tag in {"Ref", "CodeRef"}:
+            ref_id = elem.attrib.get("id") or elem.attrib.get("ID")
+            if ref_id:
+                return ref_id.strip()
+        if tag == "CodeID" and elem.text and elem.text.strip():
+            return elem.text.strip()
+    direct = node.attrib.get("id") or node.attrib.get("ID")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    return None
+
+
+def _walk_hierarchical_codes(node: ET.Element, edges: dict[str, set[str]], parent_ref: str | None = None) -> None:
+    tag = _tag_name(node)
+    next_parent = parent_ref
+    if tag == "HierarchicalCode":
+        current_ref = _hierarchical_ref_id(node)
+        if parent_ref and current_ref and current_ref != parent_ref:
+            edges.setdefault(parent_ref, set()).add(current_ref)
+        next_parent = current_ref or parent_ref
+
+    for child in list(node):
+        _walk_hierarchical_codes(child, edges, parent_ref=next_parent)
+
+
+def _hierarchical_edges_from_xml(text: str) -> dict[str, set[str]]:
+    if not text.strip():
+        return {}
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return {}
+
+    edges: dict[str, set[str]] = {}
+    for elem in root.iter():
+        if _tag_name(elem) == "Hierarchy":
+            _walk_hierarchical_codes(elem, edges)
+    return edges
+
+
+def _hierarchical_catalog_from_xml(text: str) -> list[dict[str, Any]]:
+    if not text.strip():
+        return []
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return []
+
+    results: list[dict[str, Any]] = []
+    for elem in root.iter():
+        if _tag_name(elem) != "HierarchicalCodelist":
+            continue
+        agency = elem.attrib.get("agencyID") or elem.attrib.get("agencyId") or elem.attrib.get("agency")
+        hierarchy_id = elem.attrib.get("id") or elem.attrib.get("ID")
+        version = elem.attrib.get("version") or "latest"
+        if not isinstance(hierarchy_id, str) or not hierarchy_id.strip():
+            continue
+        results.append(
+            {
+                "agencyID": (agency or "").strip(),
+                "id": hierarchy_id.strip(),
+                "version": str(version).strip() or "latest",
+                "name": _element_text(elem, "Name"),
+                "description": _element_text(elem, "Description"),
+                "urn": elem.attrib.get("urn") or "",
+            }
+        )
+    return results
+
+
 def _looks_like_json(text: str) -> bool:
     stripped = text.lstrip()
     return stripped.startswith("{") or stripped.startswith("[")
@@ -793,6 +885,239 @@ def _codelist_codes(codelist: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(codes, list):
         return []
     return [code for code in codes if isinstance(code, dict)]
+
+
+def _code_identifier(node: Any) -> str | None:
+    if isinstance(node, str):
+        text = node.strip()
+        return text or None
+    if not isinstance(node, dict):
+        return None
+    for key in ("id", "ID", "codeID", "codeId", "codeRef", "value"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            nested = _code_identifier(value)
+            if nested:
+                return nested
+    return None
+
+
+def _code_name(code: dict[str, Any]) -> str:
+    return _coerce_text(code.get("name")) or _coerce_text(code.get("names"))
+
+
+def _dimension_code_map(payload: dict[str, Any], dimension_id: str) -> dict[str, dict[str, Any]]:
+    dims = _dimension_metadata(payload)
+    target = next((d for d in dims if d.get("id") == dimension_id.strip().upper()), None)
+    if not target:
+        return {}
+    codelist_id = target.get("codelist")
+    if not isinstance(codelist_id, str) or not codelist_id.strip():
+        return {}
+    codelists = _codelist_map(payload)
+    codelist = codelists.get(codelist_id) or codelists.get(_codelist_key(codelist_id))
+    if not codelist:
+        return {}
+    mapping: dict[str, dict[str, Any]] = {}
+    for code in _codelist_codes(codelist):
+        code_id = _code_identifier(code)
+        if code_id:
+            mapping[code_id] = code
+    return mapping
+
+
+def _ref_area_code_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return _dimension_code_map(payload, "REF_AREA")
+
+
+def _code_parent_links(codes: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
+    edges: dict[str, set[str]] = {}
+    for code_id, code in codes.items():
+        for key in ("parent", "parentCode", "parentID", "parentId", "parentRef"):
+            raw_parent = code.get(key)
+            parent_id = _code_identifier(raw_parent)
+            if parent_id and parent_id in codes and parent_id != code_id:
+                edges.setdefault(parent_id, set()).add(code_id)
+    return edges
+
+
+def _walk_hierarchy_edges(node: Any, valid_ids: set[str], edges: dict[str, set[str]], parent_id: str | None = None) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _walk_hierarchy_edges(item, valid_ids, edges, parent_id=parent_id)
+        return
+
+    if not isinstance(node, dict):
+        return
+
+    current_id = _code_identifier(node)
+    current_valid = current_id if current_id in valid_ids else None
+    effective_parent = parent_id
+    if parent_id and current_valid and current_valid != parent_id:
+        edges.setdefault(parent_id, set()).add(current_valid)
+        effective_parent = current_valid
+    elif current_valid:
+        effective_parent = current_valid
+
+    for key, value in node.items():
+        if key in {"id", "ID", "codeID", "codeId", "codeRef", "value", "name", "names", "description", "descriptions"}:
+            continue
+        child_parent = effective_parent
+        if isinstance(value, dict):
+            nested_parent = _code_identifier(value)
+            if nested_parent in valid_ids:
+                child_parent = nested_parent
+        _walk_hierarchy_edges(value, valid_ids, edges, parent_id=child_parent)
+
+
+def _ref_area_hierarchy(payload: dict[str, Any]) -> dict[str, set[str]]:
+    codes = _ref_area_code_map(payload)
+    if not codes:
+        return {}
+    valid_ids = set(codes)
+    edges = _code_parent_links(codes)
+    _walk_hierarchy_edges(payload, valid_ids, edges)
+    return edges
+
+
+async def _official_reporting_region_hierarchy() -> dict[str, set[str]]:
+    cache_key = "UNICEF/UNICEF_REPORTING_REGIONS/1.0"
+    if cache_key in _hierarchical_codelist_cache:
+        return _hierarchical_codelist_cache[cache_key]
+    url = _hierarchical_codelist_url("UNICEF", "UNICEF_REPORTING_REGIONS", "1.0")
+    status, text = await _get_text_with_status(url)
+    if status >= 400:
+        return {}
+    edges = _hierarchical_edges_from_xml(text)
+    if edges:
+        _hierarchical_codelist_cache[cache_key] = edges
+    return edges
+
+
+async def _list_hierarchical_codelists_for_agency(agency: str) -> list[dict[str, Any]]:
+    cache_key = agency.strip() or "all"
+    if cache_key in _hierarchical_catalog_cache:
+        return _hierarchical_catalog_cache[cache_key]
+    url = _hierarchical_codelist_url(agency or "all", "all", "latest")
+    status, text = await _get_text_with_status(url)
+    if status >= 400:
+        return []
+    parsed = _hierarchical_catalog_from_xml(text)
+    if parsed:
+        _hierarchical_catalog_cache[cache_key] = parsed
+    return parsed
+
+
+async def _get_hierarchical_edges(hierarchy_ref: str) -> dict[str, set[str]]:
+    agency, hierarchy_id, version = _flow_identifiers(hierarchy_ref)
+    cache_key = f"{agency}/{hierarchy_id}/{version}"
+    if cache_key in _hierarchical_codelist_cache:
+        return _hierarchical_codelist_cache[cache_key]
+    url = _hierarchical_codelist_url(agency, hierarchy_id, version)
+    status, text = await _get_text_with_status(url)
+    if status >= 400:
+        return {}
+    edges = _hierarchical_edges_from_xml(text)
+    if edges:
+        _hierarchical_codelist_cache[cache_key] = edges
+    return edges
+
+
+async def _preferred_ref_area_hierarchy(payload: dict[str, Any]) -> tuple[dict[str, set[str]], str]:
+    official = await _official_reporting_region_hierarchy()
+    if official:
+        return official, _hierarchical_codelist_url("UNICEF", "UNICEF_REPORTING_REGIONS", "1.0")
+    return _ref_area_hierarchy(payload), "structure-payload-fallback"
+
+
+def _hierarchy_match_score(
+    *,
+    hierarchy_id: str,
+    hierarchy_name: str,
+    requested_code: str,
+    code_map: dict[str, dict[str, Any]],
+    descendants: list[str],
+    dimension_id: str,
+    codelist_id: str,
+) -> tuple[int, dict[str, Any]]:
+    dimension_upper = dimension_id.upper()
+    hierarchy_text = f"{hierarchy_id} {hierarchy_name}".lower()
+    codelist_key = _codelist_key(codelist_id).lower() if codelist_id else ""
+    requested_descendants = [item for item in descendants if item in code_map]
+    score = 0
+    reasons: list[str] = []
+
+    if requested_descendants:
+        score += 100 + len(requested_descendants)
+        reasons.append("requested code is present with descendants that intersect the dimension code list")
+    if dimension_upper.lower() in hierarchy_text:
+        score += 20
+        reasons.append("hierarchy id/name mentions the dimension")
+    if codelist_key and codelist_key in hierarchy_text:
+        score += 30
+        reasons.append("hierarchy id/name matches the dimension codelist")
+    if "region" in hierarchy_text and ("AREA" in dimension_upper or dimension_upper == "REF_AREA"):
+        score += 10
+        reasons.append("hierarchy looks geographically relevant to REF_AREA")
+    if dimension_upper == "REF_AREA" and hierarchy_id.upper() == "UNICEF_REPORTING_REGIONS":
+        score += 40
+        reasons.append("official UNICEF reporting-regions hierarchy is preferred for REF_AREA")
+
+    return score, {
+        "matchedDescendantCount": len(requested_descendants),
+        "matchedDescendants": requested_descendants,
+        "reasons": reasons,
+    }
+
+
+def _ref_area_descendants(hierarchy: dict[str, set[str]], root_id: str) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    queue = list(sorted(hierarchy.get(root_id, set())))
+    while queue:
+        current = queue.pop(0)
+        if current in seen or current == root_id:
+            continue
+        seen.add(current)
+        ordered.append(current)
+        queue.extend(sorted(hierarchy.get(current, set())))
+    return ordered
+
+
+def _leaf_ref_area_members(hierarchy: dict[str, set[str]], descendants: list[str]) -> list[str]:
+    descendant_set = set(descendants)
+    leaves: list[str] = []
+    for code_id in descendants:
+        children = hierarchy.get(code_id, set())
+        if not (children & descendant_set):
+            leaves.append(code_id)
+    return leaves
+
+
+def _leaf_members(hierarchy: dict[str, set[str]], descendants: list[str]) -> list[str]:
+    descendant_set = set(descendants)
+    leaves: list[str] = []
+    for code_id in descendants:
+        children = hierarchy.get(code_id, set())
+        if not (children & descendant_set):
+            leaves.append(code_id)
+    return leaves
+
+
+def _dimension_meta(payload: dict[str, Any], dimension_id: str) -> dict[str, Any] | None:
+    target_id = dimension_id.strip().upper()
+    dims = _dimension_metadata(payload)
+    return next((d for d in dims if d.get("id") == target_id), None)
+
+
+def _dimension_codelist_id(payload: dict[str, Any], dimension_id: str) -> str:
+    dim = _dimension_meta(payload, dimension_id)
+    codelist_id = dim.get("codelist") if isinstance(dim, dict) else None
+    if not isinstance(codelist_id, str) or not codelist_id.strip():
+        raise ValueError(f"Dimension '{dimension_id}' does not have a codelist reference.")
+    return codelist_id
 
 
 def _canonical_code_id(codes: list[dict[str, Any]], token: str) -> str | None:
@@ -1362,6 +1687,361 @@ async def build_key(flowRef: str, selections: dict[str, Any] | None = None) -> d
             "codeIdsOnly": "For codelist-backed dimensions, selections must use code IDs exactly as returned by list_codes.",
         },
     }
+
+
+@mcp.tool()
+async def list_hierarchical_codelists(
+    agency: str | None = None,
+    query: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """
+    List hierarchical codelists for an agency, optionally filtered by text.
+    """
+    chosen_agency = (agency or "all").strip() or "all"
+    items = await _list_hierarchical_codelists_for_agency(chosen_agency)
+    if AGENCY_ALLOWLIST and chosen_agency == "all":
+        items = [item for item in items if item.get("agencyID") in AGENCY_ALLOWLIST]
+    q = (query or "").strip().lower()
+    results: list[dict[str, Any]] = []
+    for item in items:
+        text = f"{item.get('id','')} {item.get('name','')} {item.get('description','')}".lower()
+        score = _match_score(text, q) if q else 0
+        if q and score == 0:
+            continue
+        results.append(
+            {
+                "agencyID": item.get("agencyID"),
+                "id": item.get("id"),
+                "version": item.get("version"),
+                "name": item.get("name"),
+                "description": item.get("description"),
+                "hierarchyRef": _flow_ref_for(str(item.get("id") or ""), str(item.get("version") or "latest"), str(item.get("agencyID") or "all")),
+                "_score": score,
+            }
+        )
+    if q:
+        results.sort(key=lambda item: item.get("_score", 0), reverse=True)
+    trimmed = results[:limit]
+    for item in trimmed:
+        item.pop("_score", None)
+    return trimmed
+
+
+@mcp.tool()
+async def describe_hierarchical_codelist(hierarchyRef: str) -> dict[str, Any]:
+    """
+    Describe a hierarchical codelist and expose its immediate roots.
+    """
+    agency, hierarchy_id, version = _flow_identifiers(hierarchyRef)
+    catalog = await _list_hierarchical_codelists_for_agency(agency)
+    meta = next(
+        (
+            item for item in catalog
+            if item.get("id") == hierarchy_id and (str(item.get("version") or "latest") == version or version == "latest")
+        ),
+        {},
+    )
+    edges = await _get_hierarchical_edges(hierarchyRef)
+    all_children = {child for children in edges.values() for child in children}
+    roots = sorted(code for code in edges if code not in all_children)
+    return {
+        "agencyID": agency,
+        "id": hierarchy_id,
+        "version": version,
+        "name": meta.get("name") or "",
+        "description": meta.get("description") or "",
+        "hierarchyRef": _flow_ref_for(hierarchy_id, version, agency),
+        "rootCodes": roots,
+        "rootCount": len(roots),
+        "edgeCount": sum(len(children) for children in edges.values()),
+    }
+
+
+@mcp.tool()
+async def resolve_hierarchy(flowRef: str, dimension: str, code: str) -> dict[str, Any]:
+    """
+    Resolve the best agency hierarchy for a flow dimension/code.
+    Returns resolved, ambiguous, or unresolved so the assistant does not guess.
+    """
+    payload = await get_flow_structure(flowRef)
+    dim_meta = _dimension_meta(payload, dimension)
+    if not dim_meta:
+        raise ValueError(f"Unknown dimension '{dimension}'.")
+    dimension_id = str(dim_meta.get("id") or "").upper()
+    codelist_id = _dimension_codelist_id(payload, dimension_id)
+    code_map = _dimension_code_map(payload, dimension_id)
+    code_id = code.strip()
+    if code_id not in code_map:
+        raise ValueError(
+            f"Unknown code '{code_id}' for dimension '{dimension_id}'. Use list_codes(flowRef, '{dimension_id}') to retrieve valid codes."
+        )
+
+    flow_details = await _resolved_flow_details(flowRef)
+    agency = flow_details.get("agencyID") or "all"
+    candidates = await _list_hierarchical_codelists_for_agency(agency)
+    scored: list[dict[str, Any]] = []
+    for candidate in candidates:
+        hierarchy_id = str(candidate.get("id") or "")
+        version = str(candidate.get("version") or "latest")
+        hierarchy_ref = _flow_ref_for(hierarchy_id, version, str(candidate.get("agencyID") or agency))
+        edges = await _get_hierarchical_edges(hierarchy_ref)
+        if not edges:
+            continue
+        descendants = [item for item in _ref_area_descendants(edges, code_id) if item in code_map]
+        score, detail = _hierarchy_match_score(
+            hierarchy_id=hierarchy_id,
+            hierarchy_name=str(candidate.get("name") or ""),
+            requested_code=code_id,
+            code_map=code_map,
+            descendants=descendants,
+            dimension_id=dimension_id,
+            codelist_id=codelist_id,
+        )
+        if score <= 0:
+            continue
+        leaf_members = _leaf_members(edges, descendants)
+        scored.append(
+            {
+                "hierarchyRef": hierarchy_ref,
+                "agencyID": candidate.get("agencyID"),
+                "id": hierarchy_id,
+                "version": version,
+                "name": candidate.get("name") or "",
+                "description": candidate.get("description") or "",
+                "score": score,
+                "matchedDescendantCount": detail["matchedDescendantCount"],
+                "matchedDescendants": detail["matchedDescendants"],
+                "matchedLeafMembers": leaf_members,
+                "reasons": detail["reasons"],
+            }
+        )
+
+    scored.sort(key=lambda item: (int(item.get("score") or 0), int(item.get("matchedDescendantCount") or 0)), reverse=True)
+    if not scored:
+        return {
+            "status": "unresolved",
+            "flowRef": flow_details.get("resolvedFlowRef"),
+            "dimension": dimension_id,
+            "code": code_id,
+            "assistant_guidance": "No hierarchy could be tied confidently to this dimension/code. Do not guess a hierarchy.",
+        }
+
+    top = scored[0]
+    same_score = [item for item in scored if item.get("score") == top.get("score")]
+    if len(same_score) > 1:
+        return {
+            "status": "ambiguous",
+            "flowRef": flow_details.get("resolvedFlowRef"),
+            "dimension": dimension_id,
+            "code": code_id,
+            "candidates": same_score[:5],
+            "assistant_guidance": "Multiple hierarchies plausibly match. Ask the user which hierarchy to use.",
+        }
+
+    return {
+        "status": "resolved",
+        "flowRef": flow_details.get("resolvedFlowRef"),
+        "dimension": dimension_id,
+        "code": code_id,
+        "codelist": codelist_id,
+        "hierarchy": top,
+        "assistant_guidance": "Use this hierarchy for member expansion and fallback planning.",
+    }
+
+
+@mcp.tool()
+async def expand_dimension_group(flowRef: str, dimension: str, code: str) -> dict[str, Any]:
+    """
+    Expand a dimension code through the best matching agency hierarchy.
+    """
+    payload = await get_flow_structure(flowRef)
+    dimension_id = dimension.strip().upper()
+    code_map = _dimension_code_map(payload, dimension_id)
+    if not code_map:
+        raise ValueError(f"Unknown dimension '{dimension_id}' or no codelist codes were available.")
+    resolution = await resolve_hierarchy(flowRef=flowRef, dimension=dimension_id, code=code)
+    if resolution.get("status") != "resolved":
+        return resolution
+    hierarchy_info = resolution["hierarchy"]
+    hierarchy_ref = str(hierarchy_info.get("hierarchyRef"))
+    edges = await _get_hierarchical_edges(hierarchy_ref)
+    descendants = [item for item in _ref_area_descendants(edges, code) if item in code_map]
+    members = _leaf_members(edges, descendants)
+    return {
+        "status": "resolved",
+        "flowRef": resolution.get("flowRef"),
+        "dimension": dimension_id,
+        "code": code,
+        "label": _code_name(code_map.get(code, {})),
+        "hierarchy": hierarchy_info,
+        "descendants": [{"id": item, "name": _code_name(code_map.get(item, {}))} for item in descendants],
+        "members": [{"id": item, "name": _code_name(code_map.get(item, {}))} for item in members],
+        "assistant_guidance": (
+            "If the aggregate dimension code does not resolve, retry using the member codes and return member-level observations "
+            "unless the official flow provides an aggregate."
+        ),
+    }
+
+
+@mcp.tool()
+async def expand_ref_area_group(flowRef: str, refAreaCode: str) -> dict[str, Any]:
+    """
+    Expand an aggregate REF_AREA code into its descendant members using hierarchy metadata
+    present in the official SDMX structure payload when available.
+    """
+    result = await expand_dimension_group(flowRef=flowRef, dimension="REF_AREA", code=refAreaCode)
+    if result.get("status") != "resolved":
+        return result
+    hierarchy = result.get("hierarchy") or {}
+    descendants = result.get("descendants") or []
+    members = result.get("members") or []
+    return {
+        "refAreaCode": refAreaCode.strip(),
+        "label": result.get("label") or "",
+        "kind": "aggregate" if descendants else "leaf",
+        "hierarchySource": hierarchy.get("hierarchyRef") or "",
+        "hierarchyAvailable": True,
+        "descendantCount": len(descendants),
+        "memberCount": len(members),
+        "members": members,
+        "descendants": descendants,
+        "assistant_guidance": result.get("assistant_guidance"),
+    }
+
+
+@mcp.tool()
+async def resolve_dimension_fallback(
+    flowRef: str,
+    dimension: str,
+    code: str,
+    filters: dict[str, Any] | None = None,
+    startPeriod: Optional[str] = None,
+    endPeriod: Optional[str] = None,
+    lastNObservations: Optional[int] = 1,
+    labels: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Validate an aggregate dimension code and, when unresolved, return a hierarchy-based retry plan.
+    """
+    payload = await get_flow_structure(flowRef)
+    dimension_id = dimension.strip().upper()
+    code_map = _dimension_code_map(payload, dimension_id)
+    if code.strip() not in code_map:
+        raise ValueError(
+            f"Unknown code '{code}' for dimension '{dimension_id}'. Use list_codes(flowRef, '{dimension_id}') to retrieve valid codes."
+        )
+
+    aggregate_filters = dict(filters or {})
+    aggregate_filters[dimension_id] = code.strip()
+    aggregate_result = await validate_query_scope(
+        flowRef=flowRef,
+        filters=aggregate_filters,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        labels=labels,
+    )
+    expansion = await expand_dimension_group(flowRef=flowRef, dimension=dimension_id, code=code.strip())
+
+    if aggregate_result.get("status") == "resolved":
+        return {
+            "status": "aggregate_query_resolved",
+            "dimension": dimension_id,
+            "aggregate": aggregate_result,
+            "group": expansion,
+            "assistant_guidance": "The aggregate dimension code resolved from official flows. Use that series directly.",
+        }
+
+    if expansion.get("status") == "ambiguous":
+        return {
+            "status": "ambiguous",
+            "dimension": dimension_id,
+            "aggregate": aggregate_result,
+            "group": expansion,
+            "assistant_guidance": "Multiple hierarchies plausibly match. Ask the user which hierarchy to use.",
+        }
+
+    if expansion.get("status") != "resolved":
+        return {
+            "status": "unresolved_no_hierarchy",
+            "dimension": dimension_id,
+            "aggregate": aggregate_result,
+            "group": expansion,
+            "assistant_guidance": "No hierarchy could be resolved for this aggregate code. Report the unresolved official query without guessing.",
+        }
+
+    member_ids = [item.get("id") for item in expansion.get("members", []) if isinstance(item, dict) and item.get("id")]
+    if member_ids:
+        retry_filters = dict(filters or {})
+        retry_filters[dimension_id] = member_ids
+        member_result = await validate_query_scope(
+            flowRef=flowRef,
+            filters=retry_filters,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=lastNObservations,
+            labels=labels,
+        )
+        return {
+            "status": "retry_with_members",
+            "dimension": dimension_id,
+            "reason": aggregate_result.get("error", {}).get("message") or "Aggregate dimension code did not resolve.",
+            "aggregate": aggregate_result,
+            "group": expansion,
+            "retryPlan": {
+                "dimension": dimension_id,
+                "memberCodes": member_ids,
+                "filters": retry_filters,
+                "aggregationRecommended": "return member-level rows; do not compute a rolled-up aggregate unless the official flow provides one",
+            },
+            "memberValidation": member_result,
+            "assistant_guidance": (
+                "If member validation resolves, return member-level observations only. "
+                "Do not synthesize an aggregate unless the official flow publishes one."
+            ),
+        }
+
+    return {
+        "status": "unresolved_no_members",
+        "dimension": dimension_id,
+        "reason": aggregate_result.get("error", {}).get("message") or "Aggregate dimension code did not resolve.",
+        "aggregate": aggregate_result,
+        "group": expansion,
+        "assistant_guidance": "The hierarchy resolved but no member expansion was available for retry.",
+    }
+
+
+@mcp.tool()
+async def resolve_ref_area_fallback(
+    flowRef: str,
+    refAreaCode: str,
+    filters: dict[str, Any] | None = None,
+    startPeriod: Optional[str] = None,
+    endPeriod: Optional[str] = None,
+    lastNObservations: Optional[int] = 1,
+    labels: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Validate an aggregate REF_AREA query and, when it does not resolve, return an official retry plan
+    based on hierarchy-derived member REF_AREA codes.
+    """
+    result = await resolve_dimension_fallback(
+        flowRef=flowRef,
+        dimension="REF_AREA",
+        code=refAreaCode,
+        filters=filters,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        labels=labels,
+    )
+    if "group" in result:
+        result["refArea"] = result.pop("group")
+    retry_plan = result.get("retryPlan")
+    if isinstance(retry_plan, dict) and "memberCodes" in retry_plan:
+        retry_plan["refAreaCodes"] = retry_plan.pop("memberCodes")
+    return result
 
 
 @mcp.tool()

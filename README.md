@@ -117,11 +117,28 @@ All tools are defined in `server.py`.
 - Purpose: build SDMX key from dimension selections.
 - Notes: supports list/comma syntax for multi-code segments.
 
-14. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+14. `list_hierarchical_codelists(agency=None, query=None, limit=50)`
+- Purpose: list hierarchical codelists available for an agency.
+
+15. `describe_hierarchical_codelist(hierarchyRef)`
+- Purpose: describe one hierarchical codelist and expose root codes.
+
+16. `resolve_hierarchy(flowRef, dimension, code)`
+- Purpose: choose the best matching hierarchy for a flow dimension/code.
+- Returns: `status` of `resolved`, `ambiguous`, or `unresolved`.
+- Behavior: if more than one hierarchy plausibly matches, the MCP returns ambiguity instead of guessing.
+
+17. `expand_dimension_group(flowRef, dimension, code)`
+- Purpose: expand an aggregate dimension code into descendant/member codes using the resolved hierarchy.
+
+18. `resolve_dimension_fallback(flowRef, dimension, code, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+- Purpose: validate an aggregate dimension query and, if unresolved, return a hierarchy-based retry plan using member codes.
+
+19. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
 - Purpose: preflight whether a concrete UNICEF/UNPD query resolves before any narrative answer is attempted.
 - Returns: structured source-bound status with `status`, `sourceScope`, `provenance`, optional `error`, and `assistant_guidance`.
 
-15. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
+20. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
   - requires either (`startPeriod` + `endPeriod`) or `lastNObservations`
@@ -206,8 +223,9 @@ Recommended discovery sequence:
 1. `find_indicator_candidates(query)` to find indicator IDs across scoped flows.
 2. Use each candidate's `recommendedFlowRef` (or inspect `dataflows`) to choose a flow.
 3. `list_codes(flowRef, "GEO", query=...)` and other dimension tools to constrain the slice.
-4. `validate_query_scope(flowRef, filters=...)` or `build_key(...)` then `validate_query_scope(...)`.
-5. Only if the preflight resolves, call `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
+4. If a selected code may be aggregate, call `resolve_hierarchy(...)` or `resolve_dimension_fallback(...)`.
+5. `validate_query_scope(flowRef, filters=...)` or `build_key(...)` then `validate_query_scope(...)`.
+6. Only if the preflight resolves, call `query_data(flowRef, filters=...)` or `build_key(...)` then `query_data(...)`.
 
 ## Troubleshooting
 
