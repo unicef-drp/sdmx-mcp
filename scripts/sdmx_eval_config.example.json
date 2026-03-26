@@ -1,0 +1,60 @@
+{
+  "registry": {
+    "base_url": "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest",
+    "user_agent": "sdmx-eval-runner/0.1",
+    "time_dimension_id": "TIME_PERIOD"
+  },
+  "mcp": {
+    "transport": "streamable-http",
+    "url": "https://sdmx-mcp.fly.dev/mcp",
+    "server_label": "unicef-sdmx"
+  },
+  "concurrency": 8,
+  "dataflows": [
+    "UNICEF/UNICEF_1MICS/1.0"
+  ],
+  "dimensions": [
+    {
+      "id": "INDICATOR",
+      "mode": "external_codelist_intersection",
+      "codelist_url": "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest/codelist/UNICEF/CL_UNICEF_INDICATOR/1.0",
+      "max_values": 10
+    },
+    {
+      "id": "REF_AREA",
+      "mode": "external_codelist_intersection",
+      "codelist_url": "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest/codelist/UNICEF/CL_COUNTRY/1.0",
+      "max_values": 10
+    },
+    {
+      "id": "SEX",
+      "mode": "fixed",
+      "values": ["T"]
+    },
+    {
+      "id": "TIME_PERIOD",
+      "mode": "time_range",
+      "start": 2020,
+      "end": 2024,
+      "step": 1
+    }
+  ],
+  "wildcard_dimensions": [],
+  "expected_value": {
+    "column_hint": "OBS_VALUE"
+  },
+  "prompt_template": "Using the SDMX MCP, what was the value of {INDICATOR_name} in {REF_AREA_name} in {TIME_PERIOD}? Report the numeric value and cite the dataflow you used.",
+  "provider": {
+    "type": "command",
+    "name": "anthropic",
+    "api_key_env": "ANTHROPIC_API_KEY",
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1200,
+    "temperature": 0,
+    "command": [
+      "python3",
+      "scripts/sdmx_eval_provider_anthropic.py"
+    ],
+    "env": {}
+  }
+}

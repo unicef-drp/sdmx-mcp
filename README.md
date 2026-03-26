@@ -13,6 +13,10 @@ This project lets an LLM client do a full guided data journey:
 
 - `server.py`: MCP tools and SDMX integration logic.
 - `scripts/agent_test_rig.py`: direct tool-call harness that simulates an agent workflow.
+- `scripts/sdmx_eval_runner.py`: generic SDMX eval harness for case generation, provider execution, and grading.
+- `scripts/sdmx_eval_config.example.json`: example config for deterministic case generation and provider runs.
+- `scripts/sdmx_eval_provider_anthropic.py`: Anthropic Messages API adapter using Anthropic's MCP connector.
+- `scripts/sdmx_eval_provider_template.py`: stdin/stdout adapter template for wiring any LLM+MCP stack into the eval harness.
 - `scripts/agent_test_scenarios.example.jsonl`: regression/demo scenarios.
 - `scripts/list_theme_prefixes.py`: helper to inspect dataflow ID prefixes.
 - `theme_prefixes_domain.csv`: curated prefix-to-domain mapping used for grouping.
@@ -196,6 +200,75 @@ In `scripts/agent_test_scenarios.example.jsonl`:
 - latest under-five mortality in South Asia
 - latest stunting and wasting in South Asia
 - immunization vs mortality comparison in South Asia
+
+## Generic Eval Harness
+
+`scripts/sdmx_eval_runner.py` is a config-driven evaluation harness for any SDMX registry the server can query.
+
+It supports three steps:
+- `build-cases`: deterministically expands configured dimensions and years into a manifest of natural-language prompts plus direct SDMX ground truth.
+- `run-provider`: sends each case to a provider adapter over stdin/stdout so you can plug in OpenAI, Anthropic, or any other MCP-capable client without changing the harness.
+- `grade-results`: compares structured claims from provider output against the direct SDMX result set.
+
+Example:
+
+```bash
+python3 scripts/sdmx_eval_runner.py build-cases \
+  --config scripts/sdmx_eval_config.example.json \
+  --case-limit 25
+
+python3 scripts/sdmx_eval_runner.py run-provider \
+  --config scripts/sdmx_eval_config.example.json \
+  --case-limit 25
+
+python3 scripts/sdmx_eval_runner.py grade-results \
+  --config scripts/sdmx_eval_config.example.json
+```
+
+Anthropic setup:
+
+```bash
+export ANTHROPIC_API_KEY=...
+python3 scripts/sdmx_eval_runner.py run-provider \
+  --config scripts/sdmx_eval_config.example.json \
+  --case-limit 25
+```
+
+### Config Model
+
+The config file controls:
+- `dataflows`: exact flows to test.
+- `dimensions`: how each dimension should be expanded.
+- `prompt_template`: how deterministic cases become natural-language prompts.
+- `provider`: the adapter command that will call an actual model stack.
+
+Supported dimension modes:
+- `fixed`: use an explicit list of code IDs.
+- `flow_dimension`: use all codes from the flow DSD for that dimension.
+- `external_codelist_intersection`: intersect the flow dimension codelist with an external SDMX codelist URL.
+- `time_range`: generate yearly cases across a configured start/end range.
+
+### Provider Contract
+
+The provider adapter receives a JSON payload on stdin and must print a JSON object to stdout.
+
+Important output fields:
+- `answer_text`: the model's final natural-language answer.
+- `claims.value`: the value the model claims is correct.
+- `claims.time_period`: the reported year or period.
+- `claims.flowRef`: the flow the model believes it used.
+- `claims.filters`: the code-level filters the model believes it used.
+
+The grader relies primarily on those structured claims, not on free-form prose alone.
+
+### Anthropic Adapter
+
+`scripts/sdmx_eval_provider_anthropic.py` calls the Anthropic Messages API and passes your MCP server via the `mcp_servers` request field. It expects:
+- `ANTHROPIC_API_KEY` in the environment by default
+- `mcp.url` in the eval config
+- an MCP server reachable over HTTP(S)
+
+The adapter asks Claude to return a single JSON object so grading can stay deterministic. If you need auth on the MCP endpoint, set `mcp.authorization_token_env` in the config and the adapter will forward that bearer token to Anthropic's MCP connector request.
 
 ## Connector Setup
 
