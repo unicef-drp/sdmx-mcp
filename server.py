@@ -768,6 +768,228 @@ def _unresolved_response(
     return payload
 
 
+def _csv_rows(text: str) -> list[dict[str, Any]]:
+    if not text.strip():
+        return []
+    reader = csv.DictReader(text.splitlines())
+    rows: list[dict[str, Any]] = []
+    for row in reader:
+        if not isinstance(row, dict):
+            continue
+        rows.append({str(key): value for key, value in row.items() if key is not None})
+    return rows
+
+
+def _find_column(columns: list[str], candidates: list[str]) -> str | None:
+    for candidate in candidates:
+        for column in columns:
+            if column == candidate:
+                return column
+    upper_columns = {column.upper(): column for column in columns}
+    for candidate in candidates:
+        for upper, original in upper_columns.items():
+            if candidate.upper() in upper:
+                return original
+    return None
+
+
+def _time_column(rows: list[dict[str, Any]]) -> str | None:
+    if not rows:
+        return None
+    return _find_column(list(rows[0].keys()), ["TIME_PERIOD", "TIME"])
+
+
+def _value_column(rows: list[dict[str, Any]]) -> str | None:
+    if not rows:
+        return None
+    return _find_column(list(rows[0].keys()), ["OBS_VALUE", "VALUE"])
+
+
+def _dimension_column(rows: list[dict[str, Any]], dimension_id: str) -> str | None:
+    if not rows:
+        return None
+    return _find_column(list(rows[0].keys()), [dimension_id])
+
+
+def _row_time_value(row: dict[str, Any], time_column: str | None) -> str:
+    if not time_column:
+        return ""
+    value = row.get(time_column)
+    return str(value).strip() if value is not None else ""
+
+
+def _series_signature(
+    row: dict[str, Any],
+    *,
+    time_column: str | None,
+    value_column: str | None,
+) -> tuple[tuple[str, str], ...]:
+    signature: list[tuple[str, str]] = []
+    for key in sorted(row):
+        if key in {time_column, value_column}:
+            continue
+        value = row.get(key)
+        signature.append((key, "" if value is None else str(value).strip()))
+    return tuple(signature)
+
+
+def _latest_rows(rows: list[dict[str, Any]], time_column: str | None) -> tuple[str | None, list[dict[str, Any]]]:
+    if not rows:
+        return None, []
+    if not time_column:
+        return None, rows
+    latest_period = max(_row_time_value(row, time_column) for row in rows)
+    return latest_period, [row for row in rows if _row_time_value(row, time_column) == latest_period]
+
+
+def _query_preview(rows: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
+    return rows[:limit]
+
+
+def _topline_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    columns = list(rows[0].keys()) if rows else []
+    time_column = _time_column(rows)
+    value_column = _value_column(rows)
+    distinct_counts = {}
+    for column in columns:
+        distinct_counts[column] = len({str(row.get(column) or "").strip() for row in rows})
+    latest_period, latest_rows = _latest_rows(rows, time_column)
+    return {
+        "rowCount": len(rows),
+        "columns": columns,
+        "timeColumn": time_column,
+        "valueColumn": value_column,
+        "latestPeriod": latest_period,
+        "latestRowCount": len(latest_rows),
+        "distinctCounts": distinct_counts,
+        "preview": _query_preview(rows),
+    }
+
+
+def _shape_compact_series(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    time_column = _time_column(rows)
+    value_column = _value_column(rows)
+    return {
+        "status": "resolved",
+        "shape": "compact_series",
+        "series": rows,
+        "summary": _topline_summary(rows),
+        "timeColumn": time_column,
+        "valueColumn": value_column,
+    }
+
+
+def _shape_latest_by_ref_area(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ref_area_column = _dimension_column(rows, "REF_AREA")
+    time_column = _time_column(rows)
+    value_column = _value_column(rows)
+    if not ref_area_column:
+        return {
+            "status": "shape_not_applicable",
+            "shape": "latest_by_ref_area",
+            "reason": "REF_AREA column was not present in the returned dataset.",
+            "summary": _topline_summary(rows),
+        }
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get(ref_area_column) or "").strip(), []).append(row)
+    result_rows: list[dict[str, Any]] = []
+    for ref_area, members in sorted(grouped.items()):
+        latest_period, latest_rows = _latest_rows(members, time_column)
+        result_rows.append(
+            {
+                "refArea": ref_area,
+                "latestPeriod": latest_period,
+                "rowCountAtLatestPeriod": len(latest_rows),
+                "value": latest_rows[0].get(value_column) if value_column and len(latest_rows) == 1 else None,
+                "rows": latest_rows[:10],
+            }
+        )
+    return {
+        "status": "resolved",
+        "shape": "latest_by_ref_area",
+        "refAreaColumn": ref_area_column,
+        "timeColumn": time_column,
+        "valueColumn": value_column,
+        "results": result_rows,
+        "summary": _topline_summary(rows),
+    }
+
+
+def _shape_latest_single_value(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {
+            "status": "no_observations",
+            "shape": "latest_single_value",
+            "message": "The official query resolved but returned no observation rows.",
+        }
+    time_column = _time_column(rows)
+    value_column = _value_column(rows)
+    if not value_column:
+        return {
+            "status": "no_value_column",
+            "shape": "latest_single_value",
+            "message": "The returned dataset did not expose an observation value column.",
+            "summary": _topline_summary(rows),
+        }
+    latest_period, latest_rows = _latest_rows(rows, time_column)
+    signatures = {_series_signature(row, time_column=time_column, value_column=value_column) for row in latest_rows}
+    if len(signatures) > 1:
+        return {
+            "status": "not_a_single_value",
+            "shape": "latest_single_value",
+            "message": "The latest period still contains multiple distinct series rows. Narrow more dimensions before answering with one value.",
+            "latestPeriod": latest_period,
+            "latestRowCount": len(latest_rows),
+            "summary": _topline_summary(rows),
+            "preview": _query_preview(latest_rows),
+        }
+    if len(latest_rows) != 1:
+        return {
+            "status": "not_a_single_value",
+            "shape": "latest_single_value",
+            "message": "The latest period does not resolve to exactly one observation row.",
+            "latestPeriod": latest_period,
+            "latestRowCount": len(latest_rows),
+            "summary": _topline_summary(rows),
+            "preview": _query_preview(latest_rows),
+        }
+    row = latest_rows[0]
+    return {
+        "status": "resolved_single_value",
+        "shape": "latest_single_value",
+        "latestPeriod": latest_period,
+        "timeColumn": time_column,
+        "valueColumn": value_column,
+        "value": row.get(value_column),
+        "observation": row,
+        "summary": _topline_summary(rows),
+    }
+
+
+def _shape_topline_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "status": "resolved",
+        "shape": "topline_summary",
+        "summary": _topline_summary(rows),
+    }
+
+
+def _shape_rows(rows: list[dict[str, Any]], shape: str) -> dict[str, Any]:
+    normalized = (shape or "").strip().lower()
+    if normalized == "compact_series":
+        return _shape_compact_series(rows)
+    if normalized == "latest_single_value":
+        return _shape_latest_single_value(rows)
+    if normalized == "latest_by_ref_area":
+        return _shape_latest_by_ref_area(rows)
+    if normalized == "topline_summary":
+        return _shape_topline_summary(rows)
+    raise ValueError(
+        "Unsupported resultShape. Use one of: compact_series, latest_single_value, latest_by_ref_area, topline_summary."
+    )
+
+
 def _codelist_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     mapping: dict[str, dict[str, Any]] = {}
     for codelist in _extract_codelists(payload) + _extract_codelists_from_structures(payload):
@@ -1532,6 +1754,70 @@ def _normalize_manual_key(key: str, dimension_order: list[str]) -> str:
     if len(parts) < expected:
         parts.extend([""] * (expected - len(parts)))
     return ".".join(parts)
+
+
+async def _query_plan(
+    *,
+    flowRef: str,
+    key: str | None,
+    filters: dict[str, Any] | None,
+    startPeriod: str | None,
+    endPeriod: str | None,
+    lastNObservations: int | None,
+    format: str,
+    labels: str | None,
+    resultShape: str | None,
+) -> dict[str, Any]:
+    dimension_order: list[str] | None = None
+    normalized_filters: dict[str, Any] | None = None
+    wildcard_dimensions: list[str] = []
+
+    if filters:
+        dimension_order = await _dimension_order_for_flow(flowRef)
+        normalized_filters = await _normalize_filters_to_code_ids(flowRef, filters)
+        key = _build_key_from_filters(dimension_order, normalized_filters)
+        wildcard_dimensions = [dim for dim in dimension_order if dim not in normalized_filters]
+    elif key:
+        dimension_order = await _dimension_order_for_flow(flowRef)
+        key = _normalize_manual_key(key, dimension_order)
+        wildcard_dimensions = [
+            dimension_order[index]
+            for index, segment in enumerate(key.split("."))
+            if index < len(dimension_order) and not segment.strip()
+        ]
+
+    if not key:
+        raise ValueError("Provide either a key or filters to identify the data slice.")
+
+    if not (startPeriod and endPeriod) and not lastNObservations:
+        raise ValueError("Provide start/end periods or lastNObservations to avoid unbounded extracts.")
+
+    flow_details = await _resolved_flow_details(flowRef)
+    flow_path = _data_path_for(flow_details["resolvedFlowRef"])
+    params: list[str] = []
+    if startPeriod and endPeriod:
+        params.append(f"startPeriod={quote(startPeriod)}")
+        params.append(f"endPeriod={quote(endPeriod)}")
+    if lastNObservations is not None:
+        params.append(f"lastNObservations={int(lastNObservations)}")
+    params.append(f"format={quote(format)}")
+    if labels:
+        params.append(f"labels={quote(labels)}")
+    url = f"{BASE}/data/{flow_path}/{quote(key, safe='+.')}?{'&'.join(params)}"
+    return {
+        "flowDetails": flow_details,
+        "dimensionOrder": dimension_order,
+        "normalizedFilters": normalized_filters,
+        "wildcardDimensions": wildcard_dimensions,
+        "key": key,
+        "format": format,
+        "labels": labels,
+        "resultShape": resultShape,
+        "queryURL": url,
+        "startPeriod": startPeriod,
+        "endPeriod": endPeriod,
+        "lastNObservations": lastNObservations,
+    }
 
 
 async def _cached_dataflows() -> dict[str, Any]:
@@ -2421,6 +2707,52 @@ async def resolve_ref_area_fallback(
 
 
 @mcp.tool()
+async def plan_query(
+    flowRef: str,
+    key: Optional[str] = None,
+    filters: dict[str, Any] | None = None,
+    startPeriod: Optional[str] = None,
+    endPeriod: Optional[str] = None,
+    lastNObservations: Optional[int] = None,
+    format: str = "csv",
+    labels: Optional[str] = None,
+    resultShape: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Resolve a query into a concrete SDMX URL and highlight wildcard dimensions before execution.
+    """
+    plan = await _query_plan(
+        flowRef=flowRef,
+        key=key,
+        filters=filters,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        format=format,
+        labels=labels,
+        resultShape=resultShape,
+    )
+    return {
+        "status": "planned",
+        "flowRef": plan["flowDetails"].get("resolvedFlowRef"),
+        "key": plan["key"],
+        "queryURL": plan["queryURL"],
+        "dimensionOrder": plan["dimensionOrder"] or [],
+        "filters": plan["normalizedFilters"] or {},
+        "wildcardDimensions": plan["wildcardDimensions"],
+        "shape": resultShape,
+        "notes": {
+            "format": format,
+            "labels": labels,
+            "warning": (
+                "Wildcard dimensions mean the query can return multiple series or multiple rows. "
+                "Use resultShape='latest_single_value' only when the remaining wildcard dimensions cannot split the result."
+            ),
+        },
+    }
+
+
+@mcp.tool()
 async def validate_query_scope(
     flowRef: str,
     key: Optional[str] = None,
@@ -2465,44 +2797,32 @@ async def query_data(
     maxObs: int = 50_000,
     filters: dict[str, Any] | None = None,
     lastNObservations: Optional[int] = None,
+    resultShape: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Query SDMX data with guardrails.
     - Requires a bounded time window unless caller explicitly accepts the risk.
     - Returns raw SDMX-JSON and a minimal 'query_url' for reproducibility.
     """
-    if not (startPeriod and endPeriod) and not lastNObservations:
-        raise ValueError("Provide start/end periods or lastNObservations to avoid unbounded extracts.")
+    fetch_format = "csv" if resultShape else format
+    plan = await _query_plan(
+        flowRef=flowRef,
+        key=key,
+        filters=filters,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        format=fetch_format,
+        labels=labels,
+        resultShape=resultShape,
+    )
+    flow_details = plan["flowDetails"]
+    dimension_order = plan["dimensionOrder"]
+    normalized_filters = plan["normalizedFilters"]
+    key = plan["key"]
+    url = plan["queryURL"]
 
-    dimension_order: list[str] | None = None
-    normalized_filters: dict[str, Any] | None = None
-
-    if filters:
-        dimension_order = await _dimension_order_for_flow(flowRef)
-        normalized_filters = await _normalize_filters_to_code_ids(flowRef, filters)
-        key = _build_key_from_filters(dimension_order, normalized_filters)
-    elif key:
-        dimension_order = await _dimension_order_for_flow(flowRef)
-        key = _normalize_manual_key(key, dimension_order)
-
-    if not key:
-        raise ValueError("Provide either a key or filters to identify the data slice.")
-
-    # Standard SDMX pattern: /data/{flowRef}/{key}?startPeriod=...&endPeriod=...&format=...
-    flow_details = await _resolved_flow_details(flowRef)
-    flow_path = _data_path_for(flow_details["resolvedFlowRef"])
-    params: list[str] = []
-    if startPeriod and endPeriod:
-        params.append(f"startPeriod={quote(startPeriod)}")
-        params.append(f"endPeriod={quote(endPeriod)}")
-    if lastNObservations is not None:
-        params.append(f"lastNObservations={int(lastNObservations)}")
-    params.append(f"format={quote(format)}")
-    if labels:
-        params.append(f"labels={quote(labels)}")
-    url = f"{BASE}/data/{flow_path}/{quote(key, safe='+.')}?{'&'.join(params)}"
-
-    if format.lower() == "csv":
+    if fetch_format.lower() == "csv":
         status, text = await _get_text_with_status(url)
         if status >= 400:
             return _unresolved_response(
@@ -2510,7 +2830,7 @@ async def query_data(
                 key=key,
                 query_url=url,
                 dimension_order=dimension_order,
-                format="csv",
+                format=fetch_format,
                 labels=labels,
                 startPeriod=startPeriod,
                 endPeriod=endPeriod,
@@ -2520,12 +2840,12 @@ async def query_data(
                 status_code=status,
                 raw_text=text,
             )
-        return _resolved_response(
+        payload = _resolved_response(
             flow_details=flow_details,
             key=key,
             query_url=url,
             dimension_order=dimension_order,
-            format="csv",
+            format=fetch_format,
             labels=labels,
             startPeriod=startPeriod,
             endPeriod=endPeriod,
@@ -2534,6 +2854,10 @@ async def query_data(
             maxObs=maxObs,
             raw_csv=text,
         )
+        if resultShape:
+            rows = _csv_rows(text)
+            payload["shaped"] = _shape_rows(rows, resultShape)
+        return payload
 
     status, text = await _get_text_with_status(url)
     if status >= 400:
@@ -2542,7 +2866,7 @@ async def query_data(
             key=key,
             query_url=url,
             dimension_order=dimension_order,
-            format=format,
+            format=fetch_format,
             labels=labels,
             startPeriod=startPeriod,
             endPeriod=endPeriod,
@@ -2559,7 +2883,7 @@ async def query_data(
             key=key,
             query_url=url,
             dimension_order=dimension_order,
-            format=format,
+            format=fetch_format,
             labels=labels,
             startPeriod=startPeriod,
             endPeriod=endPeriod,
@@ -2579,7 +2903,7 @@ async def query_data(
             key=key,
             query_url=url,
             dimension_order=dimension_order,
-            format=format,
+            format=fetch_format,
             labels=labels,
             startPeriod=startPeriod,
             endPeriod=endPeriod,
@@ -2596,7 +2920,7 @@ async def query_data(
         key=key,
         query_url=url,
         dimension_order=dimension_order,
-        format=format,
+        format=fetch_format,
         labels=labels,
         startPeriod=startPeriod,
         endPeriod=endPeriod,
@@ -2605,3 +2929,101 @@ async def query_data(
         maxObs=maxObs,
         raw_json=raw,
     )
+
+
+@mcp.tool()
+async def resolve_and_query_data(
+    flowRef: str,
+    filters: dict[str, Any],
+    startPeriod: Optional[str] = None,
+    endPeriod: Optional[str] = None,
+    lastNObservations: Optional[int] = None,
+    labels: Optional[str] = None,
+    resultShape: str = "latest_single_value",
+) -> dict[str, Any]:
+    """
+    Validate a query, try one hierarchy-based aggregate fallback when needed, and then return a shaped result.
+    This is intended for common user-facing questions that expect one compact answer rather than raw SDMX payloads.
+    """
+    if not filters:
+        raise ValueError("filters must include at least one dimension.")
+
+    validation = await validate_query_scope(
+        flowRef=flowRef,
+        filters=filters,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        labels=labels,
+    )
+    if validation.get("status") == "resolved":
+        result = await query_data(
+            flowRef=flowRef,
+            filters=filters,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=lastNObservations,
+            format="csv",
+            labels=labels,
+            resultShape=resultShape,
+        )
+        return {
+            "status": "resolved",
+            "resolutionPath": "direct",
+            "validation": validation,
+            "result": result,
+        }
+
+    single_value_dimensions = []
+    for raw_dimension, raw_value in filters.items():
+        tokens = _selection_tokens(raw_value)
+        if len(tokens) == 1:
+            single_value_dimensions.append((str(raw_dimension).upper(), tokens[0]))
+
+    fallback_attempts: list[dict[str, Any]] = []
+    for dimension_id, code in single_value_dimensions:
+        fallback = await resolve_dimension_fallback(
+            flowRef=flowRef,
+            dimension=dimension_id,
+            code=code,
+            filters=filters,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=lastNObservations,
+            labels=labels,
+        )
+        fallback_attempts.append(fallback)
+        if fallback.get("status") != "retry_with_members":
+            continue
+        retry_plan = fallback.get("retryPlan") or {}
+        retry_filters = retry_plan.get("filters")
+        if not isinstance(retry_filters, dict):
+            continue
+        result = await query_data(
+            flowRef=flowRef,
+            filters=retry_filters,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=lastNObservations,
+            format="csv",
+            labels=labels,
+            resultShape=resultShape,
+        )
+        return {
+            "status": "resolved_with_fallback",
+            "resolutionPath": "member_fallback",
+            "validation": validation,
+            "fallback": fallback,
+            "result": result,
+        }
+
+    return {
+        "status": "unresolved",
+        "resolutionPath": "direct_failed",
+        "validation": validation,
+        "fallbackAttempts": fallback_attempts,
+        "assistant_guidance": (
+            "The direct query did not resolve, and no single hierarchy-based fallback path produced a retry plan. "
+            "Do not guess a single value."
+        ),
+    }

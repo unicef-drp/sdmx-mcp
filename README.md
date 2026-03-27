@@ -155,22 +155,31 @@ All tools are defined in `server.py`.
 19. `resolve_dimension_fallback(flowRef, dimension, code, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
 - Purpose: validate an aggregate dimension query and, if unresolved, return a hierarchy-based retry plan using member codes.
 
-20. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+20. `plan_query(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, format='csv', labels=None, resultShape=None)`
+- Purpose: resolve a query into a concrete SDMX URL before execution and show wildcard dimensions that can still split the result.
+
+21. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
 - Purpose: preflight whether a concrete UNICEF/UNPD query resolves before any narrative answer is attempted.
 - Returns: structured source-bound status with `status`, `sourceScope`, `provenance`, optional `error`, and `assistant_guidance`.
 
-21. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None)`
+22. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None, resultShape=None)`
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
   - requires either (`startPeriod` + `endPeriod`) or `lastNObservations`
   - supports `filters` to auto-build key from dimension order
   - leaves unspecified dimensions as empty key segments (`.` wildcard)
   - supports `format='csv'` and returns `raw_csv`
+  - supports `resultShape` values `compact_series`, `latest_single_value`, `latest_by_ref_area`, and `topline_summary`
   - supports optional `labels` parameter (for example `labels=both` with CSV)
   - returns explicit `status` of either `resolved` or `unresolved_from_official_flows`
+  - when `resultShape='latest_single_value'`, returns explicit non-answer states like `no_observations`, `no_value_column`, or `not_a_single_value` instead of silently picking a row
   - always includes `sourceScope`, `provenance`, and `assistant_guidance`
   - parses SDMX XML error payloads into structured `error.message`
   - on unresolved queries, callers should stop and report the failed official query instead of supplementing with external facts
+
+23. `resolve_and_query_data(flowRef, filters, startPeriod=None, endPeriod=None, lastNObservations=None, labels=None, resultShape='latest_single_value')`
+- Purpose: high-level helper for common user questions.
+- Behavior: validates the direct query first, then attempts a single hierarchy-based member fallback when an aggregate code does not resolve, and finally returns a shaped result.
 
 ## Agent Test Rig
 
