@@ -64,6 +64,17 @@ fly auth login
 fly deploy --build-arg UV_CACHE_DIR=/app/.uv-cache
 ```
 
+Feature-branch draft deploy:
+
+- `unicef` deploys to the main Fly app from `fly.toml`
+- `feat/unicef-agent-test-rig` deploys to the separate draft app from `fly.eval.toml`
+
+If the draft app does not exist yet, create it once before relying on GitHub Actions auto-deploys:
+
+```bash
+fly launch --no-deploy --copy-config --name sdmx-mcp-eval --config fly.eval.toml
+```
+
 Sanity check:
 
 ```bash
