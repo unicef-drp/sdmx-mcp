@@ -108,6 +108,51 @@ def _query_mode(config: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _registry_profile(config: dict[str, Any]) -> str:
+    value = str(config.get("registry_profile") or "dense").strip().lower()
+    if value not in {"dense", "sparse"}:
+        raise ValueError("registry_profile must be 'dense' or 'sparse'.")
+    return value
+
+
+def _test_mode(config: dict[str, Any]) -> str:
+    value = str(config.get("test_mode") or "positive").strip().lower()
+    if value not in {"positive", "negative", "mixed"}:
+        raise ValueError("test_mode must be 'positive', 'negative', or 'mixed'.")
+    return value
+
+
+def _negative_case_options(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("negative_case_options")
+    options = dict(raw) if isinstance(raw, dict) else {}
+    ratio = options.get("ratio", 0.5)
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("negative_case_options.ratio must be numeric.") from exc
+    if ratio < 0 or ratio > 1:
+        raise ValueError("negative_case_options.ratio must be between 0 and 1.")
+    strategies = options.get("strategies") or ["swap_dimension_value"]
+    if not isinstance(strategies, list) or not strategies:
+        raise ValueError("negative_case_options.strategies must be a non-empty list.")
+    normalized_strategies = [str(item).strip().lower() for item in strategies if str(item).strip()]
+    supported = {"swap_dimension_value", "shift_year"}
+    unsupported = [item for item in normalized_strategies if item not in supported]
+    if unsupported:
+        raise ValueError(
+            f"Unsupported negative case strategies: {', '.join(unsupported)}. "
+            "Supported strategies: swap_dimension_value, shift_year."
+        )
+    max_attempts = int(options.get("max_attempts_per_case") or 20)
+    if max_attempts <= 0:
+        raise ValueError("negative_case_options.max_attempts_per_case must be >= 1.")
+    return {
+        "ratio": ratio,
+        "strategies": normalized_strategies,
+        "max_attempts_per_case": max_attempts,
+    }
+
+
 def _output_path(value: Path | None, default_path: Path) -> Path:
     return value or default_path
 
@@ -449,12 +494,119 @@ async def _direct_query_case(
     }
 
 
+def _ground_truth_outcome(ground_truth: dict[str, Any]) -> str:
+    status = str(ground_truth.get("status") or "")
+    if status == "http_error":
+        return "unresolved"
+    expected = ground_truth.get("expected")
+    if not isinstance(expected, dict):
+        return "manual_review"
+    expected_status = str(expected.get("status") or "")
+    if expected_status == "deterministic":
+        return "resolved_single_value"
+    if expected_status in {"no_data", "empty_values"}:
+        return "no_data"
+    return "manual_review"
+
+
+async def _find_negative_variant(
+    client: httpx.AsyncClient,
+    *,
+    base_case: dict[str, Any],
+    all_dimension_values: dict[str, list[DimensionValue]],
+    query_mode_type: str,
+    negative_case_options: dict[str, Any],
+    base_url: str,
+    user_agent: str,
+    wildcard_dimensions: set[str],
+    value_column_hint: str | None,
+) -> dict[str, Any] | None:
+    flow_ref = str(base_case["flowRef"])
+    dimension_order = [str(item) for item in base_case["dimensionOrder"]]
+    filters = {str(key): str(value) for key, value in dict(base_case["filters"]).items()}
+    base_time_period = base_case.get("timePeriod")
+    last_n_observations = base_case.get("lastNObservations")
+
+    attempts = 0
+    for strategy in negative_case_options["strategies"]:
+        if strategy == "swap_dimension_value":
+            for dimension_id, current_value in filters.items():
+                candidates = all_dimension_values.get(dimension_id, [])
+                for candidate in candidates:
+                    if candidate.id == current_value:
+                        continue
+                    attempts += 1
+                    if attempts > negative_case_options["max_attempts_per_case"]:
+                        return None
+                    mutated_filters = dict(filters)
+                    mutated_filters[dimension_id] = candidate.id
+                    ground_truth = await _direct_query_case(
+                        client,
+                        flow_ref=flow_ref,
+                        dimension_order=dimension_order,
+                        filters=mutated_filters,
+                        year=str(base_time_period) if base_time_period is not None else None,
+                        last_n_observations=int(last_n_observations) if last_n_observations is not None else None,
+                        base_url=base_url,
+                        user_agent=user_agent,
+                        wildcard_dimensions=wildcard_dimensions,
+                        value_column_hint=value_column_hint,
+                    )
+                    if _ground_truth_outcome(ground_truth) != "no_data":
+                        continue
+                    mutated_dimensions = dict(base_case.get("dimensions") or {})
+                    mutated_dimensions[dimension_id] = {"id": candidate.id, "name": candidate.name}
+                    mutated_case = dict(base_case)
+                    mutated_case["case_id"] = f"{base_case['case_id']}|negative|swap|{dimension_id}|{candidate.id}"
+                    mutated_case["filters"] = mutated_filters
+                    mutated_case["dimensions"] = mutated_dimensions
+                    mutated_case["caseType"] = "negative"
+                    mutated_case["negativeStrategy"] = "swap_dimension_value"
+                    mutated_case["expectedBehavior"] = "abstain_no_data"
+                    mutated_case["ground_truth"] = ground_truth
+                    return mutated_case
+
+        if strategy == "shift_year" and query_mode_type == "explicit_time_range" and base_time_period is not None:
+            for year_shift in (1, -1, 2, -2, 5, -5, 10, -10):
+                attempts += 1
+                if attempts > negative_case_options["max_attempts_per_case"]:
+                    return None
+                shifted_year = str(int(str(base_time_period)) + year_shift)
+                ground_truth = await _direct_query_case(
+                    client,
+                    flow_ref=flow_ref,
+                    dimension_order=dimension_order,
+                    filters=filters,
+                    year=shifted_year,
+                    last_n_observations=None,
+                    base_url=base_url,
+                    user_agent=user_agent,
+                    wildcard_dimensions=wildcard_dimensions,
+                    value_column_hint=value_column_hint,
+                )
+                if _ground_truth_outcome(ground_truth) != "no_data":
+                    continue
+                mutated_case = dict(base_case)
+                mutated_case["case_id"] = f"{base_case['case_id']}|negative|shift_year|{shifted_year}"
+                mutated_case["timePeriod"] = shifted_year
+                mutated_case["caseType"] = "negative"
+                mutated_case["negativeStrategy"] = "shift_year"
+                mutated_case["expectedBehavior"] = "abstain_no_data"
+                mutated_case["ground_truth"] = ground_truth
+                return mutated_case
+
+    return None
+
+
 async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: int | None = None) -> dict[str, Any]:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     _apply_registry_overrides(config)
     dataflows = config.get("dataflows")
     if not isinstance(dataflows, list) or not dataflows:
         raise ValueError("Config must include a non-empty 'dataflows' list.")
+    registry_profile = _registry_profile(config)
+    test_mode = _test_mode(config)
+    negative_case_options = _negative_case_options(config)
     specs = _dimension_specs(config)
     time_dimension_id = _time_dimension_id(config)
     query_mode = _query_mode(config)
@@ -484,6 +636,8 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
 
     total_cases = 0
     written_cases = 0
+    positive_written = 0
+    negative_written = 0
     async with httpx.AsyncClient(timeout=90.0) as client:
         with manifest_path.open("w", encoding="utf-8") as handle:
             semaphore = asyncio.Semaphore(concurrency)
@@ -498,6 +652,7 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                 flow_id = _flow_ref_parts(normalized_flow_ref)[1]
 
                 varying_dimensions: list[tuple[str, list[DimensionValue]]] = []
+                all_dimension_values: dict[str, list[DimensionValue]] = {}
                 missing_dimensions: list[str] = []
                 for dimension_id in dimension_order:
                     if query_mode["type"] == "explicit_time_range" and dimension_id == time_dimension_id:
@@ -519,6 +674,7 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                     if not values:
                         missing_dimensions.append(dimension_id)
                         continue
+                    all_dimension_values[dimension_id] = values
                     varying_dimensions.append((dimension_id, values))
 
                 if missing_dimensions:
@@ -527,7 +683,7 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                     )
 
                 combos = _cartesian_product(varying_dimensions)
-                tasks = []
+                tasks: list[asyncio.Task[dict[str, Any]]] = []
                 cases: list[dict[str, Any]] = []
                 for selected in combos:
                     for year in time_values:
@@ -544,6 +700,9 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                             "timePeriod": year,
                             "lastNObservations": last_n_observations,
                             "queryMode": query_mode["type"],
+                            "registryProfile": registry_profile,
+                            "caseType": "positive",
+                            "expectedBehavior": "return_value",
                             "wildcardDimensions": sorted(wildcard_dimensions),
                             "dimensions": {
                                 dimension_id: {"id": value.id, "name": value.name}
@@ -582,14 +741,63 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                             break
                     if case_limit is not None and total_cases >= case_limit:
                         break
+                positive_cases: list[dict[str, Any]] = []
                 for case, task in zip(cases, tasks):
                     case["ground_truth"] = await task
+                    outcome = _ground_truth_outcome(case["ground_truth"])
+                    if test_mode == "positive" and outcome != "resolved_single_value":
+                        continue
+                    if test_mode == "negative":
+                        continue
+                    positive_cases.append(case)
+
+                selected_positive_cases = positive_cases
+                if test_mode == "mixed":
+                    target_negative = max(1, int(len(positive_cases) * negative_case_options["ratio"])) if positive_cases else 0
+                elif test_mode == "negative":
+                    target_negative = max(1, case_limit or len(cases))
+                else:
+                    target_negative = 0
+
+                negative_cases: list[dict[str, Any]] = []
+                if registry_profile == "sparse" and test_mode in {"negative", "mixed"} and target_negative > 0:
+                    for base_case in positive_cases:
+                        if len(negative_cases) >= target_negative:
+                            break
+                        variant = await _find_negative_variant(
+                            client,
+                            base_case=base_case,
+                            all_dimension_values=all_dimension_values,
+                            query_mode_type=query_mode["type"],
+                            negative_case_options=negative_case_options,
+                            base_url=base_url,
+                            user_agent=user_agent,
+                            wildcard_dimensions=wildcard_dimensions,
+                            value_column_hint=value_column_hint,
+                        )
+                        if variant:
+                            negative_cases.append(variant)
+
+                if test_mode == "negative":
+                    selected_positive_cases = []
+
+                for case in selected_positive_cases:
                     handle.write(json.dumps(case, ensure_ascii=True) + "\n")
                     written_cases += 1
+                    positive_written += 1
+                for case in negative_cases:
+                    handle.write(json.dumps(case, ensure_ascii=True) + "\n")
+                    written_cases += 1
+                    negative_written += 1
                 if case_limit is not None and total_cases >= case_limit:
                     break
 
-    return {"cases_written": written_cases, "manifest_path": str(manifest_path)}
+    return {
+        "cases_written": written_cases,
+        "positive_cases_written": positive_written,
+        "negative_cases_written": negative_written,
+        "manifest_path": str(manifest_path),
+    }
 
 
 async def _bounded_direct_query(
@@ -771,8 +979,16 @@ def grade_results(
                     filter_matches[str(key)] = str(claim_filters.get(key, "")).strip() == str(expected_filter).strip()
 
             expected_status = expected.get("status") if isinstance(expected, dict) else None
+            case_type = str(case.get("caseType") or "positive")
+            expected_behavior = str(case.get("expectedBehavior") or "")
             if response.get("status") != "ok":
                 overall = "manual_review"
+            elif case_type == "negative" and expected_behavior == "abstain_no_data":
+                claim_value = claims.get("value")
+                if claim_value in (None, ""):
+                    overall = "pass"
+                else:
+                    overall = "fail"
             elif expected_status != "deterministic":
                 overall = "manual_review"
             elif value_match is True and (time_match in (True, None)) and (flow_match in (True, None)) and all(filter_matches.values()):
@@ -800,6 +1016,8 @@ def grade_results(
                     "filter_matches": filter_matches,
                 },
                 "expected": {
+                    "caseType": case_type,
+                    "expectedBehavior": expected_behavior,
                     "flowRef": case.get("flowRef"),
                     "filters": case.get("filters"),
                     "timePeriod": expected_time_period,

@@ -257,9 +257,12 @@ python3 scripts/sdmx_eval_runner.py run-provider \
 ### Config Model
 
 The config file controls:
+- `registry_profile`: whether the registry/dataflows should be tested as `dense` or `sparse`.
+- `test_mode`: whether to build `positive`, `negative`, or `mixed` case sets.
 - `dataflows`: exact flows to test.
 - `dimensions`: how each dimension should be expanded.
 - `query_mode`: whether cases use explicit `TIME_PERIOD` values or `lastNObservations`.
+- `negative_case_options`: how sparse/negative cases should be generated.
 - `prompt_template`: how deterministic cases become natural-language prompts.
 - `provider`: the adapter command that will call an actual model stack.
 
@@ -272,6 +275,19 @@ Supported dimension modes:
 Supported query modes:
 - `explicit_time_range`: build one case per configured time value from the `TIME_PERIOD` dimension config.
 - `last_n_observations`: omit explicit time values and query with `lastNObservations`, which is useful for latest-single-value benchmarks.
+
+Supported registry profiles:
+- `dense`: use when most valid intersections are expected to resolve.
+- `sparse`: use when many syntactically valid intersections are expected to return no observations.
+
+Supported test modes:
+- `positive`: benchmark value correctness on resolvable cases.
+- `negative`: benchmark abstention/non-hallucination on deliberately empty cases.
+- `mixed`: generate both positive and negative cases in one manifest.
+
+Supported negative-case strategies:
+- `swap_dimension_value`: replace one configured dimension value with another valid code and keep the mutated case only when the direct SDMX query returns no observations.
+- `shift_year`: for explicit time-range cases, move the requested year and keep the mutated case only when the direct SDMX query returns no observations.
 
 ### Provider Contract
 

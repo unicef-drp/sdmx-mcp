@@ -10,9 +10,16 @@
     "server_label": "unicef-sdmx"
   },
   "concurrency": 8,
+  "registry_profile": "sparse",
+  "test_mode": "mixed",
   "query_mode": {
     "type": "last_n_observations",
     "last_n_observations": 1
+  },
+  "negative_case_options": {
+    "ratio": 0.4,
+    "strategies": ["swap_dimension_value"],
+    "max_attempts_per_case": 20
   },
   "dataflows": [
     "UNICEF/GLOBAL_DATAFLOW/1.0"
