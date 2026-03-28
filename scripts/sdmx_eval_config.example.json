@@ -10,8 +10,12 @@
     "server_label": "unicef-sdmx"
   },
   "concurrency": 8,
+  "query_mode": {
+    "type": "last_n_observations",
+    "last_n_observations": 1
+  },
   "dataflows": [
-    "UNICEF/UNICEF_1MICS/1.0"
+    "UNICEF/GLOBAL_DATAFLOW/1.0"
   ],
   "dimensions": [
     {
@@ -24,26 +28,19 @@
       "id": "REF_AREA",
       "mode": "external_codelist_intersection",
       "codelist_url": "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest/codelist/UNICEF/CL_COUNTRY/1.0",
-      "max_values": 10
+      "max_values": 4
     },
     {
       "id": "SEX",
       "mode": "fixed",
       "values": ["T"]
-    },
-    {
-      "id": "TIME_PERIOD",
-      "mode": "time_range",
-      "start": 2020,
-      "end": 2024,
-      "step": 1
     }
   ],
   "wildcard_dimensions": [],
   "expected_value": {
     "column_hint": "OBS_VALUE"
   },
-  "prompt_template": "Using the SDMX MCP, what was the value of {INDICATOR_name} in {REF_AREA_name} in {TIME_PERIOD}? Report the numeric value and cite the dataflow you used.",
+  "prompt_template": "Using the SDMX MCP, what is the latest available value of {INDICATOR_name} in {REF_AREA_name}? Report the numeric value, the reported period, and the dataflow you used.",
   "provider": {
     "type": "command",
     "name": "anthropic",

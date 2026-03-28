@@ -259,6 +259,7 @@ python3 scripts/sdmx_eval_runner.py run-provider \
 The config file controls:
 - `dataflows`: exact flows to test.
 - `dimensions`: how each dimension should be expanded.
+- `query_mode`: whether cases use explicit `TIME_PERIOD` values or `lastNObservations`.
 - `prompt_template`: how deterministic cases become natural-language prompts.
 - `provider`: the adapter command that will call an actual model stack.
 
@@ -267,6 +268,10 @@ Supported dimension modes:
 - `flow_dimension`: use all codes from the flow DSD for that dimension.
 - `external_codelist_intersection`: intersect the flow dimension codelist with an external SDMX codelist URL.
 - `time_range`: generate yearly cases across a configured start/end range.
+
+Supported query modes:
+- `explicit_time_range`: build one case per configured time value from the `TIME_PERIOD` dimension config.
+- `last_n_observations`: omit explicit time values and query with `lastNObservations`, which is useful for latest-single-value benchmarks.
 
 ### Provider Contract
 

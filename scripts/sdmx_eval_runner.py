@@ -96,6 +96,18 @@ def _time_dimension_id(config: dict[str, Any]) -> str:
     return "TIME_PERIOD"
 
 
+def _query_mode(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("query_mode")
+    if not isinstance(raw, dict):
+        return {"type": "explicit_time_range"}
+    mode_type = str(raw.get("type") or "explicit_time_range").strip().lower()
+    if mode_type not in {"explicit_time_range", "last_n_observations"}:
+        raise ValueError("query_mode.type must be 'explicit_time_range' or 'last_n_observations'.")
+    normalized = dict(raw)
+    normalized["type"] = mode_type
+    return normalized
+
+
 def _output_path(value: Path | None, default_path: Path) -> Path:
     return value or default_path
 
@@ -202,9 +214,10 @@ def _prompt_context(
         "flow_ref": flow_ref,
         "flow_id": flow_id,
         "flow_name": flow_name,
-        "TIME_PERIOD": year,
-        "time_period": year,
-        "year": year,
+        "TIME_PERIOD": year or "",
+        "time_period": year or "",
+        "year": year or "",
+        "latest_label": "latest available" if not year else year,
     }
     for dim_id, value in values.items():
         context[dim_id] = value.id
@@ -377,23 +390,37 @@ def _resolve_time_values(spec: dict[str, Any]) -> list[str]:
     return [str(year) for year in range(start_year, end_year + 1, step)]
 
 
+def _last_n_observations(config: dict[str, Any]) -> int:
+    mode = _query_mode(config)
+    if mode["type"] != "last_n_observations":
+        return 0
+    value = int(mode.get("last_n_observations") or 1)
+    if value <= 0:
+        raise ValueError("query_mode.last_n_observations must be >= 1.")
+    return value
+
+
 async def _direct_query_case(
     client: httpx.AsyncClient,
     *,
     flow_ref: str,
     dimension_order: list[str],
     filters: dict[str, str],
-    year: str,
+    year: str | None,
+    last_n_observations: int | None,
     base_url: str,
     user_agent: str,
     wildcard_dimensions: set[str],
     value_column_hint: str | None,
 ) -> dict[str, Any]:
     key = _build_key(dimension_order, filters, wildcard_dimensions)
-    query_url = (
-        f"{base_url}/data/{_quoted_flow_path(flow_ref)}/{quote(key, safe='+.')}?"
-        f"startPeriod={quote(year)}&endPeriod={quote(year)}&format=csv"
-    )
+    query_parts = ["format=csv"]
+    if year:
+        query_parts.append(f"startPeriod={quote(year)}")
+        query_parts.append(f"endPeriod={quote(year)}")
+    if last_n_observations is not None:
+        query_parts.append(f"lastNObservations={int(last_n_observations)}")
+    query_url = f"{base_url}/data/{_quoted_flow_path(flow_ref)}/{quote(key, safe='+.')}?{'&'.join(query_parts)}"
     response = await client.get(query_url, headers={"User-Agent": user_agent})
     text = response.text
     if response.status_code >= 400:
@@ -405,6 +432,7 @@ async def _direct_query_case(
         }
     rows = _csv_rows(text)
     value_column = _infer_value_column(rows, value_column_hint)
+    time_column = _infer_value_column(rows, "TIME_PERIOD")
     expected = _expected_value(rows, value_column)
     return {
         "status": "resolved",
@@ -412,6 +440,10 @@ async def _direct_query_case(
         "http_status": response.status_code,
         "row_count": len(rows),
         "value_column": value_column,
+        "time_column": time_column,
+        "resolved_time_periods": sorted(
+            {str(row.get(time_column)).strip() for row in rows if time_column and row.get(time_column) is not None}
+        ),
         "expected": expected,
         "rows": rows,
     }
@@ -425,9 +457,16 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
         raise ValueError("Config must include a non-empty 'dataflows' list.")
     specs = _dimension_specs(config)
     time_dimension_id = _time_dimension_id(config)
-    if time_dimension_id not in specs:
-        raise ValueError(f"Config dimensions must include the time dimension '{time_dimension_id}'.")
-    time_values = _resolve_time_values(specs[time_dimension_id])
+    query_mode = _query_mode(config)
+    time_values: list[str | None]
+    last_n_observations: int | None = None
+    if query_mode["type"] == "explicit_time_range":
+        if time_dimension_id not in specs:
+            raise ValueError(f"Config dimensions must include the time dimension '{time_dimension_id}'.")
+        time_values = _resolve_time_values(specs[time_dimension_id])
+    else:
+        time_values = [None]
+        last_n_observations = _last_n_observations(config)
     wildcard_dimensions = _wildcard_dimensions(config)
     prompt_template = str(config.get("prompt_template") or "").strip()
     if not prompt_template:
@@ -461,7 +500,9 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                 varying_dimensions: list[tuple[str, list[DimensionValue]]] = []
                 missing_dimensions: list[str] = []
                 for dimension_id in dimension_order:
-                    if dimension_id == time_dimension_id or dimension_id in wildcard_dimensions:
+                    if query_mode["type"] == "explicit_time_range" and dimension_id == time_dimension_id:
+                        continue
+                    if dimension_id in wildcard_dimensions:
                         continue
                     spec = specs.get(dimension_id)
                     if not spec:
@@ -491,7 +532,8 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                 for selected in combos:
                     for year in time_values:
                         filters = {dimension_id: value.id for dimension_id, value in selected.items()}
-                        case_id = f"{normalized_flow_ref}|{year}|{json.dumps(filters, sort_keys=True)}"
+                        time_key = year if year is not None else f"lastN={int(last_n_observations or 1)}"
+                        case_id = f"{normalized_flow_ref}|{time_key}|{json.dumps(filters, sort_keys=True)}"
                         case = {
                             "case_id": case_id,
                             "flowRef": normalized_flow_ref,
@@ -500,6 +542,8 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                             "dimensionOrder": dimension_order,
                             "filters": filters,
                             "timePeriod": year,
+                            "lastNObservations": last_n_observations,
+                            "queryMode": query_mode["type"],
                             "wildcardDimensions": sorted(wildcard_dimensions),
                             "dimensions": {
                                 dimension_id: {"id": value.id, "name": value.name}
@@ -526,6 +570,7 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                                     dimension_order=dimension_order,
                                     filters=filters,
                                     year=year,
+                                    last_n_observations=last_n_observations,
                                     base_url=base_url,
                                     user_agent=user_agent,
                                     wildcard_dimensions=wildcard_dimensions,
@@ -700,6 +745,10 @@ def grade_results(
             expected_truth = case.get("ground_truth") or {}
             expected = expected_truth.get("expected") if isinstance(expected_truth, dict) else {}
             expected_value = expected.get("value") if isinstance(expected, dict) else None
+            resolved_periods = expected_truth.get("resolved_time_periods") if isinstance(expected_truth, dict) else None
+            expected_time_period = case.get("timePeriod")
+            if expected_time_period is None and isinstance(resolved_periods, list) and len(resolved_periods) == 1:
+                expected_time_period = resolved_periods[0]
 
             value_match = _decimal_match(expected_value, claims.get("value"), numeric_tolerance)
             if value_match is None and expected_value is not None:
@@ -709,7 +758,7 @@ def grade_results(
 
             time_match = None
             if claims.get("time_period") is not None:
-                time_match = str(claims.get("time_period")).strip() == str(case.get("timePeriod")).strip()
+                time_match = str(claims.get("time_period")).strip() == str(expected_time_period).strip()
 
             flow_match = None
             if claims.get("flowRef") is not None:
@@ -753,7 +802,9 @@ def grade_results(
                 "expected": {
                     "flowRef": case.get("flowRef"),
                     "filters": case.get("filters"),
-                    "timePeriod": case.get("timePeriod"),
+                    "timePeriod": expected_time_period,
+                    "resolved_time_periods": resolved_periods,
+                    "lastNObservations": case.get("lastNObservations"),
                     "expected_value": expected_value,
                     "expected_status": expected_status,
                     "query_url": expected_truth.get("query_url") if isinstance(expected_truth, dict) else None,
