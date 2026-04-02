@@ -262,7 +262,9 @@ For `observations`, `time_range` can be:
   - does not inject `startPeriod`, `endPeriod`, or `lastNObservations` for full-series requests such as `resultShape='compact_series'` or `resultShape='topline_summary'`
   - supports `filters` to auto-build key from dimension order
   - leaves unspecified dimensions as empty key segments (`.` wildcard)
-  - defaults to `format='csv'` and returns `raw_csv`
+  - always fetches SDMX `/data` payloads as CSV for efficiency and simpler downstream parsing
+  - returns `raw_csv` for data queries; structure and discovery tools still return JSON objects
+  - if a caller passes a non-CSV `format`, the response notes record the requested format and the CSV override
   - supports `resultShape` values `compact_series`, `latest_single_value`, `latest_by_ref_area`, and `topline_summary`
   - defaults to `labels='name'` for CSV readability
   - returns explicit `status` of either `resolved` or `unresolved_from_official_flows`

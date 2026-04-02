@@ -868,7 +868,6 @@ def _resolved_response(
     lastNObservations: int | None,
     filters: dict[str, Any] | None,
     maxObs: int,
-    raw_json: dict[str, Any] | None = None,
     raw_csv: str | None = None,
 ) -> dict[str, Any]:
     payload = _query_context(
@@ -887,13 +886,11 @@ def _resolved_response(
         {
             "status": "resolved",
             "assistant_guidance": "Use only the observations returned here. Cite the agency, flow, key, and query URL when summarizing.",
-            "notes": {"maxObs": maxObs, "format": format, "labels": labels},
+            "notes": {"maxObs": maxObs, "format": format, "labels": labels, "dataTransportFormat": "csv"},
         }
     )
     if raw_csv is not None:
         payload["raw_csv"] = raw_csv
-    if raw_json is not None:
-        payload["raw"] = raw_json
     return payload
 
 
@@ -2548,7 +2545,7 @@ async def _execute_query_data(
     allowUnboundedTime: bool = False,
 ) -> dict[str, Any]:
     requested_format = (format or "csv").strip() or "csv"
-    fetch_format = "csv" if resultShape else requested_format
+    fetch_format = "csv"
     plan = await _query_plan(
         flowRef=flowRef,
         key=key,
@@ -2570,43 +2567,6 @@ async def _execute_query_data(
     effective_labels = plan["labels"]
     effective_last_n = plan["lastNObservations"]
 
-    if fetch_format.lower() == "csv":
-        status, text = await _get_text_with_status(url)
-        if status >= 400:
-            return _unresolved_response(
-                flow_details=flow_details,
-                key=planned_key,
-                query_url=url,
-                dimension_order=dimension_order,
-                format=effective_format,
-                labels=effective_labels,
-                startPeriod=startPeriod,
-                endPeriod=endPeriod,
-                lastNObservations=effective_last_n,
-                filters=normalized_filters,
-                maxObs=maxObs,
-                status_code=status,
-                raw_text=text,
-            )
-        payload = _resolved_response(
-            flow_details=flow_details,
-            key=planned_key,
-            query_url=url,
-            dimension_order=dimension_order,
-            format=effective_format,
-            labels=effective_labels,
-            startPeriod=startPeriod,
-            endPeriod=endPeriod,
-            lastNObservations=effective_last_n,
-            filters=normalized_filters,
-            maxObs=maxObs,
-            raw_csv=text,
-        )
-        if resultShape:
-            rows = _csv_rows(text)
-            payload["shaped"] = _shape_rows(rows, resultShape)
-        return payload
-
     status, text = await _get_text_with_status(url)
     if status >= 400:
         return _unresolved_response(
@@ -2624,46 +2584,7 @@ async def _execute_query_data(
             status_code=status,
             raw_text=text,
         )
-
-    if not _looks_like_json(text):
-        return _unresolved_response(
-            flow_details=flow_details,
-            key=planned_key,
-            query_url=url,
-            dimension_order=dimension_order,
-            format=effective_format,
-            labels=effective_labels,
-            startPeriod=startPeriod,
-            endPeriod=endPeriod,
-            lastNObservations=effective_last_n,
-            filters=normalized_filters,
-            maxObs=maxObs,
-            status_code=status,
-            raw_text=text,
-            message="Expected SDMX JSON but received a non-JSON response.",
-        )
-
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError:
-        return _unresolved_response(
-            flow_details=flow_details,
-            key=planned_key,
-            query_url=url,
-            dimension_order=dimension_order,
-            format=effective_format,
-            labels=effective_labels,
-            startPeriod=startPeriod,
-            endPeriod=endPeriod,
-            lastNObservations=effective_last_n,
-            filters=normalized_filters,
-            maxObs=maxObs,
-            status_code=status,
-            raw_text=text,
-            message="Received a malformed JSON payload from the official flow.",
-        )
-
-    return _resolved_response(
+    payload = _resolved_response(
         flow_details=flow_details,
         key=planned_key,
         query_url=url,
@@ -2675,8 +2596,15 @@ async def _execute_query_data(
         lastNObservations=effective_last_n,
         filters=normalized_filters,
         maxObs=maxObs,
-        raw_json=raw,
+        raw_csv=text,
     )
+    if requested_format.lower() != "csv":
+        payload["notes"]["requestedFormat"] = requested_format
+        payload["notes"]["formatOverride"] = "SDMX data queries are forced to CSV for efficiency and simpler downstream parsing."
+    if resultShape:
+        rows = _csv_rows(text)
+        payload["shaped"] = _shape_rows(rows, resultShape)
+    return payload
 
 
 async def dataflows_resource() -> dict[str, Any]:
