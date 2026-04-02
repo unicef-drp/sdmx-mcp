@@ -2789,11 +2789,37 @@ async def plan_topic_query(
             flowLimit=flowLimit,
         )
 
+    flow_summaries = await _dataflow_summaries()
+    flow_summary_by_ref = {
+        str(item.get("flowRef") or "").strip(): item
+        for item in flow_summaries
+        if isinstance(item, dict) and str(item.get("flowRef") or "").strip()
+    }
+
     recommended_flow_refs: list[str] = []
+    recommended_flows: list[dict[str, Any]] = []
     for item in indicator_candidates:
         flow_ref = str(item.get("recommendedFlowRef") or "").strip()
         if flow_ref and flow_ref not in recommended_flow_refs:
             recommended_flow_refs.append(flow_ref)
+            summary = flow_summary_by_ref.get(flow_ref)
+            if summary:
+                recommended_flows.append(summary)
+
+        dataflows = item.get("dataflows") or []
+        enriched_dataflows: list[dict[str, Any]] = []
+        for dataflow in dataflows:
+            if not isinstance(dataflow, dict):
+                continue
+            candidate_flow_ref = str(dataflow.get("flowRef") or "").strip()
+            summary = flow_summary_by_ref.get(candidate_flow_ref)
+            enriched = dict(dataflow)
+            if summary:
+                enriched["flowSummary"] = summary
+            enriched_dataflows.append(enriched)
+        item["dataflows"] = enriched_dataflows
+        if flow_ref and flow_ref in flow_summary_by_ref:
+            item["recommendedFlow"] = flow_summary_by_ref[flow_ref]
 
     return {
         "question": q,
@@ -2810,15 +2836,16 @@ async def plan_topic_query(
         ),
         "indicatorCandidates": indicator_candidates,
         "recommendedFlowRefs": recommended_flow_refs,
+        "recommendedFlows": recommended_flows,
         "recommendedSequence": [
-            "Use find_indicator_candidates(question) first to resolve the subject/indicator.",
-            "Choose a flow from the indicator candidate's recommendedFlowRef or dataflows list.",
+            "Use the recommended indicator candidate and its recommendedFlow first; do not call search_dataflows unless the returned flow metadata is insufficient.",
+            "If needed, choose among the candidate's enriched dataflows using the attached flowSummary metadata.",
             "Only then constrain geography and time with list_codes/search_reference_candidates/expand_ref_area_group.",
             "Call validate_query_scope before query_data or resolve_and_query_data.",
         ],
         "assistant_guidance": (
-            "For topical questions, resolve the subject dimension first. "
-            "Do not start with search_dataflows unless the user is explicitly asking for a dataset or flow."
+            "For topical questions, resolve the subject dimension first and prefer the attached recommendedFlow metadata. "
+            "Do not call search_dataflows unless the user is explicitly asking for a dataset or flow, or the returned flow summaries are insufficient."
         ),
     }
 
