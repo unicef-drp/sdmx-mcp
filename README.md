@@ -30,6 +30,9 @@ UV_CACHE_DIR="$PWD/.uv-cache" uv sync
 UV_CACHE_DIR="$PWD/.uv-cache" uv run fastmcp run server.py --transport stdio
 ```
 
+Runtime config is loaded from `.env` automatically when present.
+Policy config is auto-discovered from `query_dimension_policy.json` when `SDMX_QUERY_DIMENSION_POLICY_FILE` is not set.
+
 HTTP mode (local):
 
 ```bash
@@ -87,6 +90,95 @@ curl -sS --max-time 20 -X POST https://sdmx-mcp.fly.dev/mcp \
 ## MCP Tools (Function Catalog)
 
 All tools are defined in `server.py`.
+
+## MCP Resources
+
+The server now exposes read-only MCP resources for deterministic metadata, configuration, and basic retrieval:
+
+- `sdmx://dataflows`
+- `sdmx://dataflows/{dataflow_id}/dimensions`
+- `sdmx://codelists/{id}`
+- `sdmx://hierarchical-codelists/{id}`
+- `sdmx://query-dimension-policy`
+- `sdmx://observations/{dataflow_id}/{indicator}/{geography}/{time_range}`
+
+Use resources for:
+- metadata discovery
+- codelist lookup
+- hierarchy inspection
+- query-policy inspection
+- basic observation retrieval
+
+Use tools for:
+- query planning
+- hierarchy resolution and fallback planning
+- shaped retrieval
+- comparison, aggregation, or other procedural work
+
+`dataflow_id`, `id`, and hierarchy identifiers can be passed as bare IDs when the registry can resolve them, or as `AGENCY,ID,VERSION` when the caller needs an explicit SDMX reference.
+
+## Query Semantics Policy
+
+The server now has a configuration-driven query-dimension policy layer. By default it defines three query dimensions in priority order:
+
+- `subject`
+- `time`
+- `location`
+
+Time is special and resolves against the `TIME_PERIOD` dimension directly. Other important query dimensions are expected to point at SDMX codelists or hierarchical codelists through policy configuration.
+
+Override it with either:
+
+- `SDMX_QUERY_DIMENSION_POLICY_JSON`
+- `SDMX_QUERY_DIMENSION_POLICY_FILE`
+- `SDMX_DEFAULT_LAST_N_OBSERVATIONS`
+
+An example file is included at `query_dimension_policy.example.json`.
+
+Example UNICEF-oriented policy:
+
+```json
+{
+  "default_query_dimensions": [
+    {
+      "name": "location",
+      "role": "geography",
+      "required_for_retrieval": true,
+      "priority": 1,
+      "preferred_sources": [
+        {"type": "codelist", "id": "UNICEF/CL_COUNTRY/1.0"},
+        {"type": "hierarchical_codelist", "id": "UNICEF/UNICEF_REPORTING_REGIONS"}
+      ],
+      "allow_hierarchy_resolution": true,
+      "allow_member_expansion": true
+    },
+    {
+      "name": "subject",
+      "role": "subject",
+      "required_for_retrieval": true,
+      "priority": 2,
+      "preferred_sources": [
+        {"type": "codelist", "id": "UNICEF/CL_UNICEF_INDICATOR/1.0"}
+      ]
+    },
+    {
+      "name": "time",
+      "role": "time",
+      "required_for_retrieval": true,
+      "priority": 3
+    }
+  ]
+}
+```
+
+Resolution order follows policy `priority`, not hardcoded dimension names. Non-time dimensions are resolved through the configured code-list or hierarchy sources, and policy source IDs should use the SDMX reference form `agency/id/version` where applicable. `time` is resolved against `TIME_PERIOD`.
+
+For `observations`, `time_range` can be:
+
+- an explicit range like `2004:2024`, which becomes `startPeriod` and `endPeriod`
+- a single period like `2024`, which becomes `startPeriod=2024&endPeriod=2024`
+- `latest`, which uses `lastNObservations=1`
+- `all`, `trend`, `series`, `chart`, `graph`, or `table`, which omit both time parameters and `lastNObservations`
 
 1. `list_agencies(limit=50)`
 - Purpose: list agencies discovered from SDMX dataflows.
@@ -152,32 +244,34 @@ All tools are defined in `server.py`.
 18. `expand_dimension_group(flowRef, dimension, code)`
 - Purpose: expand an aggregate dimension code into descendant/member codes using the resolved hierarchy.
 
-19. `resolve_dimension_fallback(flowRef, dimension, code, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+19. `resolve_dimension_fallback(flowRef, dimension, code, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, labels=None)`
 - Purpose: validate an aggregate dimension query and, if unresolved, return a hierarchy-based retry plan using member codes.
 
-20. `plan_query(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, format='csv', labels=None, resultShape=None)`
+20. `plan_query(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, format='csv', labels='name', resultShape=None)`
 - Purpose: resolve a query into a concrete SDMX URL before execution and show wildcard dimensions that can still split the result.
 
-21. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=1, labels=None)`
+21. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, labels='name')`
 - Purpose: preflight whether a concrete UNICEF/UNPD query resolves before any narrative answer is attempted.
 - Returns: structured source-bound status with `status`, `sourceScope`, `provenance`, optional `error`, and `assistant_guidance`.
 
-22. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='sdmx-json', labels=None, maxObs=50000, filters=None, lastNObservations=None, resultShape=None)`
+22. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='csv', labels='name', maxObs=50000, filters=None, lastNObservations=None, resultShape=None)`
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
-  - requires either (`startPeriod` + `endPeriod`) or `lastNObservations`
+  - defaults to `lastNObservations=1` when no explicit `startPeriod` and `endPeriod` are provided and `SDMX_DEFAULT_LAST_N_OBSERVATIONS=true`
+  - when `SDMX_DEFAULT_LAST_N_OBSERVATIONS=false`, unqualified requests default to all time periods unless the caller explicitly asks for latest data or provides a range
+  - does not inject `startPeriod`, `endPeriod`, or `lastNObservations` for full-series requests such as `resultShape='compact_series'` or `resultShape='topline_summary'`
   - supports `filters` to auto-build key from dimension order
   - leaves unspecified dimensions as empty key segments (`.` wildcard)
-  - supports `format='csv'` and returns `raw_csv`
+  - defaults to `format='csv'` and returns `raw_csv`
   - supports `resultShape` values `compact_series`, `latest_single_value`, `latest_by_ref_area`, and `topline_summary`
-  - supports optional `labels` parameter (for example `labels=both` with CSV)
+  - defaults to `labels='name'` for CSV readability
   - returns explicit `status` of either `resolved` or `unresolved_from_official_flows`
   - when `resultShape='latest_single_value'`, returns explicit non-answer states like `no_observations`, `no_value_column`, or `not_a_single_value` instead of silently picking a row
   - always includes `sourceScope`, `provenance`, and `assistant_guidance`
   - parses SDMX XML error payloads into structured `error.message`
   - on unresolved queries, callers should stop and report the failed official query instead of supplementing with external facts
 
-23. `resolve_and_query_data(flowRef, filters, startPeriod=None, endPeriod=None, lastNObservations=None, labels=None, resultShape='latest_single_value')`
+23. `resolve_and_query_data(flowRef, filters, startPeriod=None, endPeriod=None, lastNObservations=None, labels='name', resultShape='latest_single_value')`
 - Purpose: high-level helper for common user questions.
 - Behavior: validates the direct query first, then attempts a single hierarchy-based member fallback when an aggregate code does not resolve, and finally returns a shaped result.
 

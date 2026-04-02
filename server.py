@@ -3,6 +3,8 @@ import csv
 import json
 import os
 from collections import Counter
+from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
@@ -16,7 +18,27 @@ from mcp.server.fastmcp import FastMCP
 # IMPORTANT for STDIO servers: do not print() to stdout.
 logging.basicConfig(level=logging.INFO)
 
-BASE = "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest"
+REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env_key = key.strip()
+        if not env_key or env_key in os.environ:
+            continue
+        os.environ[env_key] = value.strip().strip("\"'")
+
+
+_load_dotenv(REPO_ROOT / ".env")
+
+BASE = os.getenv("SDMX_BASE_URL", "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest")
+HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "unicef-sdmx-mcp/0.1")
 AGENCY_ALLOWLIST = {item.strip() for item in os.getenv("SDMX_AGENCY_ALLOWLIST", "").split(",") if item.strip()}
 
 # Bind to all interfaces so DNS rebinding protection isn't auto-enabled for localhost-only hosts.
@@ -39,21 +61,165 @@ THEME_PREFIX_CSV = Path(__file__).resolve().parent / "theme_prefixes_domain.csv"
 _dataflow_cache = TTLCache(maxsize=1, ttl=60 * 60 * 6)  # 6h
 _structure_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 _dimension_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
+_codelist_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 _hierarchical_codelist_cache = TTLCache(maxsize=32, ttl=60 * 60 * 24)  # 24h
+_hierarchical_codelist_detail_cache = TTLCache(maxsize=32, ttl=60 * 60 * 24)  # 24h
 _hierarchical_catalog_cache = TTLCache(maxsize=8, ttl=60 * 60 * 24)  # 24h
+
+
+@dataclass(slots=True)
+class QueryDimensionSource:
+    type: str
+    id: str
+
+
+@dataclass(slots=True)
+class QueryDimensionPolicyEntry:
+    name: str
+    role: str
+    required_for_retrieval: bool
+    priority: int
+    preferred_sources: list[QueryDimensionSource] = field(default_factory=list)
+    allow_hierarchy_resolution: bool = False
+    allow_member_expansion: bool = False
+
+
+@dataclass(slots=True)
+class QueryDimensionPolicyConfig:
+    default_query_dimensions: list[QueryDimensionPolicyEntry]
+
+
+def _env_flag(name: str, default: bool, legacy_names: list[str] | None = None) -> bool:
+    candidates = [name] + list(legacy_names or [])
+    raw_value: str | None = None
+    for candidate in candidates:
+        value = os.getenv(candidate)
+        if value is None:
+            continue
+        normalized = value.strip()
+        if not normalized:
+            continue
+        raw_value = normalized
+        break
+    if raw_value is None:
+        return default
+    return raw_value.lower() in {"1", "true", "yes", "on"}
 
 
 async def _get_json(url: str) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers={"User-Agent": "unicef-sdmx-mcp/0.1"})
+        r = await client.get(url, headers={"User-Agent": HTTP_USER_AGENT})
         r.raise_for_status()
         return r.json()
 
 
 async def _get_text_with_status(url: str) -> tuple[int, str]:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers={"User-Agent": "unicef-sdmx-mcp/0.1"})
+        r = await client.get(url, headers={"User-Agent": HTTP_USER_AGENT})
         return r.status_code, r.text
+
+
+def _default_query_dimension_policy() -> QueryDimensionPolicyConfig:
+    return QueryDimensionPolicyConfig(
+        default_query_dimensions=[
+            QueryDimensionPolicyEntry(
+                name="subject",
+                role="subject",
+                required_for_retrieval=True,
+                priority=1,
+                preferred_sources=[QueryDimensionSource(type="codelist", id="UNICEF/CL_INDICATOR/latest")],
+            ),
+            QueryDimensionPolicyEntry(
+                name="time",
+                role="time",
+                required_for_retrieval=True,
+                priority=2,
+            ),
+            QueryDimensionPolicyEntry(
+                name="location",
+                role="geography",
+                required_for_retrieval=True,
+                priority=3,
+                preferred_sources=[QueryDimensionSource(type="codelist", id="UNICEF/CL_GEO/latest")],
+                allow_hierarchy_resolution=True,
+                allow_member_expansion=True,
+            ),
+        ]
+    )
+
+
+def _policy_config_from_dict(payload: dict[str, Any]) -> QueryDimensionPolicyConfig:
+    raw_dimensions = payload.get("default_query_dimensions")
+    if not isinstance(raw_dimensions, list) or not raw_dimensions:
+        raise ValueError("query dimension policy must define a non-empty default_query_dimensions list.")
+
+    dimensions: list[QueryDimensionPolicyEntry] = []
+    for item in raw_dimensions:
+        if not isinstance(item, dict):
+            raise ValueError("query dimension policy entries must be objects.")
+        raw_sources = item.get("preferred_sources") or []
+        if not isinstance(raw_sources, list):
+            raise ValueError("preferred_sources must be a list.")
+        sources = [
+            QueryDimensionSource(type=str(source.get("type") or ""), id=str(source.get("id") or ""))
+            for source in raw_sources
+            if isinstance(source, dict) and str(source.get("type") or "").strip() and str(source.get("id") or "").strip()
+        ]
+        dimensions.append(
+            QueryDimensionPolicyEntry(
+                name=str(item.get("name") or "").strip(),
+                role=str(item.get("role") or "").strip(),
+                required_for_retrieval=bool(item.get("required_for_retrieval")),
+                priority=int(item.get("priority") or 0),
+                preferred_sources=sources,
+                allow_hierarchy_resolution=bool(item.get("allow_hierarchy_resolution")),
+                allow_member_expansion=bool(item.get("allow_member_expansion")),
+            )
+        )
+
+    if not all(entry.name for entry in dimensions):
+        raise ValueError("each query dimension policy entry must have a name.")
+    if len({entry.name for entry in dimensions}) != len(dimensions):
+        raise ValueError("query dimension policy entry names must be unique.")
+    if len({entry.priority for entry in dimensions}) != len(dimensions):
+        raise ValueError("query dimension policy entry priorities must be unique.")
+    return QueryDimensionPolicyConfig(default_query_dimensions=dimensions)
+
+
+@lru_cache(maxsize=1)
+def _query_dimension_policy_config() -> QueryDimensionPolicyConfig:
+    raw_json = os.getenv("SDMX_QUERY_DIMENSION_POLICY_JSON", "").strip()
+    raw_path = os.getenv("SDMX_QUERY_DIMENSION_POLICY_FILE", "").strip()
+    default_path = REPO_ROOT / "query_dimension_policy.json"
+
+    if raw_path:
+        loaded = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+        return _policy_config_from_dict(loaded)
+    if raw_json:
+        loaded = json.loads(raw_json)
+        return _policy_config_from_dict(loaded)
+    if default_path.exists():
+        loaded = json.loads(default_path.read_text(encoding="utf-8"))
+        return _policy_config_from_dict(loaded)
+    return _default_query_dimension_policy()
+
+
+def _query_dimension_policy_payload() -> dict[str, Any]:
+    policy = _query_dimension_policy_config()
+    return asdict(policy)
+
+
+def _ordered_query_dimensions() -> list[QueryDimensionPolicyEntry]:
+    policy = _query_dimension_policy_config()
+    return sorted(policy.default_query_dimensions, key=lambda item: item.priority)
+
+
+def _default_last_n_observations_enabled() -> bool:
+    return _env_flag(
+        "SDMX_DEFAULT_LAST_N_OBSERVATIONS",
+        True,
+        legacy_names=["defaultLastNobservations"],
+    )
 
 
 def _source_scope() -> dict[str, Any]:
@@ -74,6 +240,10 @@ def _structure_url(flow_ref: str) -> str:
     # UNICEF documentation describes this approach. :contentReference[oaicite:5]{index=5}
     # flow_ref should typically look like: AGENCY:FLOW_ID(VERSION) or similar; keep it simple early.
     return f"{BASE}/dataflow/{_flow_path_for(flow_ref)}/?format=sdmx-json&detail=full&references=all"
+
+
+def _codelist_url(codelist_ref: str) -> str:
+    return f"{BASE}/codelist/{_flow_path_for(codelist_ref)}/?format=sdmx-json&detail=full"
 
 
 def _hierarchical_codelist_url(agency: str, hierarchical_codelist_id: str, version: str = "latest") -> str:
@@ -524,6 +694,10 @@ def _codelist_key(raw_id: str) -> str:
     text = raw_id.strip()
     if text.startswith("urn:") and "Codelist=" in text:
         text = text.split("Codelist=", 1)[1]
+    if "/" in text:
+        parts = [part.strip() for part in text.split("/") if part.strip()]
+        if len(parts) >= 2:
+            text = parts[1]
     if ":" in text:
         text = text.split(":", 1)[1]
     if "(" in text:
@@ -1385,7 +1559,7 @@ async def _search_reference_candidates(
     dimension: str | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    payload = await get_flow_structure(flowRef)
+    payload = await _get_flow_structure(flowRef)
     dimensions = _dimension_metadata(payload)
     wanted_dimension = dimension.strip().upper() if dimension else None
     results: list[dict[str, Any]] = []
@@ -1646,7 +1820,7 @@ def _matching_code_label(codes: list[dict[str, Any]], token: str) -> tuple[str, 
 
 
 async def _normalize_filters_to_code_ids(flowRef: str, filters: dict[str, Any]) -> dict[str, Any]:
-    payload = await get_flow_structure(flowRef)
+    payload = await _get_flow_structure(flowRef)
     dims = {str(dim.get("id")): dim for dim in _dimension_metadata(payload) if isinstance(dim.get("id"), str)}
     codelists = _codelist_map(payload)
     normalized_filters: dict[str, Any] = {}
@@ -1702,7 +1876,7 @@ async def _dimension_order_for_flow(flowRef: str) -> list[str]:
     cache_key = flowRef.strip()
     if cache_key in _dimension_cache:
         return _dimension_cache[cache_key]
-    payload = await get_flow_structure(flowRef)
+    payload = await _get_flow_structure(flowRef)
     dims = _dimension_order_from_structure(payload)
     if not dims:
         raise ValueError("Unable to determine dimension order for this flow.")
@@ -1767,10 +1941,30 @@ async def _query_plan(
     format: str,
     labels: str | None,
     resultShape: str | None,
+    allowUnboundedTime: bool = False,
 ) -> dict[str, Any]:
     dimension_order: list[str] | None = None
     normalized_filters: dict[str, Any] | None = None
     wildcard_dimensions: list[str] = []
+    effective_format = (format or "csv").strip() or "csv"
+    effective_labels = labels.strip() if isinstance(labels, str) and labels.strip() else None
+    if effective_format.lower() == "csv" and not effective_labels:
+        effective_labels = "name"
+    series_like_shapes = {"compact_series", "topline_summary"}
+    normalized_shape = (resultShape or "").strip().lower()
+    effective_allow_unbounded_time = (
+        allowUnboundedTime
+        or normalized_shape in series_like_shapes
+        or not _default_last_n_observations_enabled()
+    )
+    effective_last_n = lastNObservations
+    if (
+        effective_last_n is None
+        and not (startPeriod and endPeriod)
+        and not effective_allow_unbounded_time
+        and _default_last_n_observations_enabled()
+    ):
+        effective_last_n = 1
 
     if filters:
         dimension_order = await _dimension_order_for_flow(flowRef)
@@ -1789,7 +1983,7 @@ async def _query_plan(
     if not key:
         raise ValueError("Provide either a key or filters to identify the data slice.")
 
-    if not (startPeriod and endPeriod) and not lastNObservations:
+    if not (startPeriod and endPeriod) and not effective_last_n and not effective_allow_unbounded_time:
         raise ValueError("Provide start/end periods or lastNObservations to avoid unbounded extracts.")
 
     flow_details = await _resolved_flow_details(flowRef)
@@ -1798,11 +1992,11 @@ async def _query_plan(
     if startPeriod and endPeriod:
         params.append(f"startPeriod={quote(startPeriod)}")
         params.append(f"endPeriod={quote(endPeriod)}")
-    if lastNObservations is not None:
-        params.append(f"lastNObservations={int(lastNObservations)}")
-    params.append(f"format={quote(format)}")
-    if labels:
-        params.append(f"labels={quote(labels)}")
+    if effective_last_n is not None and not (startPeriod and endPeriod):
+        params.append(f"lastNObservations={int(effective_last_n)}")
+    params.append(f"format={quote(effective_format)}")
+    if effective_labels:
+        params.append(f"labels={quote(effective_labels)}")
     url = f"{BASE}/data/{flow_path}/{quote(key, safe='+.')}?{'&'.join(params)}"
     return {
         "flowDetails": flow_details,
@@ -1810,14 +2004,507 @@ async def _query_plan(
         "normalizedFilters": normalized_filters,
         "wildcardDimensions": wildcard_dimensions,
         "key": key,
-        "format": format,
-        "labels": labels,
+        "format": effective_format,
+        "labels": effective_labels,
         "resultShape": resultShape,
         "queryURL": url,
         "startPeriod": startPeriod,
         "endPeriod": endPeriod,
-        "lastNObservations": lastNObservations,
+        "lastNObservations": effective_last_n,
+        "allowUnboundedTime": effective_allow_unbounded_time,
     }
+
+
+def _dataflow_summary(df: dict[str, Any]) -> dict[str, Any] | None:
+    df_id = df.get("id") or df.get("ID")
+    if not isinstance(df_id, str):
+        return None
+    agency = df.get("agencyID") or df.get("agencyId") or "all"
+    name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
+    description = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
+    return {
+        "id": df_id,
+        "agencyID": agency,
+        "version": str(df.get("version") or "latest"),
+        "name": name,
+        "description": description,
+        "flowRef": _flow_ref_for(df_id, df.get("version"), agency),
+        "themeHint": _infer_theme_hint(df_id, name),
+    }
+
+
+async def _dataflow_summaries() -> list[dict[str, Any]]:
+    payload = await _cached_dataflows()
+    summaries: list[dict[str, Any]] = []
+    for df in _extract_scoped_dataflows(payload):
+        item = _dataflow_summary(df)
+        if item:
+            summaries.append(item)
+    return summaries
+
+
+def _codelist_to_resource_payload(codelist: dict[str, Any]) -> dict[str, Any]:
+    codelist_id = str(codelist.get("id") or codelist.get("ID") or "")
+    codes: list[dict[str, Any]] = []
+    for code in _codelist_codes(codelist):
+        code_id = _code_identifier(code)
+        if not code_id:
+            continue
+        codes.append(
+            {
+                "id": code_id,
+                "name": _code_name(code),
+                "description": _coerce_text(code.get("description")) or _coerce_text(code.get("descriptions")) or None,
+            }
+        )
+    return {
+        "id": codelist_id,
+        "name": _coerce_text(codelist.get("name")) or _coerce_text(codelist.get("names")),
+        "description": _coerce_text(codelist.get("description")) or _coerce_text(codelist.get("descriptions")) or None,
+        "codes": codes,
+    }
+
+
+async def _get_codelist_detail(codelist_ref: str) -> dict[str, Any]:
+    cache_key = codelist_ref.strip()
+    if cache_key in _codelist_cache:
+        return _codelist_cache[cache_key]
+
+    payload = await _get_json(_codelist_url(codelist_ref))
+    requested_id = _flow_identifiers(codelist_ref)[1]
+    requested_key = _codelist_key(requested_id)
+    codelist = None
+    for candidate in _extract_codelists(payload):
+        candidate_id = candidate.get("id") or candidate.get("ID")
+        if not isinstance(candidate_id, str):
+            continue
+        if candidate_id == requested_id or _codelist_key(candidate_id) == requested_key:
+            codelist = candidate
+            break
+    if not codelist:
+        raise ValueError(f"Codelist '{codelist_ref}' was not found.")
+
+    result = _codelist_to_resource_payload(codelist)
+    _codelist_cache[cache_key] = result
+    return result
+
+
+def _hierarchical_name_lookup(root: ET.Element) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for elem in root.iter():
+        if _tag_name(elem) != "Code":
+            continue
+        code_id = _hierarchical_ref_id(elem)
+        if not code_id:
+            continue
+        name = _element_text(elem, "Name")
+        if name:
+            names[code_id] = name
+    return names
+
+
+def _walk_hierarchical_nodes(
+    node: ET.Element,
+    nodes: dict[str, dict[str, Any]],
+    *,
+    parent_id: str | None = None,
+    name_lookup: dict[str, str] | None = None,
+) -> None:
+    if _tag_name(node) == "HierarchicalCode":
+        current_id = _hierarchical_ref_id(node)
+        if current_id:
+            current = nodes.setdefault(
+                current_id,
+                {
+                    "id": current_id,
+                    "name": "",
+                    "parent_id": parent_id,
+                    "children": [],
+                },
+            )
+            if parent_id and current_id != parent_id:
+                current["parent_id"] = parent_id
+                parent = nodes.setdefault(
+                    parent_id,
+                    {
+                        "id": parent_id,
+                        "name": "",
+                        "parent_id": None,
+                        "children": [],
+                    },
+                )
+                if current_id not in parent["children"]:
+                    parent["children"].append(current_id)
+            current_name = _element_text(node, "Name") or (name_lookup or {}).get(current_id, "")
+            if current_name:
+                current["name"] = current_name
+            parent_id = current_id
+
+    for child in list(node):
+        _walk_hierarchical_nodes(child, nodes, parent_id=parent_id, name_lookup=name_lookup)
+
+
+def _parse_hierarchical_codelist_detail(text: str) -> list[dict[str, Any]]:
+    if not text.strip():
+        return []
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return []
+
+    name_lookup = _hierarchical_name_lookup(root)
+    results: list[dict[str, Any]] = []
+    for elem in root.iter():
+        if _tag_name(elem) != "HierarchicalCodelist":
+            continue
+        hierarchy_id = elem.attrib.get("id") or elem.attrib.get("ID")
+        if not isinstance(hierarchy_id, str) or not hierarchy_id.strip():
+            continue
+        nodes: dict[str, dict[str, Any]] = {}
+        for child in elem.iter():
+            if _tag_name(child) == "Hierarchy":
+                _walk_hierarchical_nodes(child, nodes, name_lookup=name_lookup)
+        ordered_nodes = sorted(nodes.values(), key=lambda item: item["id"])
+        for node in ordered_nodes:
+            node["children"] = sorted(node["children"])
+        results.append(
+            {
+                "agencyID": (elem.attrib.get("agencyID") or elem.attrib.get("agencyId") or elem.attrib.get("agency") or "").strip(),
+                "id": hierarchy_id.strip(),
+                "version": str(elem.attrib.get("version") or "latest").strip() or "latest",
+                "name": _element_text(elem, "Name"),
+                "description": _element_text(elem, "Description") or None,
+                "nodes": ordered_nodes,
+            }
+        )
+    return results
+
+
+async def _get_hierarchical_codelist_detail(hierarchy_ref: str) -> dict[str, Any]:
+    agency, hierarchy_id, version = _flow_identifiers(hierarchy_ref)
+    cache_key = f"{agency}/{hierarchy_id}/{version}"
+    if cache_key in _hierarchical_codelist_detail_cache:
+        return _hierarchical_codelist_detail_cache[cache_key]
+
+    url = _hierarchical_codelist_url(agency, hierarchy_id, version)
+    status, text = await _get_text_with_status(url)
+    if status >= 400:
+        raise ValueError(f"Hierarchical codelist '{hierarchy_ref}' was not found.")
+
+    parsed = _parse_hierarchical_codelist_detail(text)
+    match = next(
+        (
+            item for item in parsed
+            if item.get("id") == hierarchy_id and (str(item.get("version") or "latest") == version or version == "latest")
+        ),
+        None,
+    )
+    if not match:
+        raise ValueError(f"Hierarchical codelist '{hierarchy_ref}' was not found.")
+    _hierarchical_codelist_detail_cache[cache_key] = match
+    return match
+
+
+def _find_dimension_from_source(
+    payload: dict[str, Any],
+    source: QueryDimensionSource,
+) -> dict[str, Any] | None:
+    dims = _dimension_metadata(payload)
+    source_id = source.id.strip().upper()
+
+    if source.type == "dimension":
+        return next((dim for dim in dims if str(dim.get("id") or "").upper() == source_id), None)
+
+    if source.type == "codelist":
+        source_key = _codelist_key(source.id).upper()
+        return next(
+            (
+                dim for dim in dims
+                if _codelist_key(str(dim.get("codelist") or "")).upper() == source_key
+            ),
+            None,
+        )
+
+    return None
+
+
+def _canonical_token_from_codes(codes: list[dict[str, Any]], token: str) -> tuple[str, str] | None:
+    canonical = _canonical_code_id(codes, token)
+    if canonical:
+        code = next((item for item in codes if (_code_identifier(item) or "") == canonical), {})
+        return canonical, _code_name(code)
+    label_match = _matching_code_label(codes, token)
+    if label_match:
+        return label_match
+    return None
+
+
+def _leaf_members_from_nodes(nodes: list[dict[str, Any]], root_id: str) -> list[str]:
+    node_map = {str(node.get("id") or ""): node for node in nodes if str(node.get("id") or "")}
+    descendants: list[str] = []
+    queue = list(node_map.get(root_id, {}).get("children") or [])
+    seen: set[str] = set()
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        descendants.append(current)
+        queue.extend(node_map.get(current, {}).get("children") or [])
+    return [item for item in descendants if not (node_map.get(item, {}).get("children") or [])]
+
+
+def _parse_time_range(raw_time_range: str) -> tuple[str | None, str | None, str]:
+    token = raw_time_range.strip()
+    if not token or token.lower() in {"latest", "current", "most_recent"}:
+        return None, None, "latest"
+    if token.lower() in {"all", "full", "trend", "series", "chart", "graph", "table"}:
+        return None, None, "all"
+    if ":" in token:
+        start_period, end_period = (part.strip() for part in token.split(":", 1))
+        return (start_period or None), (end_period or None), "range"
+    return token, token, "range"
+
+
+async def _resolve_time_value(
+    flow_ref: str,
+    payload: dict[str, Any],
+    raw_time_range: str,
+    policy: QueryDimensionPolicyEntry,
+) -> dict[str, Any]:
+    start_period, end_period, time_mode = _parse_time_range(raw_time_range)
+    dim = _dimension_meta(payload, "TIME_PERIOD")
+    if not dim:
+        raise ValueError(f"Unable to resolve time dimension for flow '{flow_ref}' using the configured policy.")
+    return {
+        "name": policy.name,
+        "role": policy.role,
+        "dimension_id": str(dim.get("id") or ""),
+        "value": raw_time_range.strip(),
+        "startPeriod": start_period,
+        "endPeriod": end_period,
+        "timeMode": time_mode,
+        "useLatestObservation": time_mode == "latest",
+        "useAllObservations": time_mode == "all",
+        "source": {"type": "dimension", "id": "TIME_PERIOD"},
+        "flowRef": flow_ref,
+    }
+
+
+def _input_aliases_for_policy(policy: QueryDimensionPolicyEntry) -> list[str]:
+    aliases = {
+        policy.name.strip().lower(),
+        policy.role.strip().lower(),
+    }
+    if policy.role == "subject":
+        aliases.add("indicator")
+        aliases.add("subject")
+    if policy.role == "geography":
+        aliases.add("geography")
+        aliases.add("location")
+        aliases.add("ref_area")
+    if policy.role == "time":
+        aliases.add("time")
+        aliases.add("time_range")
+        aliases.add("period")
+    return [alias for alias in aliases if alias]
+
+
+def _input_value_for_policy(provided_inputs: dict[str, str], policy: QueryDimensionPolicyEntry) -> str | None:
+    normalized = {str(key).strip().lower(): value for key, value in provided_inputs.items()}
+    for alias in _input_aliases_for_policy(policy):
+        if alias in normalized:
+            return normalized[alias]
+    return None
+
+
+def _same_flow_ref(left: str, right: str) -> bool:
+    try:
+        left_agency, left_id, left_version = _flow_identifiers(left)
+        right_agency, right_id, right_version = _flow_identifiers(right)
+    except ValueError:
+        return left.strip() == right.strip()
+    if left_agency != right_agency or left_id != right_id:
+        return False
+    if left_version in {"", "latest"} or right_version in {"", "latest"}:
+        return True
+    return left_version == right_version
+
+
+def _dimension_for_hierarchical_source(
+    payload: dict[str, Any],
+    policy: QueryDimensionPolicyEntry,
+    hierarchy_source: QueryDimensionSource,
+) -> dict[str, Any] | None:
+    non_hierarchy_sources = [source for source in policy.preferred_sources if source.type != "hierarchical_codelist"]
+    candidates = []
+    for source in non_hierarchy_sources:
+        dim = _find_dimension_from_source(payload, source)
+        if dim and not any(str(existing.get("id") or "") == str(dim.get("id") or "") for existing in candidates):
+            candidates.append(dim)
+    if len(candidates) == 1:
+        return candidates[0]
+
+    summaries = payload.get("hierarchicalCodelists") or []
+    requested_ref = hierarchy_source.id.strip()
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        hierarchy_ref = str(summary.get("hierarchyRef") or "")
+        if not hierarchy_ref or not _same_flow_ref(hierarchy_ref, requested_ref):
+            continue
+        matches = summary.get("dimensionMatches") or []
+        for match in matches:
+            dimension_id = str(match.get("dimension") or "").upper()
+            dim = _dimension_meta(payload, dimension_id)
+            if dim:
+                return dim
+    return candidates[0] if candidates else None
+
+
+async def _resolve_coded_dimension_value(
+    flow_ref: str,
+    payload: dict[str, Any],
+    raw_value: str,
+    policy: QueryDimensionPolicyEntry,
+) -> dict[str, Any]:
+    tokens = [part.strip() for part in raw_value.replace("+", ",").split(",") if part.strip()]
+    if not tokens:
+        raise ValueError(f"{policy.name} must not be empty.")
+
+    resolved: list[dict[str, Any]] = []
+    for token in tokens:
+        matched = False
+        for source in policy.preferred_sources:
+            dim = (
+                _find_dimension_from_source(payload, source)
+                if source.type != "hierarchical_codelist"
+                else _dimension_for_hierarchical_source(payload, policy, source)
+            )
+            if not dim:
+                continue
+            dimension_id = str(dim.get("id") or "")
+            codelist = _dimension_codelist(payload, dimension_id)
+            if codelist and source.type != "hierarchical_codelist":
+                match = _canonical_token_from_codes(_codelist_codes(codelist), token)
+                if match:
+                    code_id, label = match
+                    resolved.append(
+                        {
+                            "token": token,
+                            "match_type": "flat_codelist",
+                            "id": code_id,
+                            "label": label,
+                            "members": [code_id],
+                            "source": {"type": source.type, "id": source.id},
+                            "dimension_id": dimension_id,
+                            "role": policy.role,
+                        }
+                    )
+                    matched = True
+                    break
+
+            if source.type != "hierarchical_codelist" or not policy.allow_hierarchy_resolution:
+                continue
+
+            hierarchy = await _get_hierarchical_codelist_detail(source.id)
+            nodes = hierarchy.get("nodes") or []
+            node_map = {str(node.get("id") or "").lower(): node for node in nodes if str(node.get("id") or "")}
+            name_map = {
+                str(node.get("name") or "").strip().lower(): node
+                for node in nodes
+                if str(node.get("name") or "").strip()
+            }
+            node = node_map.get(token.lower()) or name_map.get(token.lower())
+            if not node:
+                continue
+            node_id = str(node.get("id") or "")
+            members = [node_id]
+            if policy.allow_member_expansion:
+                leaf_members = _leaf_members_from_nodes(nodes, node_id)
+                if leaf_members:
+                    if codelist:
+                        valid_codes = {_code_identifier(code) for code in _codelist_codes(codelist)}
+                        members = [member for member in leaf_members if member in valid_codes]
+                    else:
+                        members = leaf_members
+                    if not members:
+                        members = [node_id]
+            resolved.append(
+                {
+                    "token": token,
+                    "match_type": "hierarchy_node",
+                    "id": node_id,
+                    "label": str(node.get("name") or ""),
+                    "members": members,
+                    "source": {"type": source.type, "id": source.id},
+                    "dimension_id": dimension_id,
+                    "role": policy.role,
+                }
+            )
+            matched = True
+            break
+
+        if not matched:
+            raise ValueError(f"Unable to resolve {policy.name} value '{token}' using the configured policy.")
+
+    dimension_id = str(resolved[0].get("dimension_id") or "")
+    flattened_members: list[str] = []
+    for item in resolved:
+        for member in item.get("members") or []:
+            if member not in flattened_members:
+                flattened_members.append(member)
+    return {
+        "name": policy.name,
+        "role": policy.role,
+        "dimension_id": dimension_id,
+        "values": flattened_members,
+        "matches": resolved,
+        "flowRef": flow_ref,
+    }
+
+
+async def _resolve_query_dimension_inputs(
+    flow_ref: str,
+    provided_inputs: dict[str, str],
+) -> dict[str, Any]:
+    payload = await _get_flow_structure(flow_ref)
+    resolved: dict[str, Any] = {}
+    resolution_order: list[str] = []
+    for policy in _ordered_query_dimensions():
+        raw_value = _input_value_for_policy(provided_inputs, policy)
+        if raw_value is None:
+            if policy.required_for_retrieval:
+                raise ValueError(f"Missing required input for query dimension '{policy.name}' ({policy.role}).")
+            continue
+        if policy.role == "time":
+            resolved[policy.name] = await _resolve_time_value(flow_ref, payload, raw_value, policy)
+        else:
+            resolved[policy.name] = await _resolve_coded_dimension_value(flow_ref, payload, raw_value, policy)
+        resolution_order.append(policy.name)
+    resolved["_resolution_order"] = resolution_order
+    return resolved
+
+
+def _observation_rows_to_resource(
+    rows: list[dict[str, Any]],
+    *,
+    indicator_dimension: str,
+    location_dimension: str,
+    time_dimension: str,
+) -> list[dict[str, Any]]:
+    value_column = _value_column(rows)
+    observations: list[dict[str, Any]] = []
+    for row in rows:
+        observations.append(
+            {
+                "indicator": row.get(indicator_dimension),
+                "geography": row.get(location_dimension),
+                "time": row.get(time_dimension),
+                "value": row.get(value_column) if value_column else None,
+            }
+        )
+    return observations
 
 
 async def _cached_dataflows() -> dict[str, Any]:
@@ -1825,6 +2512,294 @@ async def _cached_dataflows() -> dict[str, Any]:
     if "dataflows" not in _dataflow_cache:
         _dataflow_cache["dataflows"] = await _get_json(_dataflow_url())
     return _dataflow_cache["dataflows"]
+
+
+async def _get_flow_structure(flowRef: str) -> dict[str, Any]:
+    if flowRef not in _structure_cache:
+        _structure_cache[flowRef] = await _get_json(_structure_url(flowRef))
+    payload = _structure_cache[flowRef]
+    hierarchy_summaries = await _structure_hierarchy_summaries(flowRef, payload)
+    enriched = dict(payload)
+    enriched["hierarchicalCodelists"] = hierarchy_summaries
+    enriched["assistant_guidance"] = (
+        "If a selected code looks aggregate, or a query implies a region, category, or country group, "
+        "inspect hierarchicalCodelists or use search_reference_candidates / resolve_hierarchy / "
+        "resolve_dimension_fallback before retrying with member codes."
+    )
+    return enriched
+
+
+async def _list_dimensions_for_flow(flow_ref: str) -> list[dict[str, Any]]:
+    payload = await _get_flow_structure(flow_ref)
+    return _dimension_metadata(payload)
+
+
+async def _execute_query_data(
+    *,
+    flowRef: str,
+    key: Optional[str] = None,
+    startPeriod: Optional[str] = None,
+    endPeriod: Optional[str] = None,
+    format: str = "sdmx-json",
+    labels: Optional[str] = None,
+    maxObs: int = 50_000,
+    filters: dict[str, Any] | None = None,
+    lastNObservations: Optional[int] = None,
+    resultShape: Optional[str] = None,
+    allowUnboundedTime: bool = False,
+) -> dict[str, Any]:
+    requested_format = (format or "csv").strip() or "csv"
+    fetch_format = "csv" if resultShape else requested_format
+    plan = await _query_plan(
+        flowRef=flowRef,
+        key=key,
+        filters=filters,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        format=fetch_format,
+        labels=labels,
+        resultShape=resultShape,
+        allowUnboundedTime=allowUnboundedTime,
+    )
+    flow_details = plan["flowDetails"]
+    dimension_order = plan["dimensionOrder"]
+    normalized_filters = plan["normalizedFilters"]
+    planned_key = plan["key"]
+    url = plan["queryURL"]
+    effective_format = str(plan["format"] or fetch_format)
+    effective_labels = plan["labels"]
+    effective_last_n = plan["lastNObservations"]
+
+    if fetch_format.lower() == "csv":
+        status, text = await _get_text_with_status(url)
+        if status >= 400:
+            return _unresolved_response(
+                flow_details=flow_details,
+                key=planned_key,
+                query_url=url,
+                dimension_order=dimension_order,
+                format=effective_format,
+                labels=effective_labels,
+                startPeriod=startPeriod,
+                endPeriod=endPeriod,
+                lastNObservations=effective_last_n,
+                filters=normalized_filters,
+                maxObs=maxObs,
+                status_code=status,
+                raw_text=text,
+            )
+        payload = _resolved_response(
+            flow_details=flow_details,
+            key=planned_key,
+            query_url=url,
+            dimension_order=dimension_order,
+            format=effective_format,
+            labels=effective_labels,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=effective_last_n,
+            filters=normalized_filters,
+            maxObs=maxObs,
+            raw_csv=text,
+        )
+        if resultShape:
+            rows = _csv_rows(text)
+            payload["shaped"] = _shape_rows(rows, resultShape)
+        return payload
+
+    status, text = await _get_text_with_status(url)
+    if status >= 400:
+        return _unresolved_response(
+            flow_details=flow_details,
+            key=planned_key,
+            query_url=url,
+            dimension_order=dimension_order,
+            format=effective_format,
+            labels=effective_labels,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=effective_last_n,
+            filters=normalized_filters,
+            maxObs=maxObs,
+            status_code=status,
+            raw_text=text,
+        )
+
+    if not _looks_like_json(text):
+        return _unresolved_response(
+            flow_details=flow_details,
+            key=planned_key,
+            query_url=url,
+            dimension_order=dimension_order,
+            format=effective_format,
+            labels=effective_labels,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=effective_last_n,
+            filters=normalized_filters,
+            maxObs=maxObs,
+            status_code=status,
+            raw_text=text,
+            message="Expected SDMX JSON but received a non-JSON response.",
+        )
+
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError:
+        return _unresolved_response(
+            flow_details=flow_details,
+            key=planned_key,
+            query_url=url,
+            dimension_order=dimension_order,
+            format=effective_format,
+            labels=effective_labels,
+            startPeriod=startPeriod,
+            endPeriod=endPeriod,
+            lastNObservations=effective_last_n,
+            filters=normalized_filters,
+            maxObs=maxObs,
+            status_code=status,
+            raw_text=text,
+            message="Received a malformed JSON payload from the official flow.",
+        )
+
+    return _resolved_response(
+        flow_details=flow_details,
+        key=planned_key,
+        query_url=url,
+        dimension_order=dimension_order,
+        format=effective_format,
+        labels=effective_labels,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=effective_last_n,
+        filters=normalized_filters,
+        maxObs=maxObs,
+        raw_json=raw,
+    )
+
+
+@mcp.resource(
+    "sdmx://dataflows",
+    name="dataflows",
+    description="Read-only SDMX dataflow metadata.",
+)
+async def dataflows_resource() -> dict[str, Any]:
+    return {"dataflows": await _dataflow_summaries()}
+
+
+@mcp.resource(
+    "sdmx://dataflows/{dataflow_id}/dimensions",
+    name="dimensions_for_dataflow",
+    description="Ordered dimension metadata for one dataflow.",
+)
+async def dimensions_for_dataflow_resource(dataflow_id: str) -> dict[str, Any]:
+    return {
+        "dataflow_id": dataflow_id,
+        "dimensions": await _list_dimensions_for_flow(dataflow_id),
+    }
+
+
+@mcp.resource(
+    "sdmx://codelists/{id}",
+    name="codelist",
+    description="Read-only codelist lookup.",
+)
+async def codelist_resource(id: str) -> dict[str, Any]:
+    return await _get_codelist_detail(id)
+
+
+@mcp.resource(
+    "sdmx://hierarchical-codelists/{id}",
+    name="hierarchical_codelist",
+    description="Read-only hierarchical codelist lookup.",
+)
+async def hierarchical_codelist_resource(id: str) -> dict[str, Any]:
+    return await _get_hierarchical_codelist_detail(id)
+
+
+@mcp.resource(
+    "sdmx://query-dimension-policy",
+    name="query_dimension_policy",
+    description="Configuration-driven query dimension semantics.",
+)
+def query_dimension_policy_resource() -> dict[str, Any]:
+    return _query_dimension_policy_payload()
+
+
+@mcp.resource(
+    "sdmx://observations/{dataflow_id}/{indicator}/{geography}/{time_range}",
+    name="observations",
+    description="Basic read-only SDMX observation retrieval.",
+)
+async def observations_resource(
+    dataflow_id: str,
+    indicator: str,
+    geography: str,
+    time_range: str,
+) -> dict[str, Any]:
+    resolved = await _resolve_query_dimension_inputs(
+        dataflow_id,
+        {
+            "indicator": indicator,
+            "geography": geography,
+            "time_range": time_range,
+        },
+    )
+    time_resolution = next(
+        value for key, value in resolved.items() if key != "_resolution_order" and value.get("role") == "time"
+    )
+    coded_resolutions = [
+        value for key, value in resolved.items() if key != "_resolution_order" and value.get("role") != "time"
+    ]
+    filters = {}
+    for item in coded_resolutions:
+        values = item.get("values")
+        filters[item["dimension_id"]] = values if values is not None else item.get("value")
+    result = await _execute_query_data(
+        flowRef=dataflow_id,
+        filters=filters,
+        startPeriod=time_resolution["startPeriod"],
+        endPeriod=time_resolution["endPeriod"],
+        lastNObservations=1 if time_resolution.get("useLatestObservation") else None,
+        format="csv",
+        labels="name",
+        allowUnboundedTime=bool(time_resolution.get("useAllObservations")),
+    )
+    if result.get("status") != "resolved":
+        return {
+            "dataflow_id": dataflow_id,
+            "query": {
+                "indicator": indicator,
+                "geography": geography,
+                "time_range": time_range,
+            },
+            "resolution": resolved,
+            "status": result.get("status"),
+            "error": result.get("error"),
+        }
+
+    rows = _csv_rows(result.get("raw_csv") or "")
+    subject_resolution = next((item for item in coded_resolutions if item.get("role") == "subject"), None)
+    geography_resolution = next((item for item in coded_resolutions if item.get("role") == "geography"), None)
+    observations = _observation_rows_to_resource(
+        rows,
+        indicator_dimension=str(subject_resolution.get("dimension_id") if subject_resolution else ""),
+        location_dimension=str(geography_resolution.get("dimension_id") if geography_resolution else ""),
+        time_dimension=time_resolution["dimension_id"],
+    )
+    return {
+        "dataflow_id": dataflow_id,
+        "query": {
+            "indicator": indicator,
+            "geography": geography,
+            "time_range": time_range,
+        },
+        "resolution": resolved,
+        "observations": observations,
+        "provenance": result.get("provenance"),
+    }
 
 
 @mcp.tool()
@@ -2011,7 +2986,7 @@ async def describe_flow(flowRef: str) -> dict[str, Any]:
     """
     Return a human-friendly summary of a dataflow, including dimension info.
     """
-    payload = await get_flow_structure(flowRef)
+    payload = await _get_flow_structure(flowRef)
     flows = _extract_dataflows(payload)
     flow_meta: dict[str, Any] = {}
     agency, df_id, version = _flow_identifiers(flowRef)
@@ -2037,8 +3012,7 @@ async def list_dimensions(flowRef: str) -> list[dict[str, Any]]:
     """
     List ordered dimensions for a flow with codelist references.
     """
-    payload = await get_flow_structure(flowRef)
-    return _dimension_metadata(payload)
+    return await _list_dimensions_for_flow(flowRef)
 
 
 @mcp.tool()
@@ -2054,7 +3028,7 @@ async def list_codes(
     Results can be enriched with hierarchy-aware hints so callers can see whether
     a code looks atomic, aggregate, or structurally ambiguous at discovery time.
     """
-    payload = await get_flow_structure(flowRef)
+    payload = await _get_flow_structure(flowRef)
     dims = _dimension_metadata(payload)
     dim_id = dimension.strip().upper()
     target = next((d for d in dims if d.get("id") == dim_id), None)
@@ -2196,7 +3170,7 @@ async def find_indicator_candidates(
         return []
 
     if flowRef:
-        payload = await get_flow_structure(flowRef)
+        payload = await _get_flow_structure(flowRef)
         codes = _indicator_codes_from_payload(payload)
         if not codes:
             raise ValueError("INDICATOR dimension not found for this flow.")
@@ -2233,7 +3207,7 @@ async def find_indicator_candidates(
         flow_desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
 
         try:
-            structure = await get_flow_structure(flow_ref)
+            structure = await _get_flow_structure(flow_ref)
         except Exception:
             continue
 
@@ -2315,18 +3289,7 @@ async def get_flow_structure(flowRef: str) -> dict[str, Any]:
     """
     Fetch and cache a flow's structure payload (DSD + codelists via references=all).
     """
-    if flowRef not in _structure_cache:
-        _structure_cache[flowRef] = await _get_json(_structure_url(flowRef))
-    payload = _structure_cache[flowRef]
-    hierarchy_summaries = await _structure_hierarchy_summaries(flowRef, payload)
-    enriched = dict(payload)
-    enriched["hierarchicalCodelists"] = hierarchy_summaries
-    enriched["assistant_guidance"] = (
-        "If a selected code looks aggregate, or a query implies a region, category, or country group, "
-        "inspect hierarchicalCodelists or use search_reference_candidates / resolve_hierarchy / "
-        "resolve_dimension_fallback before retrying with member codes."
-    )
-    return enriched
+    return await _get_flow_structure(flowRef)
 
 
 @mcp.tool()
@@ -2426,7 +3389,7 @@ async def resolve_hierarchy(flowRef: str, dimension: str, code: str) -> dict[str
     Resolve the best agency hierarchy for a flow dimension/code.
     Returns resolved, ambiguous, or unresolved so the assistant does not guess.
     """
-    payload = await get_flow_structure(flowRef)
+    payload = await _get_flow_structure(flowRef)
     dim_meta = _dimension_meta(payload, dimension)
     if not dim_meta:
         raise ValueError(f"Unknown dimension '{dimension}'.")
@@ -2517,7 +3480,7 @@ async def expand_dimension_group(flowRef: str, dimension: str, code: str) -> dic
     """
     Expand a dimension code through the best matching agency hierarchy.
     """
-    payload = await get_flow_structure(flowRef)
+    payload = await _get_flow_structure(flowRef)
     dimension_id = dimension.strip().upper()
     code_map = _dimension_code_map(payload, dimension_id)
     if not code_map:
@@ -2580,13 +3543,13 @@ async def resolve_dimension_fallback(
     filters: dict[str, Any] | None = None,
     startPeriod: Optional[str] = None,
     endPeriod: Optional[str] = None,
-    lastNObservations: Optional[int] = 1,
+    lastNObservations: Optional[int] = None,
     labels: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Validate an aggregate dimension code and, when unresolved, return a hierarchy-based retry plan.
     """
-    payload = await get_flow_structure(flowRef)
+    payload = await _get_flow_structure(flowRef)
     dimension_id = dimension.strip().upper()
     code_map = _dimension_code_map(payload, dimension_id)
     if code.strip() not in code_map:
@@ -2681,7 +3644,7 @@ async def resolve_ref_area_fallback(
     filters: dict[str, Any] | None = None,
     startPeriod: Optional[str] = None,
     endPeriod: Optional[str] = None,
-    lastNObservations: Optional[int] = 1,
+    lastNObservations: Optional[int] = None,
     labels: Optional[str] = None,
 ) -> dict[str, Any]:
     """
@@ -2715,8 +3678,9 @@ async def plan_query(
     endPeriod: Optional[str] = None,
     lastNObservations: Optional[int] = None,
     format: str = "csv",
-    labels: Optional[str] = None,
+    labels: Optional[str] = "name",
     resultShape: Optional[str] = None,
+    allowUnboundedTime: bool = False,
 ) -> dict[str, Any]:
     """
     Resolve a query into a concrete SDMX URL and highlight wildcard dimensions before execution.
@@ -2731,6 +3695,7 @@ async def plan_query(
         format=format,
         labels=labels,
         resultShape=resultShape,
+        allowUnboundedTime=allowUnboundedTime,
     )
     return {
         "status": "planned",
@@ -2759,8 +3724,8 @@ async def validate_query_scope(
     filters: dict[str, Any] | None = None,
     startPeriod: Optional[str] = None,
     endPeriod: Optional[str] = None,
-    lastNObservations: Optional[int] = 1,
-    labels: Optional[str] = None,
+    lastNObservations: Optional[int] = None,
+    labels: Optional[str] = "name",
 ) -> dict[str, Any]:
     """
     Preflight whether a concrete query resolves from the official UNICEF/UNPD flows.
@@ -2773,7 +3738,7 @@ async def validate_query_scope(
         startPeriod=startPeriod,
         endPeriod=endPeriod,
         lastNObservations=lastNObservations,
-        format="sdmx-json",
+        format="csv",
         labels=labels,
         maxObs=1,
     )
@@ -2792,142 +3757,31 @@ async def query_data(
     key: Optional[str] = None,
     startPeriod: Optional[str] = None,
     endPeriod: Optional[str] = None,
-    format: str = "sdmx-json",
-    labels: Optional[str] = None,
+    format: str = "csv",
+    labels: Optional[str] = "name",
     maxObs: int = 50_000,
     filters: dict[str, Any] | None = None,
     lastNObservations: Optional[int] = None,
     resultShape: Optional[str] = None,
+    allowUnboundedTime: bool = False,
 ) -> dict[str, Any]:
     """
     Query SDMX data with guardrails.
     - Requires a bounded time window unless caller explicitly accepts the risk.
     - Returns raw SDMX-JSON and a minimal 'query_url' for reproducibility.
     """
-    fetch_format = "csv" if resultShape else format
-    plan = await _query_plan(
+    return await _execute_query_data(
         flowRef=flowRef,
         key=key,
-        filters=filters,
         startPeriod=startPeriod,
         endPeriod=endPeriod,
-        lastNObservations=lastNObservations,
-        format=fetch_format,
+        format=format,
         labels=labels,
-        resultShape=resultShape,
-    )
-    flow_details = plan["flowDetails"]
-    dimension_order = plan["dimensionOrder"]
-    normalized_filters = plan["normalizedFilters"]
-    key = plan["key"]
-    url = plan["queryURL"]
-
-    if fetch_format.lower() == "csv":
-        status, text = await _get_text_with_status(url)
-        if status >= 400:
-            return _unresolved_response(
-                flow_details=flow_details,
-                key=key,
-                query_url=url,
-                dimension_order=dimension_order,
-                format=fetch_format,
-                labels=labels,
-                startPeriod=startPeriod,
-                endPeriod=endPeriod,
-                lastNObservations=lastNObservations,
-                filters=normalized_filters,
-                maxObs=maxObs,
-                status_code=status,
-                raw_text=text,
-            )
-        payload = _resolved_response(
-            flow_details=flow_details,
-            key=key,
-            query_url=url,
-            dimension_order=dimension_order,
-            format=fetch_format,
-            labels=labels,
-            startPeriod=startPeriod,
-            endPeriod=endPeriod,
-            lastNObservations=lastNObservations,
-            filters=normalized_filters,
-            maxObs=maxObs,
-            raw_csv=text,
-        )
-        if resultShape:
-            rows = _csv_rows(text)
-            payload["shaped"] = _shape_rows(rows, resultShape)
-        return payload
-
-    status, text = await _get_text_with_status(url)
-    if status >= 400:
-        return _unresolved_response(
-            flow_details=flow_details,
-            key=key,
-            query_url=url,
-            dimension_order=dimension_order,
-            format=fetch_format,
-            labels=labels,
-            startPeriod=startPeriod,
-            endPeriod=endPeriod,
-            lastNObservations=lastNObservations,
-            filters=normalized_filters,
-            maxObs=maxObs,
-            status_code=status,
-            raw_text=text,
-        )
-
-    if not _looks_like_json(text):
-        return _unresolved_response(
-            flow_details=flow_details,
-            key=key,
-            query_url=url,
-            dimension_order=dimension_order,
-            format=fetch_format,
-            labels=labels,
-            startPeriod=startPeriod,
-            endPeriod=endPeriod,
-            lastNObservations=lastNObservations,
-            filters=normalized_filters,
-            maxObs=maxObs,
-            status_code=status,
-            raw_text=text,
-            message="Expected SDMX JSON but received a non-JSON response.",
-        )
-
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError:
-        return _unresolved_response(
-            flow_details=flow_details,
-            key=key,
-            query_url=url,
-            dimension_order=dimension_order,
-            format=fetch_format,
-            labels=labels,
-            startPeriod=startPeriod,
-            endPeriod=endPeriod,
-            lastNObservations=lastNObservations,
-            filters=normalized_filters,
-            maxObs=maxObs,
-            status_code=status,
-            raw_text=text,
-            message="Received a malformed JSON payload from the official flow.",
-        )
-
-    return _resolved_response(
-        flow_details=flow_details,
-        key=key,
-        query_url=url,
-        dimension_order=dimension_order,
-        format=fetch_format,
-        labels=labels,
-        startPeriod=startPeriod,
-        endPeriod=endPeriod,
-        lastNObservations=lastNObservations,
-        filters=normalized_filters,
         maxObs=maxObs,
-        raw_json=raw,
+        filters=filters,
+        lastNObservations=lastNObservations,
+        resultShape=resultShape,
+        allowUnboundedTime=allowUnboundedTime,
     )
 
 
@@ -2938,7 +3792,7 @@ async def resolve_and_query_data(
     startPeriod: Optional[str] = None,
     endPeriod: Optional[str] = None,
     lastNObservations: Optional[int] = None,
-    labels: Optional[str] = None,
+    labels: Optional[str] = "name",
     resultShape: str = "latest_single_value",
 ) -> dict[str, Any]:
     """
@@ -2947,13 +3801,14 @@ async def resolve_and_query_data(
     """
     if not filters:
         raise ValueError("filters must include at least one dimension.")
+    allow_unbounded_time = (resultShape or "").strip().lower() in {"compact_series", "topline_summary"}
 
     validation = await validate_query_scope(
         flowRef=flowRef,
         filters=filters,
         startPeriod=startPeriod,
         endPeriod=endPeriod,
-        lastNObservations=lastNObservations,
+        lastNObservations=None if allow_unbounded_time and not (startPeriod and endPeriod) else lastNObservations,
         labels=labels,
     )
     if validation.get("status") == "resolved":
@@ -2962,10 +3817,11 @@ async def resolve_and_query_data(
             filters=filters,
             startPeriod=startPeriod,
             endPeriod=endPeriod,
-            lastNObservations=lastNObservations,
+            lastNObservations=None if allow_unbounded_time and not (startPeriod and endPeriod) else lastNObservations,
             format="csv",
             labels=labels,
             resultShape=resultShape,
+            allowUnboundedTime=allow_unbounded_time,
         )
         return {
             "status": "resolved",
@@ -2989,7 +3845,7 @@ async def resolve_and_query_data(
             filters=filters,
             startPeriod=startPeriod,
             endPeriod=endPeriod,
-            lastNObservations=lastNObservations,
+            lastNObservations=None if allow_unbounded_time and not (startPeriod and endPeriod) else lastNObservations,
             labels=labels,
         )
         fallback_attempts.append(fallback)
@@ -3004,10 +3860,11 @@ async def resolve_and_query_data(
             filters=retry_filters,
             startPeriod=startPeriod,
             endPeriod=endPeriod,
-            lastNObservations=lastNObservations,
+            lastNObservations=None if allow_unbounded_time and not (startPeriod and endPeriod) else lastNObservations,
             format="csv",
             labels=labels,
             resultShape=resultShape,
+            allowUnboundedTime=allow_unbounded_time,
         )
         return {
             "status": "resolved_with_fallback",

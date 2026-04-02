@@ -1,0 +1,31 @@
+{
+  "default_query_dimensions": [
+    {
+      "name": "subject",
+      "role": "subject",
+      "required_for_retrieval": true,
+      "priority": 1,
+      "preferred_sources": [
+        { "type": "codelist", "id": "UNICEF/CL_UNICEF_INDICATOR/1.0" }
+      ]
+    },
+    {
+      "name": "location",
+      "role": "geography",
+      "required_for_retrieval": true,
+      "priority": 2,
+      "preferred_sources": [
+        { "type": "codelist", "id": "UNICEF/CL_COUNTRY/1.0" },
+        { "type": "hierarchical_codelist", "id": "UNICEF/UNICEF_REPORTING_REGIONS" }
+      ],
+      "allow_hierarchy_resolution": true,
+      "allow_member_expansion": true
+    },
+    {
+      "name": "time",
+      "role": "time",
+      "required_for_retrieval": true,
+      "priority": 3
+    }
+  ]
+}
