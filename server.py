@@ -2817,10 +2817,94 @@ async def list_agencies(limit: int = 50) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
+async def plan_topic_query(
+    question: str,
+    flowQuery: str | None = None,
+    indicatorLimit: int = 10,
+    flowLimit: int = 200,
+) -> dict[str, Any]:
+    """
+    Plan a topical user question into an indicator-first SDMX workflow.
+
+    Use this as the first tool for questions about a phenomenon or metric such as
+    stunting, wasting, mortality, literacy, vaccination, or similar subject-matter topics.
+    This tool reads the configured query-dimension policy, highlights the highest-priority
+    required dimension, and returns ranked indicator candidates before any flow-level query.
+    Do not start with search_dataflows for topical questions unless the user explicitly asks
+    for a dataset or dataflow by name.
+    """
+    q = (question or "").strip()
+    if not q:
+        raise ValueError("question must not be empty.")
+
+    policy = _sorted_query_dimension_policies()
+    prioritized_dimensions = [
+        {
+            "name": item.name,
+            "role": item.role,
+            "requiredForRetrieval": item.required_for_retrieval,
+            "priority": item.priority,
+            "preferredSources": [asdict(source) for source in item.preferred_sources],
+            "allowHierarchyResolution": item.allow_hierarchy_resolution,
+            "allowMemberExpansion": item.allow_member_expansion,
+        }
+        for item in policy
+    ]
+
+    first_required = next((item for item in policy if item.required_for_retrieval), None)
+    indicator_candidates: list[dict[str, Any]] = []
+    if first_required and first_required.role == "subject":
+        indicator_candidates = await find_indicator_candidates(
+            query=q,
+            flowQuery=flowQuery,
+            limit=indicatorLimit,
+            flowLimit=flowLimit,
+        )
+
+    recommended_flow_refs: list[str] = []
+    for item in indicator_candidates:
+        flow_ref = str(item.get("recommendedFlowRef") or "").strip()
+        if flow_ref and flow_ref not in recommended_flow_refs:
+            recommended_flow_refs.append(flow_ref)
+
+    return {
+        "question": q,
+        "policyDrivenDiscovery": True,
+        "prioritizedDimensions": prioritized_dimensions,
+        "firstRequiredDimension": (
+            {
+                "name": first_required.name,
+                "role": first_required.role,
+                "priority": first_required.priority,
+            }
+            if first_required
+            else None
+        ),
+        "indicatorCandidates": indicator_candidates,
+        "recommendedFlowRefs": recommended_flow_refs,
+        "recommendedSequence": [
+            "Use find_indicator_candidates(question) first to resolve the subject/indicator.",
+            "Choose a flow from the indicator candidate's recommendedFlowRef or dataflows list.",
+            "Only then constrain geography and time with list_codes/search_reference_candidates/expand_ref_area_group.",
+            "Call validate_query_scope before query_data or resolve_and_query_data.",
+        ],
+        "assistant_guidance": (
+            "For topical questions, resolve the subject dimension first. "
+            "Do not start with search_dataflows unless the user is explicitly asking for a dataset or flow."
+        ),
+    }
+
+
+@mcp.tool()
 async def search_dataflows(query: str, limit: int = 10) -> list[dict[str, Any]]:
     """
     Search UNICEF SDMX dataflows by id/name/description.
     Returns lightweight matches with a flowRef you can pass to other tools.
+
+    Prefer find_indicator_candidates or plan_topic_query for topical metric questions
+    such as stunting, wasting, mortality, immunization, literacy, or similar phenomena.
+    Use search_dataflows when the user is asking for a known dataset, domain, or flow,
+    not when the main problem is to identify the right indicator first.
     """
     payload = await _cached_dataflows()
     flows = _extract_scoped_dataflows(payload)
@@ -3133,6 +3217,11 @@ async def find_indicator_candidates(
     """
     Rank indicator codes by matching query text against codelist labels/descriptions.
     If flowRef is omitted, scan scoped flows and return indicator candidates with matching dataflows.
+
+    This is the preferred first step for topical user questions where the subject/metric
+    is not already resolved. For requests such as "stunting in Latin America" or
+    "vaccination coverage in West Africa", call this before search_dataflows so the
+    subject dimension is resolved before flow selection.
     """
     q = (query or "").strip()
     if not q:
@@ -3767,6 +3856,10 @@ async def resolve_and_query_data(
     """
     Validate a query, try one hierarchy-based aggregate fallback when needed, and then return a shaped result.
     This is intended for common user-facing questions that expect one compact answer rather than raw SDMX payloads.
+
+    Use this only after the subject/indicator dimension has already been resolved to a concrete code
+    and a suitable flowRef has already been chosen. Do not use this as the first discovery step for
+    topical questions such as stunting or wasting.
     """
     if not filters:
         raise ValueError("filters must include at least one dimension.")
