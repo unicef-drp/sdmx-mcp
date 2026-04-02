@@ -13,7 +13,7 @@ from xml.etree import ElementTree as ET
 import httpx
 from cachetools import TTLCache
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp.types import Annotations
 
 # IMPORTANT for STDIO servers: do not print() to stdout.
@@ -42,9 +42,9 @@ BASE = os.getenv("SDMX_BASE_URL", "https://sdmx.data.unicef.org/ws/public/sdmxap
 HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "unicef-sdmx-mcp/0.1")
 AGENCY_ALLOWLIST = {item.strip() for item in os.getenv("SDMX_AGENCY_ALLOWLIST", "").split(",") if item.strip()}
 
-# Bind to all interfaces so DNS rebinding protection isn't auto-enabled for localhost-only hosts.
-mcp = FastMCP("unicef-sdmx", json_response=True, host="0.0.0.0", stateless_http=True)
+mcp = FastMCP("unicef-sdmx")
 INTERNAL_RESOURCE_ANNOTATIONS = Annotations(audience=["assistant"])
+INTERNAL_RESOURCE_META = {"expose_to_user": False}
 
 # Starter mapping for common flow id prefixes to human-friendly labels.
 FALLBACK_THEME_PREFIX_MAP: dict[str, str] = {
@@ -2687,6 +2687,7 @@ async def _execute_query_data(
     name="dataflows",
     description="Read-only SDMX dataflow metadata.",
     annotations=INTERNAL_RESOURCE_ANNOTATIONS,
+    meta=INTERNAL_RESOURCE_META,
 )
 async def dataflows_resource() -> dict[str, Any]:
     return {"dataflows": await _dataflow_summaries()}
@@ -2697,6 +2698,7 @@ async def dataflows_resource() -> dict[str, Any]:
     name="dimensions_for_dataflow",
     description="Ordered dimension metadata for one dataflow.",
     annotations=INTERNAL_RESOURCE_ANNOTATIONS,
+    meta=INTERNAL_RESOURCE_META,
 )
 async def dimensions_for_dataflow_resource(dataflow_id: str) -> dict[str, Any]:
     return {
@@ -2710,6 +2712,7 @@ async def dimensions_for_dataflow_resource(dataflow_id: str) -> dict[str, Any]:
     name="codelist",
     description="Read-only codelist lookup.",
     annotations=INTERNAL_RESOURCE_ANNOTATIONS,
+    meta=INTERNAL_RESOURCE_META,
 )
 async def codelist_resource(id: str) -> dict[str, Any]:
     return await _get_codelist_detail(id)
@@ -2720,6 +2723,7 @@ async def codelist_resource(id: str) -> dict[str, Any]:
     name="hierarchical_codelist",
     description="Read-only hierarchical codelist lookup.",
     annotations=INTERNAL_RESOURCE_ANNOTATIONS,
+    meta=INTERNAL_RESOURCE_META,
 )
 async def hierarchical_codelist_resource(id: str) -> dict[str, Any]:
     return await _get_hierarchical_codelist_detail(id)
@@ -2730,6 +2734,7 @@ async def hierarchical_codelist_resource(id: str) -> dict[str, Any]:
     name="query_dimension_policy",
     description="Configuration-driven query dimension semantics.",
     annotations=INTERNAL_RESOURCE_ANNOTATIONS,
+    meta=INTERNAL_RESOURCE_META,
 )
 def query_dimension_policy_resource() -> dict[str, Any]:
     return _query_dimension_policy_payload()
@@ -2740,6 +2745,7 @@ def query_dimension_policy_resource() -> dict[str, Any]:
     name="observations",
     description="Basic read-only SDMX observation retrieval.",
     annotations=INTERNAL_RESOURCE_ANNOTATIONS,
+    meta=INTERNAL_RESOURCE_META,
 )
 async def observations_resource(
     dataflow_id: str,
