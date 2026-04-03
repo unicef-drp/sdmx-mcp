@@ -317,11 +317,68 @@ def _discovery_resource_payload(role: str) -> dict[str, Any]:
             "discoveryMode": _discovery_slug_for_role(role),
             "question": "<user question>",
         },
+        "avoidRedundantTools": [
+            "search_dataflows",
+            "expand_ref_area_group",
+            "list_codes",
+            "resolve_and_query_data",
+        ],
         "assistant_guidance": (
-            "Use guided_discover(question, discoveryMode) after attaching this resource. "
+            "After attaching this resource, call guided_discover(question, discoveryMode) directly. "
+            "Do not do extra discovery with search_dataflows, expand_ref_area_group, list_codes, or resolve_and_query_data unless guided_discover returns unresolved or clearly insufficient output. "
             "The chosen discovery mode is the user-facing entry path; backend query construction still honors the configured priority order."
         ),
     }
+
+
+def _discovery_resource_markdown(role: str) -> str:
+    payload = _discovery_resource_payload(role)
+    lines = [
+        f"# {payload['label']}",
+        "",
+        payload["description"],
+        "",
+        "Cost guidance:",
+        "- Attach this resource, then call `guided_discover(...)` immediately.",
+        "- Avoid extra discovery calls unless `guided_discover` returns unresolved or incomplete output.",
+        "",
+        "Recommended tool:",
+        f"- `{payload['recommendedTool']}(question, discoveryMode=\"{payload['recommendedArguments']['discoveryMode']}\")`",
+        "",
+        "Avoid redundant tools:",
+    ]
+    for tool_name in payload["avoidRedundantTools"]:
+        lines.append(f"- `{tool_name}`")
+    lines.extend(
+        [
+            "",
+        "Backend resolution priority:",
+        ]
+    )
+    for item in payload["backendResolutionPriority"]:
+        lines.append(
+            f"- `{item['priority']}`. `{item['name']}` ({item['role']})"
+            + (" required" if item.get("requiredForRetrieval") else "")
+        )
+    entry = payload["entryDimension"]
+    lines.extend(
+        [
+            "",
+            "Entry dimension:",
+            f"- `{entry['name']}` ({entry['role']})",
+            f"- Priority: `{entry['priority']}`",
+        ]
+    )
+    if entry.get("preferredSources"):
+        lines.append("- Preferred sources:")
+        for source in entry["preferredSources"]:
+            lines.append(f"  - `{source['type']}`: `{source['id']}`")
+    if payload.get("examplePrompts"):
+        lines.extend(["", "Example prompts:"])
+        for prompt in payload["examplePrompts"]:
+            lines.append(f"- {prompt}")
+    lines.extend(["", payload["assistant_guidance"]])
+    return "\n".join(lines)
 
 
 def _default_last_n_observations_enabled() -> bool:
@@ -2727,10 +2784,10 @@ async def dataflows_resource() -> dict[str, Any]:
     name="discover_by_subject",
     title="Discover by Subject",
     description="Guided entry point for topic-first discovery.",
-    mime_type="application/json",
+    mime_type="text/markdown",
 )
-def discover_by_subject_resource() -> dict[str, Any]:
-    return _discovery_resource_payload("subject")
+def discover_by_subject_resource() -> str:
+    return _discovery_resource_markdown("subject")
 
 
 @mcp.resource(
@@ -2738,10 +2795,10 @@ def discover_by_subject_resource() -> dict[str, Any]:
     name="discover_by_location",
     title="Discover by Location",
     description="Guided entry point for geography-first discovery.",
-    mime_type="application/json",
+    mime_type="text/markdown",
 )
-def discover_by_location_resource() -> dict[str, Any]:
-    return _discovery_resource_payload("location")
+def discover_by_location_resource() -> str:
+    return _discovery_resource_markdown("location")
 
 
 @mcp.resource(
@@ -2749,10 +2806,10 @@ def discover_by_location_resource() -> dict[str, Any]:
     name="discover_by_time",
     title="Discover by Time",
     description="Guided entry point for time-first discovery.",
-    mime_type="application/json",
+    mime_type="text/markdown",
 )
-def discover_by_time_resource() -> dict[str, Any]:
-    return _discovery_resource_payload("time")
+def discover_by_time_resource() -> str:
+    return _discovery_resource_markdown("time")
 
 
 async def dimensions_for_dataflow_resource(dataflow_id: str) -> dict[str, Any]:
@@ -3157,6 +3214,7 @@ async def _guided_discover_impl(
             "discoveryMode": _discovery_slug_for_role(normalized_mode),
             "question": question,
             "plan": plan,
+            "recommendedNextAction": "Refine the question or policy sources, then retry guided_discover. Do not switch to generic discovery tools yet.",
             "assistant_guidance": "No indicator candidates were found. Refine the subject wording or adjust the policy sources.",
         }
 
@@ -3172,6 +3230,7 @@ async def _guided_discover_impl(
             "question": question,
             "plan": plan,
             "selectedIndicator": selected_indicator,
+            "recommendedNextAction": "Refine the question or flowQuery, then retry guided_discover. Avoid generic flow search unless the user is explicitly asking for a dataset.",
             "assistant_guidance": "An indicator candidate was found, but no recommended flow could be selected.",
         }
 
@@ -3212,6 +3271,7 @@ async def _guided_discover_impl(
             "selectedGeography": selected_geography,
             "timeInput": time_input,
             "error": str(exc),
+            "recommendedNextAction": "Use the plan output to refine the question, then retry guided_discover. Only fall back to lower-level tools if this remains unresolved.",
             "assistant_guidance": "The discovery plan found likely candidates, but policy-backed input resolution failed.",
         }
 
@@ -3244,9 +3304,13 @@ async def _guided_discover_impl(
         "resolvedGeography": geography_resolution,
         "resolvedTime": time_resolution,
         "result": result,
+        "recommendedNextAction": (
+            "Answer directly from result. Avoid search_dataflows, expand_ref_area_group, list_codes, or resolve_and_query_data unless the result is unresolved or missing a required slice."
+        ),
         "assistant_guidance": (
             "This guided discovery path uses the chosen discovery mode as the user-facing entry point, "
-            "but final query construction still follows the configured policy priority."
+            "but final query construction still follows the configured policy priority. "
+            "If the result is resolved, answer from it directly instead of issuing more discovery calls."
         ),
     }
 
@@ -3286,6 +3350,8 @@ async def search_dataflows(query: str, limit: int = 10) -> list[dict[str, Any]]:
     such as stunting, wasting, mortality, immunization, literacy, or similar phenomena.
     Use search_dataflows when the user is asking for a known dataset, domain, or flow,
     not when the main problem is to identify the right indicator first.
+    If a discovery resource is attached or guided_discover is available, calling this first is usually redundant
+    and increases cost. Avoid it for topic-first questions unless guided_discover returned unresolved.
     """
     payload = await _cached_dataflows()
     flows = _extract_scoped_dataflows(payload)
@@ -3650,6 +3716,8 @@ async def guided_discover(
     This tool is intended to be called after attaching one of the discovery resources.
     The selected discovery mode is the visible user entry path, but backend query
     construction still follows the configured query-dimension policy order.
+    For cost control, prefer this single tool over chaining search_dataflows, expand_ref_area_group,
+    list_codes, and resolve_and_query_data after a discovery resource has been attached.
     """
     return await _guided_discover_impl(
         question=question,
