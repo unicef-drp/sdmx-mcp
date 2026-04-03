@@ -3158,6 +3158,36 @@ def _time_input_from_question(question: str) -> str:
     return "latest"
 
 
+def _guided_result_shape(question: str, requested_shape: str) -> str:
+    normalized_requested = (requested_shape or "").strip().lower() or "topline_summary"
+    q = (question or "").strip().lower()
+    if normalized_requested != "topline_summary":
+        return requested_shape
+    if any(token in q for token in ["table", "by country", "country table", "dashboard", "widget"]):
+        return "latest_by_ref_area"
+    if any(token in q for token in ["trend", "over time", "time series", "series", "chart", "graph"]):
+        return "compact_series"
+    return requested_shape
+
+
+def _fallback_time_resolution(question: str) -> dict[str, Any]:
+    time_input = _time_input_from_question(question)
+    use_all = time_input == "all"
+    return {
+        "name": "time",
+        "role": "time",
+        "dimension_id": "",
+        "value": time_input,
+        "startPeriod": None,
+        "endPeriod": None,
+        "timeMode": "all" if use_all else "latest",
+        "useLatestObservation": not use_all,
+        "useAllObservations": use_all,
+        "source": {"type": "fallback", "id": "no_time_dimension"},
+        "flowRef": "",
+    }
+
+
 def _dimension_for_policy(payload: dict[str, Any], policy: QueryDimensionPolicyEntry) -> dict[str, Any] | None:
     for source in policy.preferred_sources:
         dim = (
@@ -3201,6 +3231,7 @@ async def _guided_discover_impl(
     resultShape: str = "topline_summary",
 ) -> dict[str, Any]:
     normalized_mode = _normalized_discovery_role(discoveryMode)
+    effective_result_shape = _guided_result_shape(question, resultShape)
     plan = await _plan_topic_query_impl(
         question=question,
         flowQuery=flowQuery,
@@ -3258,24 +3289,66 @@ async def _guided_discover_impl(
     if selected_geography and selected_geography.get("id"):
         provided_inputs["location"] = str(selected_geography.get("id"))
 
+    time_resolution_error: str | None = None
     try:
         resolved = await _resolve_query_dimension_inputs(flow_ref, provided_inputs)
     except Exception as exc:
-        return {
-            "status": "unresolved",
-            "discoveryMode": _discovery_slug_for_role(normalized_mode),
-            "question": question,
-            "plan": plan,
-            "selectedIndicator": selected_indicator,
-            "selectedFlowRef": flow_ref,
-            "selectedGeography": selected_geography,
-            "timeInput": time_input,
-            "error": str(exc),
-            "recommendedNextAction": "Use the plan output to refine the question, then retry guided_discover. Only fall back to lower-level tools if this remains unresolved.",
-            "assistant_guidance": "The discovery plan found likely candidates, but policy-backed input resolution failed.",
-        }
+        payload_dimensions = {str(item.get("id") or "").upper() for item in _dimension_metadata(payload)}
+        if "TIME_PERIOD" not in payload_dimensions:
+            resolved = {
+                "subject": {
+                    "name": "subject",
+                    "role": "subject",
+                    "dimension_id": "",
+                    "values": [str(selected_indicator.get("id") or "")],
+                    "flowRef": flow_ref,
+                },
+                "_resolution_order": ["subject"],
+            }
+            if selected_geography and selected_geography.get("id"):
+                resolved["location"] = {
+                    "name": "location",
+                    "role": "geography",
+                    "dimension_id": str(geography_dimension.get("id") or "") if geography_dimension else "",
+                    "values": [str(selected_geography.get("id"))],
+                    "flowRef": flow_ref,
+                }
+                resolved["_resolution_order"].append("location")
+            time_resolution_error = str(exc)
+        else:
+            return {
+                "status": "unresolved",
+                "discoveryMode": _discovery_slug_for_role(normalized_mode),
+                "question": question,
+                "plan": plan,
+                "selectedIndicator": selected_indicator,
+                "selectedFlowRef": flow_ref,
+                "selectedGeography": selected_geography,
+                "timeInput": time_input,
+                "error": str(exc),
+                "recommendedNextAction": "Use the plan output to refine the question, then retry guided_discover. Only fall back to lower-level tools if this remains unresolved.",
+                "assistant_guidance": "The discovery plan found likely candidates, but policy-backed input resolution failed.",
+            }
 
-    filters, time_resolution, subject_resolution, geography_resolution = _query_args_from_resolved_inputs(resolved)
+    if any(value.get("role") == "time" for key, value in resolved.items() if key != "_resolution_order"):
+        filters, time_resolution, subject_resolution, geography_resolution = _query_args_from_resolved_inputs(resolved)
+    else:
+        coded_resolutions = [value for key, value in resolved.items() if key != "_resolution_order"]
+        filters = {}
+        subject_resolution = None
+        geography_resolution = None
+        for item in coded_resolutions:
+            values = item.get("values")
+            dimension_id = str(item.get("dimension_id") or "")
+            if dimension_id:
+                filters[dimension_id] = values if values is not None else item.get("value")
+            if item.get("role") == "subject":
+                subject_resolution = item
+            if item.get("role") == "geography":
+                geography_resolution = item
+        time_resolution = _fallback_time_resolution(question)
+        time_resolution["flowRef"] = flow_ref
+
     result = await _execute_query_data(
         flowRef=flow_ref,
         filters=filters,
@@ -3284,7 +3357,7 @@ async def _guided_discover_impl(
         lastNObservations=1 if time_resolution.get("useLatestObservation") else None,
         format="csv",
         labels=labels,
-        resultShape=resultShape,
+        resultShape=effective_result_shape,
         allowUnboundedTime=bool(time_resolution.get("useAllObservations")),
     )
 
@@ -3299,6 +3372,15 @@ async def _guided_discover_impl(
         "selectedGeography": selected_geography,
         "geographyCandidates": geography_candidates,
         "timeInput": time_input,
+        "timeResolutionFallback": (
+            {
+                "used": True,
+                "reason": time_resolution_error,
+                "applied": time_resolution,
+            }
+            if time_resolution_error
+            else {"used": False}
+        ),
         "resolution": resolved,
         "resolvedSubject": subject_resolution,
         "resolvedGeography": geography_resolution,
