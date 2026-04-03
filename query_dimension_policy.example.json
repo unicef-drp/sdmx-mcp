@@ -5,6 +5,12 @@
       "role": "subject",
       "required_for_retrieval": true,
       "priority": 1,
+      "discovery_label": "Discover by Subject",
+      "discovery_description": "Start with the phenomenon, metric, or topic and let the system find the best indicator and flow.",
+      "example_prompts": [
+        "Tell me about stunting in Latin America.",
+        "Show me vaccination coverage in West Africa."
+      ],
       "preferred_sources": [
         { "type": "codelist", "id": "UNICEF/CL_UNICEF_INDICATOR/1.0" }
       ]
@@ -14,6 +20,12 @@
       "role": "geography",
       "required_for_retrieval": true,
       "priority": 2,
+      "discovery_label": "Discover by Location",
+      "discovery_description": "Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
+      "example_prompts": [
+        "Tell me about stunting in Latin America.",
+        "Compare child mortality in South Asia."
+      ],
       "preferred_sources": [
         { "type": "codelist", "id": "UNICEF/CL_COUNTRY/1.0" },
         { "type": "hierarchical_codelist", "id": "UNICEF/UNICEF_REPORTING_REGIONS" }
@@ -25,7 +37,13 @@
       "name": "time",
       "role": "time",
       "required_for_retrieval": true,
-      "priority": 3
+      "priority": 3,
+      "discovery_label": "Discover by Time",
+      "discovery_description": "Start with the period or trend you want and let the system resolve the right subject, flow, and location slice.",
+      "example_prompts": [
+        "What changed over time for under-five mortality in South Asia?",
+        "Show the latest nutrition indicators."
+      ]
     }
   ]
 }

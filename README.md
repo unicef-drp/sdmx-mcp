@@ -145,6 +145,12 @@ Example UNICEF-oriented policy:
       "role": "geography",
       "required_for_retrieval": true,
       "priority": 1,
+      "discovery_label": "Discover by Location",
+      "discovery_description": "Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
+      "example_prompts": [
+        "Tell me about stunting in Latin America.",
+        "Compare child mortality in South Asia."
+      ],
       "preferred_sources": [
         {"type": "codelist", "id": "UNICEF/CL_COUNTRY/1.0"},
         {"type": "hierarchical_codelist", "id": "UNICEF/UNICEF_REPORTING_REGIONS"}
@@ -157,6 +163,12 @@ Example UNICEF-oriented policy:
       "role": "subject",
       "required_for_retrieval": true,
       "priority": 2,
+      "discovery_label": "Discover by Subject",
+      "discovery_description": "Start with the phenomenon, metric, or topic and let the system find the best indicator and flow.",
+      "example_prompts": [
+        "Tell me about stunting in Latin America.",
+        "Show me vaccination coverage in West Africa."
+      ],
       "preferred_sources": [
         {"type": "codelist", "id": "UNICEF/CL_UNICEF_INDICATOR/1.0"}
       ]
@@ -165,13 +177,34 @@ Example UNICEF-oriented policy:
       "name": "time",
       "role": "time",
       "required_for_retrieval": true,
-      "priority": 3
+      "priority": 3,
+      "discovery_label": "Discover by Time",
+      "discovery_description": "Start with the period or trend you want and let the system resolve the right subject, flow, and location slice.",
+      "example_prompts": [
+        "What changed over time for under-five mortality in South Asia?",
+        "Show the latest nutrition indicators."
+      ]
     }
   ]
 }
 ```
 
 Resolution order follows policy `priority`, not hardcoded dimension names. Non-time dimensions are resolved through the configured code-list or hierarchy sources, and policy source IDs should use the SDMX reference form `agency/id/version` where applicable. `time` is resolved against `TIME_PERIOD`.
+
+The same policy can also drive three user-facing discovery resources:
+
+- `Discover by Subject`
+- `Discover by Location`
+- `Discover by Time`
+
+Optional policy fields for each query dimension:
+
+- `discovery_enabled`
+- `discovery_label`
+- `discovery_description`
+- `example_prompts`
+
+Discovery mode is the user-facing entry path only. Final query construction still honors policy `priority`.
 
 For `observations`, `time_range` can be:
 
@@ -223,38 +256,42 @@ For `observations`, `time_range` can be:
 12. `search_indicators(query, flowRef=None, limit=10, flowQuery=None, flowLimit=200)`
 - Purpose: alias of `find_indicator_candidates`.
 
-13. `get_flow_structure(flowRef)`
+13. `guided_discover(question, discoveryMode, flowQuery=None, indicatorLimit=10, flowLimit=200, labels='name', resultShape='topline_summary')`
+- Purpose: run the full guided discovery workflow from a user-facing entry mode of `subject`, `location`, or `time`.
+- Behavior: uses the chosen discovery mode as the visible entry path, then resolves subject/location/time according to the configured backend policy before validating and executing the query.
+
+14. `get_flow_structure(flowRef)`
 - Purpose: fetch/cache structure payload (`references=all`).
 
-14. `build_key(flowRef, selections)`
+15. `build_key(flowRef, selections)`
 - Purpose: build SDMX key from dimension selections.
 - Notes: supports list/comma syntax for multi-code segments.
 
-15. `list_hierarchical_codelists(agency=None, query=None, limit=50)`
+16. `list_hierarchical_codelists(agency=None, query=None, limit=50)`
 - Purpose: list hierarchical codelists available for an agency.
 
-16. `describe_hierarchical_codelist(hierarchyRef)`
+17. `describe_hierarchical_codelist(hierarchyRef)`
 - Purpose: describe one hierarchical codelist and expose root codes.
 
-17. `resolve_hierarchy(flowRef, dimension, code)`
+18. `resolve_hierarchy(flowRef, dimension, code)`
 - Purpose: choose the best matching hierarchy for a flow dimension/code.
 - Returns: `status` of `resolved`, `ambiguous`, or `unresolved`.
 - Behavior: if more than one hierarchy plausibly matches, the MCP returns ambiguity instead of guessing.
 
-18. `expand_dimension_group(flowRef, dimension, code)`
+19. `expand_dimension_group(flowRef, dimension, code)`
 - Purpose: expand an aggregate dimension code into descendant/member codes using the resolved hierarchy.
 
-19. `resolve_dimension_fallback(flowRef, dimension, code, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, labels=None)`
+20. `resolve_dimension_fallback(flowRef, dimension, code, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, labels=None)`
 - Purpose: validate an aggregate dimension query and, if unresolved, return a hierarchy-based retry plan using member codes.
 
-20. `plan_query(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, format='csv', labels='name', resultShape=None)`
+21. `plan_query(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, format='csv', labels='name', resultShape=None)`
 - Purpose: resolve a query into a concrete SDMX URL before execution and show wildcard dimensions that can still split the result.
 
-21. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, labels='name')`
+22. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, labels='name')`
 - Purpose: preflight whether a concrete UNICEF/UNPD query resolves before any narrative answer is attempted.
 - Returns: structured source-bound status with `status`, `sourceScope`, `provenance`, optional `error`, and `assistant_guidance`.
 
-22. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='csv', labels='name', maxObs=50000, filters=None, lastNObservations=None, resultShape=None)`
+23. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='csv', labels='name', maxObs=50000, filters=None, lastNObservations=None, resultShape=None)`
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
   - defaults to `lastNObservations=1` when no explicit `startPeriod` and `endPeriod` are provided and `SDMX_DEFAULT_LAST_N_OBSERVATIONS=true`
@@ -273,7 +310,7 @@ For `observations`, `time_range` can be:
   - parses SDMX XML error payloads into structured `error.message`
   - on unresolved queries, callers should stop and report the failed official query instead of supplementing with external facts
 
-23. `resolve_and_query_data(flowRef, filters, startPeriod=None, endPeriod=None, lastNObservations=None, labels='name', resultShape='latest_single_value')`
+24. `resolve_and_query_data(flowRef, filters, startPeriod=None, endPeriod=None, lastNObservations=None, labels='name', resultShape='latest_single_value')`
 - Purpose: high-level helper for common user questions.
 - Behavior: validates the direct query first, then attempts a single hierarchy-based member fallback when an aggregate code does not resolve, and finally returns a shaped result.
 

@@ -81,6 +81,10 @@ class QueryDimensionPolicyEntry:
     preferred_sources: list[QueryDimensionSource] = field(default_factory=list)
     allow_hierarchy_resolution: bool = False
     allow_member_expansion: bool = False
+    discovery_enabled: bool = True
+    discovery_label: str | None = None
+    discovery_description: str | None = None
+    example_prompts: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -127,12 +131,18 @@ def _default_query_dimension_policy() -> QueryDimensionPolicyConfig:
                 required_for_retrieval=True,
                 priority=1,
                 preferred_sources=[QueryDimensionSource(type="codelist", id="UNICEF/CL_INDICATOR/latest")],
+                discovery_label="Discover by Subject",
+                discovery_description="Start with the phenomenon, metric, or topic you care about and let the system find the best indicator and flow.",
+                example_prompts=["Tell me about stunting in Latin America.", "Show me vaccination coverage in West Africa."],
             ),
             QueryDimensionPolicyEntry(
                 name="time",
                 role="time",
                 required_for_retrieval=True,
                 priority=2,
+                discovery_label="Discover by Time",
+                discovery_description="Start with the period or trend you want and let the system resolve the right subject, flow, and location slice.",
+                example_prompts=["What changed over time for under-five mortality in South Asia?", "Show the latest nutrition indicators."],
             ),
             QueryDimensionPolicyEntry(
                 name="location",
@@ -142,6 +152,9 @@ def _default_query_dimension_policy() -> QueryDimensionPolicyConfig:
                 preferred_sources=[QueryDimensionSource(type="codelist", id="UNICEF/CL_GEO/latest")],
                 allow_hierarchy_resolution=True,
                 allow_member_expansion=True,
+                discovery_label="Discover by Location",
+                discovery_description="Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
+                example_prompts=["Tell me about stunting in Latin America.", "Compare child mortality in South Asia."],
             ),
         ]
     )
@@ -173,6 +186,14 @@ def _policy_config_from_dict(payload: dict[str, Any]) -> QueryDimensionPolicyCon
                 preferred_sources=sources,
                 allow_hierarchy_resolution=bool(item.get("allow_hierarchy_resolution")),
                 allow_member_expansion=bool(item.get("allow_member_expansion")),
+                discovery_enabled=bool(item.get("discovery_enabled", True)),
+                discovery_label=str(item.get("discovery_label") or "").strip() or None,
+                discovery_description=str(item.get("discovery_description") or "").strip() or None,
+                example_prompts=[
+                    str(prompt).strip()
+                    for prompt in (item.get("example_prompts") or [])
+                    if str(prompt).strip()
+                ],
             )
         )
 
@@ -211,6 +232,96 @@ def _query_dimension_policy_payload() -> dict[str, Any]:
 def _ordered_query_dimensions() -> list[QueryDimensionPolicyEntry]:
     policy = _query_dimension_policy_config()
     return sorted(policy.default_query_dimensions, key=lambda item: item.priority)
+
+
+def _sorted_query_dimension_policies() -> list[QueryDimensionPolicyEntry]:
+    return _ordered_query_dimensions()
+
+
+def _normalized_discovery_role(mode: str) -> str:
+    normalized = (mode or "").strip().lower()
+    if normalized in {"location", "geo", "geography", "ref_area"}:
+        return "geography"
+    if normalized in {"subject", "indicator"}:
+        return "subject"
+    if normalized in {"time", "period"}:
+        return "time"
+    raise ValueError("discoveryMode must be one of: subject, location, or time.")
+
+
+def _discovery_slug_for_role(role: str) -> str:
+    normalized = _normalized_discovery_role(role)
+    if normalized == "geography":
+        return "location"
+    return normalized
+
+
+def _default_discovery_label(role: str) -> str:
+    normalized = _normalized_discovery_role(role)
+    return {
+        "subject": "Discover by Subject",
+        "geography": "Discover by Location",
+        "time": "Discover by Time",
+    }[normalized]
+
+
+def _default_discovery_description(role: str) -> str:
+    normalized = _normalized_discovery_role(role)
+    return {
+        "subject": "Start with the phenomenon, metric, or topic and let the system find the best indicator and flow.",
+        "geography": "Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
+        "time": "Start with the period or trend you want and let the system resolve the right subject, flow, and location slice.",
+    }[normalized]
+
+
+def _policy_for_role(role: str) -> QueryDimensionPolicyEntry | None:
+    normalized = _normalized_discovery_role(role)
+    for item in _ordered_query_dimensions():
+        if _normalized_discovery_role(item.role) == normalized:
+            return item
+    return None
+
+
+def _policy_source_payload(policy: QueryDimensionPolicyEntry) -> list[dict[str, Any]]:
+    return [asdict(source) for source in policy.preferred_sources]
+
+
+def _discovery_resource_payload(role: str) -> dict[str, Any]:
+    policy = _policy_for_role(role)
+    if not policy:
+        raise ValueError(f"No query-dimension policy exists for discovery role '{role}'.")
+    return {
+        "mode": _discovery_slug_for_role(role),
+        "label": policy.discovery_label or _default_discovery_label(role),
+        "description": policy.discovery_description or _default_discovery_description(role),
+        "backendResolutionPriority": [
+            {
+                "name": item.name,
+                "role": item.role,
+                "priority": item.priority,
+                "requiredForRetrieval": item.required_for_retrieval,
+            }
+            for item in _ordered_query_dimensions()
+        ],
+        "entryDimension": {
+            "name": policy.name,
+            "role": policy.role,
+            "priority": policy.priority,
+            "preferredSources": _policy_source_payload(policy),
+            "allowHierarchyResolution": policy.allow_hierarchy_resolution,
+            "allowMemberExpansion": policy.allow_member_expansion,
+        },
+        "examplePrompts": policy.example_prompts,
+        "recommendedTool": "guided_discover",
+        "recommendedArguments": {
+            "discoveryMode": _discovery_slug_for_role(role),
+            "question": "<user question>",
+        },
+        "assistant_guidance": (
+            "Use guided_discover(question, discoveryMode) after attaching this resource. "
+            "The chosen discovery mode is the user-facing entry path; backend query construction still honors the configured priority order."
+        ),
+    }
 
 
 def _default_last_n_observations_enabled() -> bool:
@@ -2611,6 +2722,39 @@ async def dataflows_resource() -> dict[str, Any]:
     return {"dataflows": await _dataflow_summaries()}
 
 
+@mcp.resource(
+    "sdmx://discover/subject",
+    name="discover_by_subject",
+    title="Discover by Subject",
+    description="Guided entry point for topic-first discovery.",
+    mime_type="application/json",
+)
+def discover_by_subject_resource() -> dict[str, Any]:
+    return _discovery_resource_payload("subject")
+
+
+@mcp.resource(
+    "sdmx://discover/location",
+    name="discover_by_location",
+    title="Discover by Location",
+    description="Guided entry point for geography-first discovery.",
+    mime_type="application/json",
+)
+def discover_by_location_resource() -> dict[str, Any]:
+    return _discovery_resource_payload("location")
+
+
+@mcp.resource(
+    "sdmx://discover/time",
+    name="discover_by_time",
+    title="Discover by Time",
+    description="Guided entry point for time-first discovery.",
+    mime_type="application/json",
+)
+def discover_by_time_resource() -> dict[str, Any]:
+    return _discovery_resource_payload("time")
+
+
 async def dimensions_for_dataflow_resource(dataflow_id: str) -> dict[str, Any]:
     return {
         "dataflow_id": dataflow_id,
@@ -2744,23 +2888,119 @@ async def list_agencies(limit: int = 50) -> list[dict[str, Any]]:
     return results
 
 
-@mcp.tool()
-async def plan_topic_query(
+async def _find_indicator_candidates_impl(
+    *,
+    query: str,
+    flowRef: str | None = None,
+    limit: int = 10,
+    flowQuery: str | None = None,
+    flowLimit: int = 200,
+) -> list[dict[str, Any]]:
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    if flowRef:
+        payload = await _get_flow_structure(flowRef)
+        codes = _indicator_codes_from_payload(payload)
+        if not codes:
+            raise ValueError("INDICATOR dimension not found for this flow.")
+        return _ranked_code_matches(codes, q, limit=limit)
+
+    payload = await _cached_dataflows()
+    flows = _extract_scoped_dataflows(payload)
+    if flowQuery:
+        flow_q = flowQuery.strip().lower()
+        scored_flows: list[tuple[int, dict[str, Any]]] = []
+        for df in flows:
+            df_id = str(df.get("id") or df.get("ID") or "")
+            name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
+            desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
+            score = _match_score(f"{df_id} {name} {desc}".lower(), flow_q)
+            if score > 0:
+                scored_flows.append((score, df))
+        scored_flows.sort(key=lambda item: item[0], reverse=True)
+        flows = [item[1] for item in scored_flows]
+
+    if flowLimit > 0:
+        flows = flows[:flowLimit]
+
+    merged: dict[str, dict[str, Any]] = {}
+    for df in flows:
+        df_id = str(df.get("id") or df.get("ID") or "").strip()
+        if not df_id:
+            continue
+        agency = str(df.get("agencyID") or df.get("agencyId") or "all")
+        version = str(df.get("version") or "latest")
+        flow_ref = _flow_ref_for(df_id, version, agency)
+        flow_name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
+        flow_desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
+
+        try:
+            structure = await _get_flow_structure(flow_ref)
+        except Exception:
+            continue
+
+        codes = _indicator_codes_from_payload(structure)
+        if not codes:
+            continue
+        for item in _scored_code_matches(codes, q):
+            code_id = str(item.get("id") or "").strip()
+            if not code_id:
+                continue
+            bucket = merged.setdefault(
+                code_id,
+                {
+                    "id": code_id,
+                    "name": item.get("name") or "",
+                    "description": item.get("description") or "",
+                    "_score": int(item.get("_score") or 0),
+                    "dataflows": [],
+                },
+            )
+
+            item_score = int(item.get("_score") or 0)
+            if item_score > int(bucket.get("_score") or 0):
+                bucket["_score"] = item_score
+                bucket["name"] = item.get("name") or bucket.get("name") or ""
+                bucket["description"] = item.get("description") or bucket.get("description") or ""
+
+            flow_candidates: list[dict[str, Any]] = bucket["dataflows"]
+            if any(existing.get("flowRef") == flow_ref for existing in flow_candidates):
+                continue
+            flow_candidates.append(
+                {
+                    "flowRef": flow_ref,
+                    "agencyID": agency,
+                    "flowID": df_id,
+                    "flowName": flow_name,
+                    "flowDescription": flow_desc,
+                    "isCrossSectional": _is_cross_sectional_flow(df_id, flow_name, flow_desc),
+                }
+            )
+
+    ranked = sorted(
+        merged.values(),
+        key=lambda item: (int(item.get("_score") or 0), len(item.get("dataflows") or [])),
+        reverse=True,
+    )[:limit]
+
+    for item in ranked:
+        candidates = item.get("dataflows") or []
+        recommended = _pick_recommended_flow(candidates, q)
+        item["recommendedFlowRef"] = recommended.get("flowRef") if isinstance(recommended, dict) else None
+        item.pop("_score", None)
+
+    return ranked
+
+
+async def _plan_topic_query_impl(
     question: str,
     flowQuery: str | None = None,
     indicatorLimit: int = 10,
     flowLimit: int = 200,
 ) -> dict[str, Any]:
-    """
-    Plan a topical user question into an indicator-first SDMX workflow.
-
-    Use this as the first tool for questions about a phenomenon or metric such as
-    stunting, wasting, mortality, literacy, vaccination, or similar subject-matter topics.
-    This tool reads the configured query-dimension policy, highlights the highest-priority
-    required dimension, and returns ranked indicator candidates before any flow-level query.
-    Do not start with search_dataflows for topical questions unless the user explicitly asks
-    for a dataset or dataflow by name.
-    """
+    """Internal implementation for topic planning."""
     q = (question or "").strip()
     if not q:
         raise ValueError("question must not be empty.")
@@ -2782,7 +3022,7 @@ async def plan_topic_query(
     first_required = next((item for item in policy if item.required_for_retrieval), None)
     indicator_candidates: list[dict[str, Any]] = []
     if first_required and first_required.role == "subject":
-        indicator_candidates = await find_indicator_candidates(
+        indicator_candidates = await _find_indicator_candidates_impl(
             query=q,
             flowQuery=flowQuery,
             limit=indicatorLimit,
@@ -2848,6 +3088,192 @@ async def plan_topic_query(
             "Do not call search_dataflows unless the user is explicitly asking for a dataset or flow, or the returned flow summaries are insufficient."
         ),
     }
+
+
+def _time_input_from_question(question: str) -> str:
+    q = (question or "").strip().lower()
+    if not q:
+        return "latest"
+    if any(token in q for token in ["trend", "over time", "time series", "series", "by year", "historical"]):
+        return "all"
+    if any(token in q for token in ["latest", "most recent", "current", "today"]):
+        return "latest"
+    return "latest"
+
+
+def _dimension_for_policy(payload: dict[str, Any], policy: QueryDimensionPolicyEntry) -> dict[str, Any] | None:
+    for source in policy.preferred_sources:
+        dim = (
+            _find_dimension_from_source(payload, source)
+            if source.type != "hierarchical_codelist"
+            else _dimension_for_hierarchical_source(payload, policy, source)
+        )
+        if dim:
+            return dim
+    return None
+
+
+def _query_args_from_resolved_inputs(resolved: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+    time_resolution = next(
+        value for key, value in resolved.items() if key != "_resolution_order" and value.get("role") == "time"
+    )
+    coded_resolutions = [
+        value for key, value in resolved.items() if key != "_resolution_order" and value.get("role") != "time"
+    ]
+    filters: dict[str, Any] = {}
+    subject_resolution: dict[str, Any] | None = None
+    geography_resolution: dict[str, Any] | None = None
+    for item in coded_resolutions:
+        values = item.get("values")
+        filters[item["dimension_id"]] = values if values is not None else item.get("value")
+        if item.get("role") == "subject":
+            subject_resolution = item
+        if item.get("role") == "geography":
+            geography_resolution = item
+    return filters, time_resolution, subject_resolution, geography_resolution
+
+
+async def _guided_discover_impl(
+    *,
+    question: str,
+    discoveryMode: str,
+    flowQuery: str | None = None,
+    indicatorLimit: int = 10,
+    flowLimit: int = 200,
+    labels: str | None = "name",
+    resultShape: str = "topline_summary",
+) -> dict[str, Any]:
+    normalized_mode = _normalized_discovery_role(discoveryMode)
+    plan = await _plan_topic_query_impl(
+        question=question,
+        flowQuery=flowQuery,
+        indicatorLimit=indicatorLimit,
+        flowLimit=flowLimit,
+    )
+    indicator_candidates = plan.get("indicatorCandidates") or []
+    if not indicator_candidates:
+        return {
+            "status": "unresolved",
+            "discoveryMode": _discovery_slug_for_role(normalized_mode),
+            "question": question,
+            "plan": plan,
+            "assistant_guidance": "No indicator candidates were found. Refine the subject wording or adjust the policy sources.",
+        }
+
+    selected_indicator = next(
+        (item for item in indicator_candidates if isinstance(item, dict) and item.get("recommendedFlowRef")),
+        indicator_candidates[0],
+    )
+    flow_ref = str(selected_indicator.get("recommendedFlowRef") or "").strip()
+    if not flow_ref:
+        return {
+            "status": "unresolved",
+            "discoveryMode": _discovery_slug_for_role(normalized_mode),
+            "question": question,
+            "plan": plan,
+            "selectedIndicator": selected_indicator,
+            "assistant_guidance": "An indicator candidate was found, but no recommended flow could be selected.",
+        }
+
+    payload = await _get_flow_structure(flow_ref)
+    geography_policy = _policy_for_role("geography")
+    geography_dimension = _dimension_for_policy(payload, geography_policy) if geography_policy else None
+    geography_candidates = await _search_reference_candidates(
+        flowRef=flow_ref,
+        query=question,
+        dimension=str(geography_dimension.get("id") or "") if geography_dimension else None,
+        limit=10,
+    )
+    selected_geography = next(
+        (item for item in geography_candidates if isinstance(item, dict) and item.get("kind") == "code"),
+        None,
+    )
+    if not selected_geography:
+        selected_geography = next((item for item in geography_candidates if isinstance(item, dict)), None)
+
+    time_input = _time_input_from_question(question)
+    provided_inputs = {
+        "subject": str(selected_indicator.get("id") or ""),
+        "time": time_input,
+    }
+    if selected_geography and selected_geography.get("id"):
+        provided_inputs["location"] = str(selected_geography.get("id"))
+
+    try:
+        resolved = await _resolve_query_dimension_inputs(flow_ref, provided_inputs)
+    except Exception as exc:
+        return {
+            "status": "unresolved",
+            "discoveryMode": _discovery_slug_for_role(normalized_mode),
+            "question": question,
+            "plan": plan,
+            "selectedIndicator": selected_indicator,
+            "selectedFlowRef": flow_ref,
+            "selectedGeography": selected_geography,
+            "timeInput": time_input,
+            "error": str(exc),
+            "assistant_guidance": "The discovery plan found likely candidates, but policy-backed input resolution failed.",
+        }
+
+    filters, time_resolution, subject_resolution, geography_resolution = _query_args_from_resolved_inputs(resolved)
+    result = await _execute_query_data(
+        flowRef=flow_ref,
+        filters=filters,
+        startPeriod=time_resolution["startPeriod"],
+        endPeriod=time_resolution["endPeriod"],
+        lastNObservations=1 if time_resolution.get("useLatestObservation") else None,
+        format="csv",
+        labels=labels,
+        resultShape=resultShape,
+        allowUnboundedTime=bool(time_resolution.get("useAllObservations")),
+    )
+
+    return {
+        "status": result.get("status"),
+        "discoveryMode": _discovery_slug_for_role(normalized_mode),
+        "question": question,
+        "plan": plan,
+        "selectedIndicator": selected_indicator,
+        "selectedFlowRef": flow_ref,
+        "selectedFlow": selected_indicator.get("recommendedFlow"),
+        "selectedGeography": selected_geography,
+        "geographyCandidates": geography_candidates,
+        "timeInput": time_input,
+        "resolution": resolved,
+        "resolvedSubject": subject_resolution,
+        "resolvedGeography": geography_resolution,
+        "resolvedTime": time_resolution,
+        "result": result,
+        "assistant_guidance": (
+            "This guided discovery path uses the chosen discovery mode as the user-facing entry point, "
+            "but final query construction still follows the configured policy priority."
+        ),
+    }
+
+
+@mcp.tool()
+async def plan_topic_query(
+    question: str,
+    flowQuery: str | None = None,
+    indicatorLimit: int = 10,
+    flowLimit: int = 200,
+) -> dict[str, Any]:
+    """
+    Plan a topical user question into an indicator-first SDMX workflow.
+
+    Use this as the first tool for questions about a phenomenon or metric such as
+    stunting, wasting, mortality, literacy, vaccination, or similar subject-matter topics.
+    This tool reads the configured query-dimension policy, highlights the highest-priority
+    required dimension, and returns ranked indicator candidates before any flow-level query.
+    Do not start with search_dataflows for topical questions unless the user explicitly asks
+    for a dataset or dataflow by name.
+    """
+    return await _plan_topic_query_impl(
+        question=question,
+        flowQuery=flowQuery,
+        indicatorLimit=indicatorLimit,
+        flowLimit=flowLimit,
+    )
 
 
 @mcp.tool()
@@ -3178,103 +3604,13 @@ async def find_indicator_candidates(
     "vaccination coverage in West Africa", call this before search_dataflows so the
     subject dimension is resolved before flow selection.
     """
-    q = (query or "").strip()
-    if not q:
-        return []
-
-    if flowRef:
-        payload = await _get_flow_structure(flowRef)
-        codes = _indicator_codes_from_payload(payload)
-        if not codes:
-            raise ValueError("INDICATOR dimension not found for this flow.")
-        return _ranked_code_matches(codes, q, limit=limit)
-
-    payload = await _cached_dataflows()
-    flows = _extract_scoped_dataflows(payload)
-    if flowQuery:
-        flow_q = flowQuery.strip().lower()
-        scored_flows: list[tuple[int, dict[str, Any]]] = []
-        for df in flows:
-            df_id = str(df.get("id") or df.get("ID") or "")
-            name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
-            desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
-            score = _match_score(f"{df_id} {name} {desc}".lower(), flow_q)
-            if score > 0:
-                scored_flows.append((score, df))
-        scored_flows.sort(key=lambda item: item[0], reverse=True)
-        flows = [item[1] for item in scored_flows]
-
-    if flowLimit > 0:
-        flows = flows[:flowLimit]
-
-    merged: dict[str, dict[str, Any]] = {}
-
-    for df in flows:
-        df_id = str(df.get("id") or df.get("ID") or "").strip()
-        if not df_id:
-            continue
-        agency = str(df.get("agencyID") or df.get("agencyId") or "all")
-        version = str(df.get("version") or "latest")
-        flow_ref = _flow_ref_for(df_id, version, agency)
-        flow_name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
-        flow_desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
-
-        try:
-            structure = await _get_flow_structure(flow_ref)
-        except Exception:
-            continue
-
-        codes = _indicator_codes_from_payload(structure)
-        if not codes:
-            continue
-        for item in _scored_code_matches(codes, q):
-            code_id = str(item.get("id") or "").strip()
-            if not code_id:
-                continue
-            bucket = merged.setdefault(
-                code_id,
-                {
-                    "id": code_id,
-                    "name": item.get("name") or "",
-                    "description": item.get("description") or "",
-                    "_score": int(item.get("_score") or 0),
-                    "dataflows": [],
-                },
-            )
-
-            item_score = int(item.get("_score") or 0)
-            if item_score > int(bucket.get("_score") or 0):
-                bucket["_score"] = item_score
-                bucket["name"] = item.get("name") or bucket.get("name") or ""
-                bucket["description"] = item.get("description") or bucket.get("description") or ""
-
-            flow_candidates: list[dict[str, Any]] = bucket["dataflows"]
-            if any(existing.get("flowRef") == flow_ref for existing in flow_candidates):
-                continue
-            flow_candidates.append(
-                {
-                    "flowRef": flow_ref,
-                    "agencyID": agency,
-                    "flowID": df_id,
-                    "flowName": flow_name,
-                    "flowDescription": flow_desc,
-                    "isCrossSectional": _is_cross_sectional_flow(df_id, flow_name, flow_desc),
-                }
-            )
-
-    ranked = sorted(
-        merged.values(),
-        key=lambda item: (int(item.get("_score") or 0), len(item.get("dataflows") or [])),
-        reverse=True,
-    )[:limit]
-
-    for item in ranked:
-        candidates = item.get("dataflows") or []
-        recommended = _pick_recommended_flow(candidates, q)
-        item["recommendedFlowRef"] = recommended.get("flowRef") if isinstance(recommended, dict) else None
-        item.pop("_score", None)
-
-    return ranked
+    return await _find_indicator_candidates_impl(
+        query=query,
+        flowRef=flowRef,
+        limit=limit,
+        flowQuery=flowQuery,
+        flowLimit=flowLimit,
+    )
 
 
 @mcp.tool()
@@ -3288,12 +3624,41 @@ async def search_indicators(
     """
     Alias for find_indicator_candidates with identical behavior and parameters.
     """
-    return await find_indicator_candidates(
+    return await _find_indicator_candidates_impl(
         query=query,
         flowRef=flowRef,
         limit=limit,
         flowQuery=flowQuery,
         flowLimit=flowLimit,
+    )
+
+
+@mcp.tool()
+async def guided_discover(
+    question: str,
+    discoveryMode: str,
+    flowQuery: str | None = None,
+    indicatorLimit: int = 10,
+    flowLimit: int = 200,
+    labels: str | None = "name",
+    resultShape: str = "topline_summary",
+) -> dict[str, Any]:
+    """
+    Execute a guided SDMX discovery flow from one of three user-facing entry modes:
+    subject, location, or time.
+
+    This tool is intended to be called after attaching one of the discovery resources.
+    The selected discovery mode is the visible user entry path, but backend query
+    construction still follows the configured query-dimension policy order.
+    """
+    return await _guided_discover_impl(
+        question=question,
+        discoveryMode=discoveryMode,
+        flowQuery=flowQuery,
+        indicatorLimit=indicatorLimit,
+        flowLimit=flowLimit,
+        labels=labels,
+        resultShape=resultShape,
     )
 
 
