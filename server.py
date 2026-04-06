@@ -3220,6 +3220,33 @@ def _query_args_from_resolved_inputs(resolved: dict[str, Any]) -> tuple[dict[str
     return filters, time_resolution, subject_resolution, geography_resolution
 
 
+def _ordered_flow_candidates_for_indicator(indicator_candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    recommended_flow_ref = str(indicator_candidate.get("recommendedFlowRef") or "").strip()
+    recommended_flow = indicator_candidate.get("recommendedFlow")
+    if recommended_flow_ref:
+        ordered.append(
+            {
+                "flowRef": recommended_flow_ref,
+                "flowSummary": recommended_flow if isinstance(recommended_flow, dict) else None,
+            }
+        )
+        seen.add(recommended_flow_ref)
+
+    for item in indicator_candidate.get("dataflows") or []:
+        if not isinstance(item, dict):
+            continue
+        flow_ref = str(item.get("flowRef") or "").strip()
+        if not flow_ref or flow_ref in seen:
+            continue
+        ordered.append({"flowRef": flow_ref, "flowSummary": item.get("flowSummary")})
+        seen.add(flow_ref)
+
+    return ordered
+
+
 async def _guided_discover_impl(
     *,
     question: str,
@@ -3253,8 +3280,8 @@ async def _guided_discover_impl(
         (item for item in indicator_candidates if isinstance(item, dict) and item.get("recommendedFlowRef")),
         indicator_candidates[0],
     )
-    flow_ref = str(selected_indicator.get("recommendedFlowRef") or "").strip()
-    if not flow_ref:
+    candidate_flows = _ordered_flow_candidates_for_indicator(selected_indicator)
+    if not candidate_flows:
         return {
             "status": "unresolved",
             "discoveryMode": _discovery_slug_for_role(normalized_mode),
@@ -3264,136 +3291,165 @@ async def _guided_discover_impl(
             "recommendedNextAction": "Refine the question or flowQuery, then retry guided_discover. Avoid generic flow search unless the user is explicitly asking for a dataset.",
             "assistant_guidance": "An indicator candidate was found, but no recommended flow could be selected.",
         }
-
-    payload = await _get_flow_structure(flow_ref)
-    geography_policy = _policy_for_role("geography")
-    geography_dimension = _dimension_for_policy(payload, geography_policy) if geography_policy else None
-    geography_candidates = await _search_reference_candidates(
-        flowRef=flow_ref,
-        query=question,
-        dimension=str(geography_dimension.get("id") or "") if geography_dimension else None,
-        limit=10,
-    )
-    selected_geography = next(
-        (item for item in geography_candidates if isinstance(item, dict) and item.get("kind") == "code"),
-        None,
-    )
-    if not selected_geography:
-        selected_geography = next((item for item in geography_candidates if isinstance(item, dict)), None)
-
+    attempt_history: list[dict[str, Any]] = []
     time_input = _time_input_from_question(question)
-    provided_inputs = {
-        "subject": str(selected_indicator.get("id") or ""),
-        "time": time_input,
-    }
-    if selected_geography and selected_geography.get("id"):
-        provided_inputs["location"] = str(selected_geography.get("id"))
+    geography_policy = _policy_for_role("geography")
 
-    time_resolution_error: str | None = None
-    try:
-        resolved = await _resolve_query_dimension_inputs(flow_ref, provided_inputs)
-    except Exception as exc:
-        payload_dimensions = {str(item.get("id") or "").upper() for item in _dimension_metadata(payload)}
-        if "TIME_PERIOD" not in payload_dimensions:
-            resolved = {
-                "subject": {
-                    "name": "subject",
-                    "role": "subject",
-                    "dimension_id": "",
-                    "values": [str(selected_indicator.get("id") or "")],
-                    "flowRef": flow_ref,
-                },
-                "_resolution_order": ["subject"],
-            }
-            if selected_geography and selected_geography.get("id"):
-                resolved["location"] = {
-                    "name": "location",
-                    "role": "geography",
-                    "dimension_id": str(geography_dimension.get("id") or "") if geography_dimension else "",
-                    "values": [str(selected_geography.get("id"))],
-                    "flowRef": flow_ref,
+    for candidate in candidate_flows:
+        flow_ref = str(candidate.get("flowRef") or "").strip()
+        if not flow_ref:
+            continue
+        payload = await _get_flow_structure(flow_ref)
+        geography_dimension = _dimension_for_policy(payload, geography_policy) if geography_policy else None
+        geography_candidates = await _search_reference_candidates(
+            flowRef=flow_ref,
+            query=question,
+            dimension=str(geography_dimension.get("id") or "") if geography_dimension else None,
+            limit=10,
+        )
+        selected_geography = next(
+            (item for item in geography_candidates if isinstance(item, dict) and item.get("kind") == "code"),
+            None,
+        )
+        if not selected_geography:
+            selected_geography = next((item for item in geography_candidates if isinstance(item, dict)), None)
+
+        provided_inputs = {
+            "subject": str(selected_indicator.get("id") or ""),
+            "time": time_input,
+        }
+        if selected_geography and selected_geography.get("id"):
+            provided_inputs["location"] = str(selected_geography.get("id"))
+
+        time_resolution_error: str | None = None
+        try:
+            resolved = await _resolve_query_dimension_inputs(flow_ref, provided_inputs)
+        except Exception as exc:
+            payload_dimensions = {str(item.get("id") or "").upper() for item in _dimension_metadata(payload)}
+            if "TIME_PERIOD" not in payload_dimensions:
+                resolved = {
+                    "subject": {
+                        "name": "subject",
+                        "role": "subject",
+                        "dimension_id": "",
+                        "values": [str(selected_indicator.get("id") or "")],
+                        "flowRef": flow_ref,
+                    },
+                    "_resolution_order": ["subject"],
                 }
-                resolved["_resolution_order"].append("location")
-            time_resolution_error = str(exc)
+                if selected_geography and selected_geography.get("id"):
+                    resolved["location"] = {
+                        "name": "location",
+                        "role": "geography",
+                        "dimension_id": str(geography_dimension.get("id") or "") if geography_dimension else "",
+                        "values": [str(selected_geography.get("id"))],
+                        "flowRef": flow_ref,
+                    }
+                    resolved["_resolution_order"].append("location")
+                time_resolution_error = str(exc)
+            else:
+                attempt_history.append(
+                    {
+                        "flowRef": flow_ref,
+                        "flowSummary": candidate.get("flowSummary"),
+                        "status": "resolution_error",
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+        if any(value.get("role") == "time" for key, value in resolved.items() if key != "_resolution_order"):
+            filters, time_resolution, subject_resolution, geography_resolution = _query_args_from_resolved_inputs(resolved)
         else:
+            coded_resolutions = [value for key, value in resolved.items() if key != "_resolution_order"]
+            filters = {}
+            subject_resolution = None
+            geography_resolution = None
+            for item in coded_resolutions:
+                values = item.get("values")
+                dimension_id = str(item.get("dimension_id") or "")
+                if dimension_id:
+                    filters[dimension_id] = values if values is not None else item.get("value")
+                if item.get("role") == "subject":
+                    subject_resolution = item
+                if item.get("role") == "geography":
+                    geography_resolution = item
+            time_resolution = _fallback_time_resolution(question)
+            time_resolution["flowRef"] = flow_ref
+
+        result = await _execute_query_data(
+            flowRef=flow_ref,
+            filters=filters,
+            startPeriod=time_resolution["startPeriod"],
+            endPeriod=time_resolution["endPeriod"],
+            lastNObservations=1 if time_resolution.get("useLatestObservation") else None,
+            format="csv",
+            labels=labels,
+            resultShape=effective_result_shape,
+            allowUnboundedTime=bool(time_resolution.get("useAllObservations")),
+        )
+
+        attempt_history.append(
+            {
+                "flowRef": flow_ref,
+                "flowSummary": candidate.get("flowSummary"),
+                "status": result.get("status"),
+                "selectedGeography": selected_geography,
+                "timeResolutionFallback": (
+                    {"used": True, "reason": time_resolution_error, "applied": time_resolution}
+                    if time_resolution_error
+                    else {"used": False}
+                ),
+                "error": result.get("error"),
+            }
+        )
+
+        if result.get("status") == "resolved":
             return {
-                "status": "unresolved",
+                "status": result.get("status"),
                 "discoveryMode": _discovery_slug_for_role(normalized_mode),
                 "question": question,
                 "plan": plan,
                 "selectedIndicator": selected_indicator,
                 "selectedFlowRef": flow_ref,
+                "selectedFlow": candidate.get("flowSummary") or selected_indicator.get("recommendedFlow"),
                 "selectedGeography": selected_geography,
+                "geographyCandidates": geography_candidates,
                 "timeInput": time_input,
-                "error": str(exc),
-                "recommendedNextAction": "Use the plan output to refine the question, then retry guided_discover. Only fall back to lower-level tools if this remains unresolved.",
-                "assistant_guidance": "The discovery plan found likely candidates, but policy-backed input resolution failed.",
+                "timeResolutionFallback": (
+                    {
+                        "used": True,
+                        "reason": time_resolution_error,
+                        "applied": time_resolution,
+                    }
+                    if time_resolution_error
+                    else {"used": False}
+                ),
+                "resolution": resolved,
+                "resolvedSubject": subject_resolution,
+                "resolvedGeography": geography_resolution,
+                "resolvedTime": time_resolution,
+                "attemptHistory": attempt_history,
+                "result": result,
+                "recommendedNextAction": (
+                    "Answer directly from result. Avoid search_dataflows, expand_ref_area_group, list_codes, or resolve_and_query_data unless the result is unresolved or missing a required slice."
+                ),
+                "assistant_guidance": (
+                    "This guided discovery path uses the chosen discovery mode as the user-facing entry point, "
+                    "but final query construction still follows the configured policy priority. "
+                    "If the result is resolved, answer from it directly instead of issuing more discovery calls."
+                ),
             }
 
-    if any(value.get("role") == "time" for key, value in resolved.items() if key != "_resolution_order"):
-        filters, time_resolution, subject_resolution, geography_resolution = _query_args_from_resolved_inputs(resolved)
-    else:
-        coded_resolutions = [value for key, value in resolved.items() if key != "_resolution_order"]
-        filters = {}
-        subject_resolution = None
-        geography_resolution = None
-        for item in coded_resolutions:
-            values = item.get("values")
-            dimension_id = str(item.get("dimension_id") or "")
-            if dimension_id:
-                filters[dimension_id] = values if values is not None else item.get("value")
-            if item.get("role") == "subject":
-                subject_resolution = item
-            if item.get("role") == "geography":
-                geography_resolution = item
-        time_resolution = _fallback_time_resolution(question)
-        time_resolution["flowRef"] = flow_ref
-
-    result = await _execute_query_data(
-        flowRef=flow_ref,
-        filters=filters,
-        startPeriod=time_resolution["startPeriod"],
-        endPeriod=time_resolution["endPeriod"],
-        lastNObservations=1 if time_resolution.get("useLatestObservation") else None,
-        format="csv",
-        labels=labels,
-        resultShape=effective_result_shape,
-        allowUnboundedTime=bool(time_resolution.get("useAllObservations")),
-    )
-
     return {
-        "status": result.get("status"),
+        "status": "unresolved_from_official_flows",
         "discoveryMode": _discovery_slug_for_role(normalized_mode),
         "question": question,
         "plan": plan,
         "selectedIndicator": selected_indicator,
-        "selectedFlowRef": flow_ref,
-        "selectedFlow": selected_indicator.get("recommendedFlow"),
-        "selectedGeography": selected_geography,
-        "geographyCandidates": geography_candidates,
-        "timeInput": time_input,
-        "timeResolutionFallback": (
-            {
-                "used": True,
-                "reason": time_resolution_error,
-                "applied": time_resolution,
-            }
-            if time_resolution_error
-            else {"used": False}
-        ),
-        "resolution": resolved,
-        "resolvedSubject": subject_resolution,
-        "resolvedGeography": geography_resolution,
-        "resolvedTime": time_resolution,
-        "result": result,
-        "recommendedNextAction": (
-            "Answer directly from result. Avoid search_dataflows, expand_ref_area_group, list_codes, or resolve_and_query_data unless the result is unresolved or missing a required slice."
-        ),
-        "assistant_guidance": (
-            "This guided discovery path uses the chosen discovery mode as the user-facing entry point, "
-            "but final query construction still follows the configured policy priority. "
-            "If the result is resolved, answer from it directly instead of issuing more discovery calls."
-        ),
+        "attemptHistory": attempt_history,
+        "recommendedNextAction": "Report that the indicator was found but no candidate flow resolved from the official flows. Do not guess a flow; refine flowQuery or inspect attemptHistory.",
+        "assistant_guidance": "The indicator candidate was found, but none of its candidate flows resolved from the official flows. Do not guess a flow.",
     }
 
 
