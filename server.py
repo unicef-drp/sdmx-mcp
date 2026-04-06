@@ -4119,8 +4119,37 @@ async def expand_ref_area_group(flowRef: str, refAreaCode: str) -> dict[str, Any
     }
 
 
-@mcp.tool()
-async def resolve_dimension_fallback(
+async def _validate_query_scope_impl(
+    *,
+    flowRef: str,
+    key: Optional[str] = None,
+    filters: dict[str, Any] | None = None,
+    startPeriod: Optional[str] = None,
+    endPeriod: Optional[str] = None,
+    lastNObservations: Optional[int] = None,
+    labels: Optional[str] = "name",
+) -> dict[str, Any]:
+    result = await _execute_query_data(
+        flowRef=flowRef,
+        key=key,
+        filters=filters,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        format="csv",
+        labels=labels,
+        maxObs=1,
+    )
+    return {
+        "status": result.get("status"),
+        "sourceScope": result.get("sourceScope"),
+        "provenance": result.get("provenance"),
+        "assistant_guidance": result.get("assistant_guidance"),
+        "error": result.get("error"),
+    }
+
+
+async def _resolve_dimension_fallback_impl(
     flowRef: str,
     dimension: str,
     code: str,
@@ -4143,7 +4172,7 @@ async def resolve_dimension_fallback(
 
     aggregate_filters = dict(filters or {})
     aggregate_filters[dimension_id] = code.strip()
-    aggregate_result = await validate_query_scope(
+    aggregate_result = await _validate_query_scope_impl(
         flowRef=flowRef,
         filters=aggregate_filters,
         startPeriod=startPeriod,
@@ -4184,7 +4213,7 @@ async def resolve_dimension_fallback(
     if member_ids:
         retry_filters = dict(filters or {})
         retry_filters[dimension_id] = member_ids
-        member_result = await validate_query_scope(
+        member_result = await _validate_query_scope_impl(
             flowRef=flowRef,
             filters=retry_filters,
             startPeriod=startPeriod,
@@ -4214,11 +4243,36 @@ async def resolve_dimension_fallback(
     return {
         "status": "unresolved_no_members",
         "dimension": dimension_id,
-        "reason": aggregate_result.get("error", {}).get("message") or "Aggregate dimension code did not resolve.",
         "aggregate": aggregate_result,
         "group": expansion,
-        "assistant_guidance": "The hierarchy resolved but no member expansion was available for retry.",
+        "assistant_guidance": "The hierarchy resolved, but no member codes were available for a retry plan.",
     }
+
+
+@mcp.tool()
+async def resolve_dimension_fallback(
+    flowRef: str,
+    dimension: str,
+    code: str,
+    filters: dict[str, Any] | None = None,
+    startPeriod: Optional[str] = None,
+    endPeriod: Optional[str] = None,
+    lastNObservations: Optional[int] = None,
+    labels: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Validate an aggregate dimension code and, when unresolved, return a hierarchy-based retry plan.
+    """
+    return await _resolve_dimension_fallback_impl(
+        flowRef=flowRef,
+        dimension=dimension,
+        code=code,
+        filters=filters,
+        startPeriod=startPeriod,
+        endPeriod=endPeriod,
+        lastNObservations=lastNObservations,
+        labels=labels,
+    )
 
 
 @mcp.tool()
@@ -4235,7 +4289,7 @@ async def resolve_ref_area_fallback(
     Validate an aggregate REF_AREA query and, when it does not resolve, return an official retry plan
     based on hierarchy-derived member REF_AREA codes.
     """
-    result = await resolve_dimension_fallback(
+    result = await _resolve_dimension_fallback_impl(
         flowRef=flowRef,
         dimension="REF_AREA",
         code=refAreaCode,
@@ -4315,24 +4369,15 @@ async def validate_query_scope(
     Preflight whether a concrete query resolves from the official UNICEF/UNPD flows.
     This is intended to fail early before any narrative answer is attempted.
     """
-    result = await query_data(
+    return await _validate_query_scope_impl(
         flowRef=flowRef,
         key=key,
         filters=filters,
         startPeriod=startPeriod,
         endPeriod=endPeriod,
         lastNObservations=lastNObservations,
-        format="csv",
         labels=labels,
-        maxObs=1,
     )
-    return {
-        "status": result.get("status"),
-        "sourceScope": result.get("sourceScope"),
-        "provenance": result.get("provenance"),
-        "assistant_guidance": result.get("assistant_guidance"),
-        "error": result.get("error"),
-    }
 
 
 @mcp.tool()
@@ -4391,7 +4436,7 @@ async def resolve_and_query_data(
         raise ValueError("filters must include at least one dimension.")
     allow_unbounded_time = (resultShape or "").strip().lower() in {"compact_series", "topline_summary"}
 
-    validation = await validate_query_scope(
+    validation = await _validate_query_scope_impl(
         flowRef=flowRef,
         filters=filters,
         startPeriod=startPeriod,
@@ -4400,7 +4445,7 @@ async def resolve_and_query_data(
         labels=labels,
     )
     if validation.get("status") == "resolved":
-        result = await query_data(
+        result = await _execute_query_data(
             flowRef=flowRef,
             filters=filters,
             startPeriod=startPeriod,
@@ -4426,7 +4471,7 @@ async def resolve_and_query_data(
 
     fallback_attempts: list[dict[str, Any]] = []
     for dimension_id, code in single_value_dimensions:
-        fallback = await resolve_dimension_fallback(
+        fallback = await _resolve_dimension_fallback_impl(
             flowRef=flowRef,
             dimension=dimension_id,
             code=code,
@@ -4443,7 +4488,7 @@ async def resolve_and_query_data(
         retry_filters = retry_plan.get("filters")
         if not isinstance(retry_filters, dict):
             continue
-        result = await query_data(
+        result = await _execute_query_data(
             flowRef=flowRef,
             filters=retry_filters,
             startPeriod=startPeriod,
