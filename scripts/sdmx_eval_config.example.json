@@ -1,0 +1,64 @@
+{
+  "registry": {
+    "base_url": "https://example.org/ws/public/sdmxapi/rest",
+    "user_agent": "sdmx-eval-runner/0.1",
+    "time_dimension_id": "TIME_PERIOD"
+  },
+  "mcp": {
+    "transport": "streamable-http",
+    "url": "https://example-mcp-host.example/mcp",
+    "server_label": "sdmx"
+  },
+  "concurrency": 8,
+  "registry_profile": "sparse",
+  "test_mode": "mixed",
+  "query_mode": {
+    "type": "last_n_observations",
+    "last_n_observations": 1
+  },
+  "negative_case_options": {
+    "ratio": 0.4,
+    "strategies": ["swap_dimension_value"],
+    "max_attempts_per_case": 20
+  },
+  "dataflows": [
+    "AGENCY/DATAFLOW/1.0"
+  ],
+  "dimensions": [
+    {
+      "id": "INDICATOR",
+      "mode": "external_codelist_intersection",
+      "codelist_url": "https://example.org/ws/public/sdmxapi/rest/codelist/AGENCY/CL_INDICATOR/1.0",
+      "max_values": 10
+    },
+    {
+      "id": "REF_AREA",
+      "mode": "external_codelist_intersection",
+      "codelist_url": "https://example.org/ws/public/sdmxapi/rest/codelist/AGENCY/CL_REF_AREA/1.0",
+      "max_values": 4
+    },
+    {
+      "id": "SEX",
+      "mode": "fixed",
+      "values": ["T"]
+    }
+  ],
+  "wildcard_dimensions": [],
+  "expected_value": {
+    "column_hint": "OBS_VALUE"
+  },
+  "prompt_template": "Using the SDMX MCP, what is the latest available value of {INDICATOR_name} in {REF_AREA_name}? Report the numeric value, the reported period, and the dataflow you used.",
+  "provider": {
+    "type": "command",
+    "name": "anthropic",
+    "api_key_env": "ANTHROPIC_API_KEY",
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1200,
+    "temperature": 0,
+    "command": [
+      "python3",
+      "scripts/sdmx_eval_provider_anthropic.py"
+    ],
+    "env": {}
+  }
+}

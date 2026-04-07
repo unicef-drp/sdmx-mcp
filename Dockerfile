@@ -3,15 +3,16 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     FASTMCP_JSON_RESPONSE=true \
-    FASTMCP_STATELESS_HTTP=true
+    FASTMCP_STATELESS_HTTP=true \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
 COPY pyproject.toml uv.lock* ./
-RUN pip install --upgrade pip
+RUN pip install --upgrade pip uv
 
 COPY . .
-RUN pip install --no-cache-dir .
+RUN uv sync --frozen --no-dev --no-cache
 
 EXPOSE 8000
 

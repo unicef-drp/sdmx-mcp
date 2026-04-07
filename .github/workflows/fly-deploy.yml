@@ -1,18 +1,24 @@
-# See https://fly.io/docs/app-guides/continuous-deployment-with-github-actions/
+# Manual Fly deploy template for downstream branches.
+# Generic main intentionally does not auto-deploy on push.
 
 name: Fly Deploy
 on:
-  push:
-    branches:
-      - unicef
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "Fly config file to deploy"
+        required: false
+        default: "fly.toml"
+
 jobs:
   deploy:
     name: Deploy app
     runs-on: ubuntu-latest
-    concurrency: deploy-group    # optional: ensure only one action runs at a time
+    concurrency: fly-deploy-${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --remote-only
+      - name: Deploy app
+        run: flyctl deploy --remote-only --config "${{ inputs.config }}"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

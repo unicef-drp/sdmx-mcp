@@ -1,0 +1,49 @@
+{
+  "default_query_dimensions": [
+    {
+      "name": "subject",
+      "role": "subject",
+      "required_for_retrieval": true,
+      "priority": 1,
+      "discovery_label": "Discover by Subject",
+      "discovery_description": "Start with the phenomenon, metric, or topic and let the system find the best indicator and flow.",
+      "example_prompts": [
+        "Tell me about an indicator in a region.",
+        "Show me education coverage for a country group."
+      ],
+      "preferred_sources": [
+        { "type": "codelist", "id": "AGENCY/CL_INDICATOR/1.0" }
+      ]
+    },
+    {
+      "name": "location",
+      "role": "geography",
+      "required_for_retrieval": true,
+      "priority": 2,
+      "discovery_label": "Discover by Location",
+      "discovery_description": "Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
+      "example_prompts": [
+        "Tell me about an indicator in a region.",
+        "Compare an indicator across a country group."
+      ],
+      "preferred_sources": [
+        { "type": "codelist", "id": "AGENCY/CL_REF_AREA/1.0" },
+        { "type": "hierarchical_codelist", "id": "AGENCY/REPORTING_REGIONS/1.0" }
+      ],
+      "allow_hierarchy_resolution": true,
+      "allow_member_expansion": true
+    },
+    {
+      "name": "time",
+      "role": "time",
+      "required_for_retrieval": true,
+      "priority": 3,
+      "discovery_label": "Discover by Time",
+      "discovery_description": "Start with the period or trend you want and let the system resolve the right subject, flow, and location slice.",
+      "example_prompts": [
+        "What changed over time for an indicator in a region?",
+        "Show the latest values for this topic."
+      ]
+    }
+  ]
+}
