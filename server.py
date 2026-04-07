@@ -2,6 +2,7 @@ import logging
 import csv
 import json
 import os
+import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -42,6 +43,27 @@ HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "unicef-sdmx-mcp/0.1")
 AGENCY_ALLOWLIST = {item.strip() for item in os.getenv("SDMX_AGENCY_ALLOWLIST", "").split(",") if item.strip()}
 
 mcp = FastMCP("unicef-sdmx")
+
+QUERY_STOPWORDS = {
+    "about",
+    "chart",
+    "current",
+    "dashboard",
+    "data",
+    "give",
+    "latest",
+    "level",
+    "levels",
+    "make",
+    "most",
+    "recent",
+    "show",
+    "table",
+    "tell",
+    "the",
+    "widget",
+    "with",
+}
 
 # Starter mapping for common flow id prefixes to human-friendly labels.
 FALLBACK_THEME_PREFIX_MAP: dict[str, str] = {
@@ -443,20 +465,23 @@ def _coerce_text(value: Any) -> str:
 
 
 def _query_tokens(query: str) -> list[str]:
-    tokens = [part.strip().lower() for part in query.replace("/", " ").split() if part.strip()]
-    return [token for token in tokens if len(token) >= 3]
+    tokens = re.findall(r"[a-z0-9]+", (query or "").lower())
+    return [token for token in tokens if len(token) >= 3 and token not in QUERY_STOPWORDS]
 
 
 def _match_score(text: str, query: str) -> int:
     q = (query or "").strip().lower()
     if not q:
         return 0
-    if q in text:
-        return len(q.split())
     tokens = _query_tokens(q)
     if not tokens:
         return 0
-    score = sum(1 for token in tokens if token in text)
+    text_tokens = set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+    score = sum(1 for token in tokens if token in text_tokens)
+    normalized_query = " ".join(tokens)
+    normalized_text = " ".join(re.findall(r"[a-z0-9]+", (text or "").lower()))
+    if normalized_query and normalized_query in normalized_text:
+        score += len(tokens)
     return score
 
 
