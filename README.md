@@ -4,14 +4,19 @@ MCP server for the UNICEF SDMX warehouse (`https://sdmx.data.unicef.org/ws/publi
 
 This project lets an LLM client do a full guided data journey:
 - pick agency
-- discover/select dataflow
+- discover by subject, location, or time
+- select a dataflow through guided indicator-first planning
 - inspect dimensions and codelists
 - rank candidate indicators
-- query data (CSV or SDMX-JSON)
+- query data with CSV transport for SDMX `/data` payloads
 
 ## What This Repo Contains
 
 - `server.py`: MCP tools and SDMX integration logic.
+- `query_dimension_policy.json`: default subject/location/time query-dimension policy.
+- `query_dimension_policy.example.json`: example query-dimension policy.
+- `discovery_policy.json`: default discovery ranking policy for stopwords and topic-to-flow hints.
+- `discovery_policy.example.json`: example discovery ranking policy.
 - `scripts/agent_test_rig.py`: direct tool-call harness that simulates an agent workflow.
 - `scripts/sdmx_eval_runner.py`: generic SDMX eval harness for case generation, provider execution, and grading.
 - `scripts/sdmx_eval_config.example.json`: example config for deterministic case generation and provider runs.
@@ -32,6 +37,7 @@ UV_CACHE_DIR="$PWD/.uv-cache" uv run fastmcp run server.py --transport stdio
 
 Runtime config is loaded from `.env` automatically when present.
 Policy config is auto-discovered from `query_dimension_policy.json` when `SDMX_QUERY_DIMENSION_POLICY_FILE` is not set.
+Discovery ranking config is auto-discovered from `discovery_policy.json` when `SDMX_DISCOVERY_POLICY_FILE` is not set.
 
 HTTP mode (local):
 
@@ -57,6 +63,8 @@ docker build -t sdmx-mcp:latest .
 docker run --rm -p 8000:8000 sdmx-mcp:latest
 ```
 
+Docker installs dependencies with `uv sync --frozen --no-dev --no-cache`, so builds use `uv.lock` rather than resolving floating dependency versions from PyPI.
+
 Container command uses:
 - `fastmcp run server.py --transport streamable-http --path /mcp`
 
@@ -64,8 +72,10 @@ Container command uses:
 
 ```bash
 fly auth login
-fly deploy --build-arg UV_CACHE_DIR=/app/.uv-cache
+fly deploy
 ```
+
+Fly deploys use the same Dockerfile and locked dependency install. The app may intentionally autostop depending on `fly.toml` settings.
 
 Feature-branch draft deploy:
 
@@ -87,43 +97,52 @@ curl -sS --max-time 20 -X POST https://sdmx-mcp.fly.dev/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-## MCP Tools (Function Catalog)
+## MCP Surface
 
-All tools are defined in `server.py`.
+Tools and resources are defined in `server.py`.
 
 ## MCP Resources
 
-The server now exposes read-only MCP resources for deterministic metadata, configuration, and basic retrieval:
+The server intentionally exposes only guided discovery resources. Earlier metadata/data resources were removed because some MCP clients expose all resources directly to users and then fail or create redundant tool paths.
 
-- `sdmx://dataflows`
-- `sdmx://dataflows/{dataflow_id}/dimensions`
-- `sdmx://codelists/{id}`
-- `sdmx://hierarchical-codelists/{id}`
-- `sdmx://query-dimension-policy`
-- `sdmx://observations/{dataflow_id}/{indicator}/{geography}/{time_range}`
+Current resources:
+
+- `sdmx://discover/subject` (`Discover by Subject`)
+- `sdmx://discover/location` (`Discover by Location`)
+- `sdmx://discover/time` (`Discover by Time`)
 
 Use resources for:
-- metadata discovery
-- codelist lookup
-- hierarchy inspection
-- query-policy inspection
-- basic observation retrieval
+- giving the user an intentional entry point
+- instructing the client to call `guided_discover(...)`
+- showing example prompts and configured policy sources
 
 Use tools for:
 - query planning
+- metadata discovery
+- codelist lookup
+- hierarchy inspection
 - hierarchy resolution and fallback planning
 - shaped retrieval
 - comparison, aggregation, or other procedural work
 
-`dataflow_id`, `id`, and hierarchy identifiers can be passed as bare IDs when the registry can resolve them, or as `AGENCY,ID,VERSION` when the caller needs an explicit SDMX reference.
+Discovery mode is the user-facing entry path only. The backend still resolves subject, location, and time according to the configured query policy.
 
-## Query Semantics Policy
+## Configuration
 
-The server now has a configuration-driven query-dimension policy layer. By default it defines three query dimensions in priority order:
+Configuration is split into two policy files:
+
+- `query_dimension_policy.json`: what dimensions matter and how to resolve them
+- `discovery_policy.json`: how natural-language discovery is scored and routed
+
+This separation is intentional. A registry owner can configure the SDMX semantics independently from search/ranking heuristics.
+
+### Query Dimension Policy
+
+The query-dimension policy defines the retrieval dimensions and their resolution order. The default policy defines:
 
 - `subject`
-- `time`
 - `location`
+- `time`
 
 Time is special and resolves against the `TIME_PERIOD` dimension directly. Other important query dimensions are expected to point at SDMX codelists or hierarchical codelists through policy configuration.
 
@@ -135,26 +154,31 @@ Override it with either:
 
 An example file is included at `query_dimension_policy.example.json`.
 
-Discovery ranking has its own lightweight policy so registry-specific language does not have to be hardcoded. By default the server auto-loads `discovery_policy.json`; override it with:
-
-- `SDMX_DISCOVERY_POLICY_JSON`
-- `SDMX_DISCOVERY_POLICY_FILE`
-
-An example file is included at `discovery_policy.example.json`. It controls:
-
-- `query_stopwords`: generic prompt words ignored during candidate scoring, such as `tell`, `show`, or `level`
-- `flow_topic_hints`: registry-specific term groups that prefer matching dataflow IDs, such as nutrition terms preferring `NUTRITION`
-
 Example UNICEF-oriented policy:
 
 ```json
 {
   "default_query_dimensions": [
     {
+      "name": "subject",
+      "role": "subject",
+      "required_for_retrieval": true,
+      "priority": 1,
+      "discovery_label": "Discover by Subject",
+      "discovery_description": "Start with the phenomenon, metric, or topic and let the system find the best indicator and flow.",
+      "example_prompts": [
+        "Tell me about stunting in Latin America.",
+        "Show me vaccination coverage in West Africa."
+      ],
+      "preferred_sources": [
+        {"type": "codelist", "id": "UNICEF/CL_UNICEF_INDICATOR/1.0"}
+      ]
+    },
+    {
       "name": "location",
       "role": "geography",
       "required_for_retrieval": true,
-      "priority": 1,
+      "priority": 2,
       "discovery_label": "Discover by Location",
       "discovery_description": "Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
       "example_prompts": [
@@ -167,21 +191,6 @@ Example UNICEF-oriented policy:
       ],
       "allow_hierarchy_resolution": true,
       "allow_member_expansion": true
-    },
-    {
-      "name": "subject",
-      "role": "subject",
-      "required_for_retrieval": true,
-      "priority": 2,
-      "discovery_label": "Discover by Subject",
-      "discovery_description": "Start with the phenomenon, metric, or topic and let the system find the best indicator and flow.",
-      "example_prompts": [
-        "Tell me about stunting in Latin America.",
-        "Show me vaccination coverage in West Africa."
-      ],
-      "preferred_sources": [
-        {"type": "codelist", "id": "UNICEF/CL_UNICEF_INDICATOR/1.0"}
-      ]
     },
     {
       "name": "time",
@@ -216,12 +225,58 @@ Optional policy fields for each query dimension:
 
 Discovery mode is the user-facing entry path only. Final query construction still honors policy `priority`.
 
-For `observations`, `time_range` can be:
+### Discovery Ranking Policy
+
+The discovery ranking policy controls generic text-scoring behavior. By default the server auto-loads `discovery_policy.json`.
+
+Override it with either:
+
+- `SDMX_DISCOVERY_POLICY_JSON`
+- `SDMX_DISCOVERY_POLICY_FILE`
+
+An example file is included at `discovery_policy.example.json`.
+
+Supported fields:
+
+- `query_stopwords`: generic prompt words ignored during candidate scoring, such as `tell`, `show`, or `level`
+- `flow_topic_hints`: registry-specific term groups that prefer matching dataflow IDs, such as nutrition terms preferring `NUTRITION`
+
+Example:
+
+```json
+{
+  "query_stopwords": ["tell", "show", "level", "latest", "table"],
+  "flow_topic_hints": [
+    {
+      "terms": ["bmi", "nutrition", "obesity", "stunting", "wasting"],
+      "preferred_flow_markers": ["NUTRITION"]
+    },
+    {
+      "terms": ["education", "learning", "school"],
+      "preferred_flow_markers": ["EDUCATION"]
+    }
+  ]
+}
+```
+
+`preferred_flow_markers` are matched against flow IDs and flow refs, so a marker like `NUTRITION` matches `UNICEF/NUTRITION/1.0`.
+
+### Data Transport
+
+All SDMX `/data` calls are fetched as CSV for efficiency and simpler downstream parsing. This applies to `query_data`, `validate_query_scope`, `resolve_and_query_data`, and `guided_discover`.
+
+Structure and discovery tools still return JSON objects because SDMX structures, codelists, and hierarchy metadata are JSON-shaped in this server.
+
+If a caller requests a non-CSV data format, the response records the requested format and the CSV override in `notes`.
+
+Time inputs accepted by the query policy can be:
 
 - an explicit range like `2004:2024`, which becomes `startPeriod` and `endPeriod`
 - a single period like `2024`, which becomes `startPeriod=2024&endPeriod=2024`
 - `latest`, which uses `lastNObservations=1`
 - `all`, `trend`, `series`, `chart`, `graph`, or `table`, which omit both time parameters and `lastNObservations`
+
+## Tool Reference
 
 1. `list_agencies(limit=50)`
 - Purpose: list agencies discovered from SDMX dataflows.
