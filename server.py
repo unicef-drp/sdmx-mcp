@@ -38,11 +38,42 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(REPO_ROOT / ".env")
 
-BASE = os.getenv("SDMX_BASE_URL", "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest")
-HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "unicef-sdmx-mcp/0.1")
-AGENCY_ALLOWLIST = {item.strip() for item in os.getenv("SDMX_AGENCY_ALLOWLIST", "").split(",") if item.strip()}
+BASE = os.getenv("SDMX_BASE_URL", "").strip().rstrip("/")
+MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
+HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "sdmx-mcp/0.1").strip() or "sdmx-mcp/0.1"
 
-mcp = FastMCP("unicef-sdmx")
+
+def _env_csv(name: str) -> list[str]:
+    raw = os.getenv(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _env_regex(name: str) -> re.Pattern[str] | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    return re.compile(raw, re.IGNORECASE)
+
+
+FLOW_ID_ALLOW_RE = _env_regex("SDMX_DATAFLOW_ID_ALLOW_REGEX")
+FLOW_ID_DENY_RE = _env_regex("SDMX_DATAFLOW_ID_DENY_REGEX")
+FLOW_ID_ALLOW_PREFIXES = tuple(_env_csv("SDMX_DATAFLOW_ID_ALLOW_PREFIXES"))
+FLOW_ID_DENY_PREFIXES = tuple(_env_csv("SDMX_DATAFLOW_ID_DENY_PREFIXES"))
+AGENCY_ALLOWLIST = set(_env_csv("SDMX_AGENCY_ALLOWLIST"))
+EXCLUDE_DRAFT = os.getenv("SDMX_EXCLUDE_DRAFT", "").strip().lower() in {"1", "true", "yes", "on"}
+SCOPE_ACTIVE = any(
+    [
+        FLOW_ID_ALLOW_RE,
+        FLOW_ID_DENY_RE,
+        FLOW_ID_ALLOW_PREFIXES,
+        FLOW_ID_DENY_PREFIXES,
+        AGENCY_ALLOWLIST,
+        EXCLUDE_DRAFT,
+    ]
+)
+ENFORCE_SCOPE = os.getenv("SDMX_ENFORCE_SCOPE", "").strip().lower() in {"1", "true", "yes", "on"} if os.getenv("SDMX_ENFORCE_SCOPE") else SCOPE_ACTIVE
+
+mcp = FastMCP(MCP_NAME)
 
 DEFAULT_DISCOVERY_STOPWORDS = [
     "about",
@@ -65,40 +96,10 @@ DEFAULT_DISCOVERY_STOPWORDS = [
     "with",
 ]
 
-DEFAULT_FLOW_TOPIC_HINTS = [
-    {
-        "terms": ["bmi", "malnutrition", "nutrition", "obesity", "overweight", "stunting", "underweight", "wasting"],
-        "preferred_flow_markers": ["NUTRITION"],
-    },
-    {
-        "terms": ["education", "learning", "literacy", "school", "schools"],
-        "preferred_flow_markers": ["EDUCATION"],
-    },
-    {
-        "terms": ["hygiene", "sanitation", "wash", "water"],
-        "preferred_flow_markers": ["WASH"],
-    },
-    {
-        "terms": ["immunisation", "immunization", "vaccine", "vaccination"],
-        "preferred_flow_markers": ["IMMUNISATION"],
-    },
-    {
-        "terms": ["mortality", "death", "deaths"],
-        "preferred_flow_markers": ["CME", "CAUSE_OF_DEATH"],
-    },
-]
+DEFAULT_FLOW_TOPIC_HINTS = []
 
-# Starter mapping for common flow id prefixes to human-friendly labels.
-FALLBACK_THEME_PREFIX_MAP: dict[str, str] = {
-    "PT": "Child Protection",
-    "NUTRITION": "Nutrition",
-    "EDU": "Education",
-    "WASH": "Water, Sanitation and Hygiene",
-    "MICS": "Multiple Indicator Cluster Surveys",
-    "HIV": "HIV and AIDS",
-    "IMM": "Immunization",
-    "MCH": "Maternal and Child Health",
-}
+# Optional mapping from flow id prefixes to human-friendly labels.
+FALLBACK_THEME_PREFIX_MAP: dict[str, str] = {}
 THEME_PREFIX_CSV = Path(__file__).resolve().parent / "theme_prefixes_domain.csv"
 
 # Small caches to keep things fast and reduce load.
@@ -109,6 +110,22 @@ _codelist_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 _hierarchical_codelist_cache = TTLCache(maxsize=32, ttl=60 * 60 * 24)  # 24h
 _hierarchical_codelist_detail_cache = TTLCache(maxsize=32, ttl=60 * 60 * 24)  # 24h
 _hierarchical_catalog_cache = TTLCache(maxsize=8, ttl=60 * 60 * 24)  # 24h
+
+
+def _sdmx_base() -> str:
+    if not BASE:
+        raise ValueError("SDMX_BASE_URL must be set to the base URL of an SDMX REST API.")
+    return BASE
+
+
+def _theme_prefix_csv_path() -> Path:
+    raw_path = os.getenv("SDMX_THEME_PREFIX_CSV", "").strip()
+    if not raw_path:
+        return REPO_ROOT / ".disabled-theme-prefixes.csv"
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return REPO_ROOT / path
 
 
 @dataclass(slots=True)
@@ -187,10 +204,9 @@ def _default_query_dimension_policy() -> QueryDimensionPolicyConfig:
                 role="subject",
                 required_for_retrieval=True,
                 priority=1,
-                preferred_sources=[QueryDimensionSource(type="codelist", id="UNICEF/CL_INDICATOR/latest")],
                 discovery_label="Discover by Subject",
                 discovery_description="Start with the phenomenon, metric, or topic you care about and let the system find the best indicator and flow.",
-                example_prompts=["Tell me about stunting in Latin America.", "Show me vaccination coverage in West Africa."],
+                example_prompts=["Tell me about a health indicator in a region.", "Show me education coverage for a country group."],
             ),
             QueryDimensionPolicyEntry(
                 name="time",
@@ -199,19 +215,18 @@ def _default_query_dimension_policy() -> QueryDimensionPolicyConfig:
                 priority=2,
                 discovery_label="Discover by Time",
                 discovery_description="Start with the period or trend you want and let the system resolve the right subject, flow, and location slice.",
-                example_prompts=["What changed over time for under-five mortality in South Asia?", "Show the latest nutrition indicators."],
+                example_prompts=["What changed over time for an indicator in a region?", "Show the latest values for this topic."],
             ),
             QueryDimensionPolicyEntry(
                 name="location",
                 role="geography",
                 required_for_retrieval=True,
                 priority=3,
-                preferred_sources=[QueryDimensionSource(type="codelist", id="UNICEF/CL_GEO/latest")],
                 allow_hierarchy_resolution=True,
                 allow_member_expansion=True,
                 discovery_label="Discover by Location",
                 discovery_description="Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
-                example_prompts=["Tell me about stunting in Latin America.", "Compare child mortality in South Asia."],
+                example_prompts=["Tell me about an indicator in a region.", "Compare an indicator across a country group."],
             ),
         ]
     )
@@ -502,28 +517,31 @@ def _source_scope() -> dict[str, Any]:
     agencies = sorted(AGENCY_ALLOWLIST) if AGENCY_ALLOWLIST else []
     return {
         "allowedAgencies": agencies,
+        "flowIdAllowPrefixes": list(FLOW_ID_ALLOW_PREFIXES),
+        "flowIdDenyPrefixes": list(FLOW_ID_DENY_PREFIXES),
+        "flowIdAllowRegex": FLOW_ID_ALLOW_RE.pattern if FLOW_ID_ALLOW_RE else None,
+        "flowIdDenyRegex": FLOW_ID_DENY_RE.pattern if FLOW_ID_DENY_RE else None,
+        "excludeDraft": EXCLUDE_DRAFT,
         "policy": "Use only observations returned from these official SDMX flows. If unresolved, do not supplement with external facts.",
     }
 
 
 def _dataflow_url() -> str:
-    # UNICEF service builder defaults to SDMX 2.1 (XML), but FastMCP expects JSON for parsing.
-    return f"{BASE}/dataflow/all/all/latest/?format=sdmx-json&detail=full&references=none"
+    # Request SDMX-JSON explicitly for predictable parsing across registries.
+    return f"{_sdmx_base()}/dataflow/all/all/latest/?format=sdmx-json&detail=full&references=none"
 
 
 def _structure_url(flow_ref: str) -> str:
-    # Practical approach: fetch dataflow with references=all to pull back related structures (DSD, codelists).
-    # UNICEF documentation describes this approach. :contentReference[oaicite:5]{index=5}
-    # flow_ref should typically look like: AGENCY:FLOW_ID(VERSION) or similar; keep it simple early.
-    return f"{BASE}/dataflow/{_flow_path_for(flow_ref)}/?format=sdmx-json&detail=full&references=all"
+    # Fetch related structures (DSD, codelists) in one request when supported.
+    return f"{_sdmx_base()}/dataflow/{_flow_path_for(flow_ref)}/?format=sdmx-json&detail=full&references=all"
 
 
 def _codelist_url(codelist_ref: str) -> str:
-    return f"{BASE}/codelist/{_flow_path_for(codelist_ref)}/?format=sdmx-json&detail=full"
+    return f"{_sdmx_base()}/codelist/{_flow_path_for(codelist_ref)}/?format=sdmx-json&detail=full"
 
 
 def _hierarchical_codelist_url(agency: str, hierarchical_codelist_id: str, version: str = "latest") -> str:
-    return f"{BASE}/hierarchicalcodelist/{quote(agency)}/{quote(hierarchical_codelist_id)}/{quote(version)}"
+    return f"{_sdmx_base()}/hierarchicalcodelist/{quote(agency)}/{quote(hierarchical_codelist_id)}/{quote(version)}"
 
 
 def _encode_flow_path(flow_ref: str) -> str:
@@ -630,6 +648,32 @@ def _is_cross_sectional_flow(df_id: str, name: str = "", description: str = "") 
     return any(marker in text for marker in ("cross-sectional", "cross sectional", "cross_sectional"))
 
 
+def _is_draft_flow(df_id: str, name: str = "", description: str = "") -> bool:
+    text = f"{df_id} {name} {description}".upper()
+    return "DRAFT" in text
+
+
+def _flow_in_scope(df_id: str, agency: str = "", name: str = "", description: str = "") -> bool:
+    flow_id = (df_id or "").strip()
+    agency_id = (agency or "").strip()
+    if not flow_id:
+        return False
+    upper_flow = flow_id.upper()
+    if AGENCY_ALLOWLIST and agency_id not in AGENCY_ALLOWLIST:
+        return False
+    if EXCLUDE_DRAFT and _is_draft_flow(flow_id, name, description):
+        return False
+    if FLOW_ID_ALLOW_PREFIXES and not any(upper_flow.startswith(prefix.upper()) for prefix in FLOW_ID_ALLOW_PREFIXES):
+        return False
+    if FLOW_ID_DENY_PREFIXES and any(upper_flow.startswith(prefix.upper()) for prefix in FLOW_ID_DENY_PREFIXES):
+        return False
+    if FLOW_ID_ALLOW_RE and not FLOW_ID_ALLOW_RE.search(flow_id):
+        return False
+    if FLOW_ID_DENY_RE and FLOW_ID_DENY_RE.search(flow_id):
+        return False
+    return True
+
+
 def _flow_topic_score(item: dict[str, Any], query: str, indicator_text: str = "") -> int:
     flow_name = str(item.get("flowName") or "")
     flow_desc = str(item.get("flowDescription") or "")
@@ -653,12 +697,10 @@ def _pick_recommended_flow(candidates: list[dict[str, Any]], query: str, indicat
         return None
 
     def _rank(item: dict[str, Any]) -> tuple[int, int, int, str]:
-        agency = str(item.get("agencyID") or "")
         flow_id = str(item.get("flowID") or "")
         flow_score = _flow_topic_score(item, query, indicator_text)
         cross_penalty = 1 if item.get("isCrossSectional") else 0
-        unicef_bonus = 1 if agency == "UNICEF" else 0
-        return (flow_score, unicef_bonus, -cross_penalty, flow_id)
+        return (flow_score, -cross_penalty, 0, flow_id)
 
     return max(candidates, key=_rank)
 
@@ -686,12 +728,15 @@ def _extract_dataflows(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _extract_scoped_dataflows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     flows = _extract_dataflows(payload)
-    if not AGENCY_ALLOWLIST:
-        return flows
     scoped: list[dict[str, Any]] = []
     for df in flows:
+        df_id = df.get("id") or df.get("ID")
+        if not isinstance(df_id, str):
+            continue
         agency = df.get("agencyID") or df.get("agencyId")
-        if isinstance(agency, str) and agency in AGENCY_ALLOWLIST:
+        name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
+        desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
+        if _flow_in_scope(df_id, agency=str(agency or ""), name=name, description=desc):
             scoped.append(df)
     return scoped
 
@@ -806,7 +851,7 @@ def _theme_prefix_conflicts_from_csv(path: Path) -> list[dict[str, Any]]:
 
 
 def _default_theme_prefix_map() -> dict[str, str]:
-    from_csv = _load_theme_prefix_map_from_csv(THEME_PREFIX_CSV)
+    from_csv = _load_theme_prefix_map_from_csv(_theme_prefix_csv_path())
     if not from_csv:
         return dict(FALLBACK_THEME_PREFIX_MAP)
     merged = dict(FALLBACK_THEME_PREFIX_MAP)
@@ -913,8 +958,7 @@ async def _data_path_for_query(flow_ref: str) -> str:
         elif len(matches) == 1:
             selected = matches[0]
         elif matches:
-            # Stable preference for UNICEF flows when agency is ambiguous.
-            selected = next((item for item in matches if item[0] == "UNICEF"), matches[0])
+            selected = matches[0]
 
         if selected:
             selected_agency, selected_version = selected
@@ -1223,10 +1267,10 @@ def _unresolved_response(
     payload.update(
         {
             "status": "unresolved_from_official_flows",
-            "assistant_guidance": "Do not supplement this with non-MCP facts. State that the UNICEF/UNPD flow query did not resolve and report the attempted flow, key, and query URL.",
+            "assistant_guidance": "Do not supplement this with non-MCP facts. State that the configured SDMX flow query did not resolve and report the attempted flow, key, and query URL.",
             "error": {
                 "status": status_code,
-                "message": message or _parse_sdmx_error(raw_text) or "Query did not resolve from official UNICEF/UNPD flows.",
+                "message": message or _parse_sdmx_error(raw_text) or "Query did not resolve from the configured SDMX service.",
                 "raw": raw_text,
             },
             "notes": {"maxObs": maxObs, "format": format, "labels": labels},
@@ -1696,18 +1740,22 @@ def _ref_area_hierarchy(payload: dict[str, Any]) -> dict[str, set[str]]:
     return edges
 
 
-async def _official_reporting_region_hierarchy() -> dict[str, set[str]]:
-    cache_key = "UNICEF/UNICEF_REPORTING_REGIONS/1.0"
+async def _configured_ref_area_hierarchy() -> tuple[dict[str, set[str]], str]:
+    hierarchy_ref = os.getenv("SDMX_REF_AREA_HIERARCHY_REF", "").strip()
+    if not hierarchy_ref:
+        return {}, ""
+    agency, hierarchy_id, version = _flow_identifiers(hierarchy_ref)
+    cache_key = f"{agency}/{hierarchy_id}/{version}"
     if cache_key in _hierarchical_codelist_cache:
-        return _hierarchical_codelist_cache[cache_key]
-    url = _hierarchical_codelist_url("UNICEF", "UNICEF_REPORTING_REGIONS", "1.0")
+        return _hierarchical_codelist_cache[cache_key], hierarchy_ref
+    url = _hierarchical_codelist_url(agency, hierarchy_id, version)
     status, text = await _get_text_with_status(url)
     if status >= 400:
-        return {}
+        return {}, hierarchy_ref
     edges = _hierarchical_edges_from_xml(text)
     if edges:
         _hierarchical_codelist_cache[cache_key] = edges
-    return edges
+    return edges, hierarchy_ref
 
 
 async def _list_hierarchical_codelists_for_agency(agency: str) -> list[dict[str, Any]]:
@@ -1759,9 +1807,6 @@ def _hierarchy_dimension_candidates(
         if codelist_key and codelist_key in text:
             score += 40
             reasons.append("hierarchy id/name matches the dimension codelist")
-        if dim_id == "REF_AREA" and hierarchy_id.upper() == "UNICEF_REPORTING_REGIONS":
-            score += 60
-            reasons.append("official UNICEF reporting-regions hierarchy is preferred for REF_AREA")
         if score > 0:
             matches.append(
                 {
@@ -1992,9 +2037,9 @@ async def _search_reference_candidates(
 
 
 async def _preferred_ref_area_hierarchy(payload: dict[str, Any]) -> tuple[dict[str, set[str]], str]:
-    official = await _official_reporting_region_hierarchy()
-    if official:
-        return official, _hierarchical_codelist_url("UNICEF", "UNICEF_REPORTING_REGIONS", "1.0")
+    configured, hierarchy_ref = await _configured_ref_area_hierarchy()
+    if configured:
+        return configured, hierarchy_ref
     return _ref_area_hierarchy(payload), "structure-payload-fallback"
 
 
@@ -2027,10 +2072,6 @@ def _hierarchy_match_score(
     if "region" in hierarchy_text and ("AREA" in dimension_upper or dimension_upper == "REF_AREA"):
         score += 10
         reasons.append("hierarchy looks geographically relevant to REF_AREA")
-    if dimension_upper == "REF_AREA" and hierarchy_id.upper() == "UNICEF_REPORTING_REGIONS":
-        score += 40
-        reasons.append("official UNICEF reporting-regions hierarchy is preferred for REF_AREA")
-
     return score, {
         "matchedDescendantCount": len(requested_descendants),
         "matchedDescendants": requested_descendants,
@@ -2290,7 +2331,7 @@ async def _query_plan(
     params.append(f"format={quote(effective_format)}")
     if effective_labels:
         params.append(f"labels={quote(effective_labels)}")
-    url = f"{BASE}/data/{flow_path}/{quote(key, safe='+.')}?{'&'.join(params)}"
+    url = f"{_sdmx_base()}/data/{flow_path}/{quote(key, safe='+.')}?{'&'.join(params)}"
     return {
         "flowDetails": flow_details,
         "dimensionOrder": dimension_order,
@@ -3032,7 +3073,7 @@ async def observations_resource(
 @mcp.tool()
 async def list_agencies(limit: int = 50) -> list[dict[str, Any]]:
     """
-    List agencies from the UNICEF SDMX service with optional descriptions.
+    List agencies from the configured SDMX service with optional descriptions.
     """
     payload = await _cached_dataflows()
     scoped_flows = _extract_scoped_dataflows(payload)
@@ -3612,7 +3653,7 @@ async def plan_topic_query(
 @mcp.tool()
 async def search_dataflows(query: str, limit: int = 10) -> list[dict[str, Any]]:
     """
-    Search UNICEF SDMX dataflows by id/name/description.
+    Search SDMX dataflows by id/name/description.
     Returns lightweight matches with a flowRef you can pass to other tools.
 
     Prefer find_indicator_candidates or plan_topic_query for topical metric questions
@@ -3744,9 +3785,9 @@ async def list_theme_prefixes(limit: int = 50) -> list[dict[str, Any]]:
 @mcp.tool()
 async def list_theme_prefix_conflicts(limit: int = 100) -> list[dict[str, Any]]:
     """
-    List prefixes that map to multiple domains in theme_prefixes_domain.csv.
+    List prefixes that map to multiple domains in the configured theme-prefix CSV.
     """
-    conflicts = _theme_prefix_conflicts_from_csv(THEME_PREFIX_CSV)
+    conflicts = _theme_prefix_conflicts_from_csv(_theme_prefix_csv_path())
     return conflicts[:limit]
 
 
@@ -4497,7 +4538,7 @@ async def validate_query_scope(
     labels: Optional[str] = "name",
 ) -> dict[str, Any]:
     """
-    Preflight whether a concrete query resolves from the official UNICEF/UNPD flows.
+    Preflight whether a concrete query resolves from the configured SDMX service.
     This is intended to fail early before any narrative answer is attempted.
     """
     return await _validate_query_scope_impl(

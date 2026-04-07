@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency: fly-deploy-${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy main app
         if: github.ref_name == 'unicef'

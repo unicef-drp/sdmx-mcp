@@ -81,6 +81,8 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"SDMX_DEFAULT_LAST_N_OBSERVATIONS": "TRUE"}, clear=False), patch(
             "server._resolved_flow_details", return_value={"resolvedFlowRef": "UNICEF/TEST_FLOW/1.0"}
         ), patch(
+            "server._sdmx_base", return_value="https://example.org/rest"
+        ), patch(
             "server._data_path_for", return_value="UNICEF,TEST_FLOW,1.0"
         ), patch("server._dimension_order_for_flow", return_value=["REF_AREA", "SUBJECT"]), patch(
             "server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}
@@ -107,6 +109,8 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_query_plan_skips_default_last_n_when_env_disabled(self) -> None:
         with patch.dict(os.environ, {"SDMX_DEFAULT_LAST_N_OBSERVATIONS": "FALSE"}, clear=False), patch(
             "server._resolved_flow_details", return_value={"resolvedFlowRef": "UNICEF/TEST_FLOW/1.0"}
+        ), patch(
+            "server._sdmx_base", return_value="https://example.org/rest"
         ), patch("server._data_path_for", return_value="UNICEF,TEST_FLOW,1.0"), patch(
             "server._dimension_order_for_flow", return_value=["REF_AREA", "SUBJECT"]
         ), patch("server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}):
@@ -127,6 +131,8 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_query_plan_allows_unbounded_time_for_compact_series(self) -> None:
         with patch("server._resolved_flow_details", return_value={"resolvedFlowRef": "UNICEF/TEST_FLOW/1.0"}), patch(
+            "server._sdmx_base", return_value="https://example.org/rest"
+        ), patch(
             "server._data_path_for", return_value="UNICEF,TEST_FLOW,1.0"
         ), patch("server._dimension_order_for_flow", return_value=["REF_AREA", "SUBJECT"]), patch(
             "server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}

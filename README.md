@@ -1,6 +1,6 @@
-# UNICEF SDMX MCP
+# SDMX MCP
 
-MCP server for the UNICEF SDMX warehouse (`https://sdmx.data.unicef.org/ws/public/sdmxapi/rest`) built with FastMCP.
+Generic MCP server for SDMX registries built with FastMCP. Set `SDMX_BASE_URL` to your SDMX REST API and configure registry-specific policies from the included examples.
 
 This project lets an LLM client do a full guided data journey:
 - pick agency
@@ -13,18 +13,15 @@ This project lets an LLM client do a full guided data journey:
 ## What This Repo Contains
 
 - `server.py`: MCP tools and SDMX integration logic.
-- `query_dimension_policy.json`: default subject/location/time query-dimension policy.
-- `query_dimension_policy.example.json`: example query-dimension policy.
-- `discovery_policy.json`: default discovery ranking policy for stopwords and topic-to-flow hints.
-- `discovery_policy.example.json`: example discovery ranking policy.
+- `query_dimension_policy.example.json`: example subject/location/time query-dimension policy.
+- `discovery_policy.example.json`: example discovery ranking policy for stopwords and topic-to-flow hints.
 - `scripts/agent_test_rig.py`: direct tool-call harness that simulates an agent workflow.
 - `scripts/sdmx_eval_runner.py`: generic SDMX eval harness for case generation, provider execution, and grading.
 - `scripts/sdmx_eval_config.example.json`: example config for deterministic case generation and provider runs.
 - `scripts/sdmx_eval_provider_anthropic.py`: Anthropic Messages API adapter using Anthropic's MCP connector.
 - `scripts/sdmx_eval_provider_template.py`: stdin/stdout adapter template for wiring any LLM+MCP stack into the eval harness.
-- `scripts/agent_test_scenarios.example.jsonl`: regression/demo scenarios.
 - `scripts/list_theme_prefixes.py`: helper to inspect dataflow ID prefixes.
-- `theme_prefixes_domain.csv`: curated prefix-to-domain mapping used for grouping.
+- `theme_prefixes_domain.csv`: optional example prefix-to-domain mapping for grouping. Set `SDMX_THEME_PREFIX_CSV` to use it.
 
 ## Local Run
 
@@ -36,8 +33,7 @@ UV_CACHE_DIR="$PWD/.uv-cache" uv run fastmcp run server.py --transport stdio
 ```
 
 Runtime config is loaded from `.env` automatically when present.
-Policy config is auto-discovered from `query_dimension_policy.json` when `SDMX_QUERY_DIMENSION_POLICY_FILE` is not set.
-Discovery ranking config is auto-discovered from `discovery_policy.json` when `SDMX_DISCOVERY_POLICY_FILE` is not set.
+Main ships only example policy files. Copy `query_dimension_policy.example.json` to `query_dimension_policy.json`, copy `discovery_policy.example.json` to `discovery_policy.json`, or set the corresponding environment variables when you want active registry-specific policies.
 
 HTTP mode (local):
 
@@ -77,21 +73,12 @@ fly deploy
 
 Fly deploys use the same Dockerfile and locked dependency install. The app may intentionally autostop depending on `fly.toml` settings.
 
-Feature-branch draft deploy:
-
-- `unicef` deploys to the main Fly app from `fly.toml`
-- `feat/unicef-agent-test-rig` deploys to the separate draft app from `fly.eval.toml`
-
-If the draft app does not exist yet, create it once before relying on GitHub Actions auto-deploys:
-
-```bash
-fly launch --no-deploy --copy-config --name sdmx-mcp-eval --config fly.eval.toml
-```
+Generic `main` intentionally does not auto-deploy on push. The included `.github/workflows/fly-deploy.yml` workflow is manual-only (`workflow_dispatch`) so downstream branches can opt into deployment after setting their own Fly app/config.
 
 Sanity check:
 
 ```bash
-curl -sS --max-time 20 -X POST https://sdmx-mcp.fly.dev/mcp \
+curl -sS --max-time 20 -X POST https://<your-app>.fly.dev/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
@@ -135,6 +122,7 @@ Configuration is split into two policy files:
 - `discovery_policy.json`: how natural-language discovery is scored and routed
 
 This separation is intentional. A registry owner can configure the SDMX semantics independently from search/ranking heuristics.
+The generic `main` branch includes `.example.json` versions only. Active policy files should be provided by downstream branches or deployment environment variables.
 
 ### Query Dimension Policy
 
@@ -154,7 +142,7 @@ Override it with either:
 
 An example file is included at `query_dimension_policy.example.json`.
 
-Example UNICEF-oriented policy:
+Example policy:
 
 ```json
 {
@@ -167,11 +155,11 @@ Example UNICEF-oriented policy:
       "discovery_label": "Discover by Subject",
       "discovery_description": "Start with the phenomenon, metric, or topic and let the system find the best indicator and flow.",
       "example_prompts": [
-        "Tell me about stunting in Latin America.",
-        "Show me vaccination coverage in West Africa."
+        "Tell me about an indicator in a region.",
+        "Show me education coverage for a country group."
       ],
       "preferred_sources": [
-        {"type": "codelist", "id": "UNICEF/CL_UNICEF_INDICATOR/1.0"}
+        {"type": "codelist", "id": "AGENCY/CL_INDICATOR/1.0"}
       ]
     },
     {
@@ -182,12 +170,12 @@ Example UNICEF-oriented policy:
       "discovery_label": "Discover by Location",
       "discovery_description": "Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
       "example_prompts": [
-        "Tell me about stunting in Latin America.",
-        "Compare child mortality in South Asia."
+        "Tell me about an indicator in a region.",
+        "Compare an indicator across a country group."
       ],
       "preferred_sources": [
-        {"type": "codelist", "id": "UNICEF/CL_COUNTRY/1.0"},
-        {"type": "hierarchical_codelist", "id": "UNICEF/UNICEF_REPORTING_REGIONS"}
+        {"type": "codelist", "id": "AGENCY/CL_REF_AREA/1.0"},
+        {"type": "hierarchical_codelist", "id": "AGENCY/REPORTING_REGIONS/1.0"}
       ],
       "allow_hierarchy_resolution": true,
       "allow_member_expansion": true
@@ -200,8 +188,8 @@ Example UNICEF-oriented policy:
       "discovery_label": "Discover by Time",
       "discovery_description": "Start with the period or trend you want and let the system resolve the right subject, flow, and location slice.",
       "example_prompts": [
-        "What changed over time for under-five mortality in South Asia?",
-        "Show the latest nutrition indicators."
+        "What changed over time for an indicator in a region?",
+        "Show the latest values for this topic."
       ]
     }
   ]
@@ -259,7 +247,7 @@ Example:
 }
 ```
 
-`preferred_flow_markers` are matched against flow IDs and flow refs, so a marker like `NUTRITION` matches `UNICEF/NUTRITION/1.0`.
+`preferred_flow_markers` are matched against flow IDs and flow refs, so a marker like `NUTRITION` matches `AGENCY/NUTRITION/1.0`.
 
 ### Data Transport
 
@@ -353,7 +341,7 @@ Time inputs accepted by the query policy can be:
 - Purpose: resolve a query into a concrete SDMX URL before execution and show wildcard dimensions that can still split the result.
 
 22. `validate_query_scope(flowRef, key=None, filters=None, startPeriod=None, endPeriod=None, lastNObservations=None, labels='name')`
-- Purpose: preflight whether a concrete UNICEF/UNPD query resolves before any narrative answer is attempted.
+- Purpose: preflight whether a concrete SDMX query resolves before any narrative answer is attempted.
 - Returns: structured source-bound status with `status`, `sourceScope`, `provenance`, optional `error`, and `assistant_guidance`.
 
 23. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='csv', labels='name', maxObs=50000, filters=None, lastNObservations=None, resultShape=None)`
@@ -384,12 +372,9 @@ Time inputs accepted by the query policy can be:
 `scripts/agent_test_rig.py` (direct call harness) simulates the intended LLM flow.
 
 Capabilities:
-- selects best flow from question
-- retries discovery with topic hints when full-sentence flow search is sparse
-- infers `REF_AREA` for South Asia
+- builds direct SDMX manifest cases from configured indicator and reference-area codelists
+- filters inspected flows by optional agency
 - does not auto-fill non-essential dimensions, leaving unspecified dimensions as SDMX wildcards
-- ranks indicator candidates
-- iterates indicators until data is found
 - logs attempts verbosely
 - saves per-case JSON outputs
 
@@ -397,27 +382,11 @@ Single run:
 
 ```bash
 python scripts/agent_test_rig.py \
-  --question "Show me latest child mortality rates in South Asia" \
-  --agency UNICEF \
-  --journey --verbose \
-  --last-n 3 --format csv --labels both
+  --agency <AGENCY> \
+  --indicator-codelist-url https://<registry>/codelist/<AGENCY>/<INDICATOR_CODELIST>/1.0 \
+  --country-codelist-url https://<registry>/codelist/<AGENCY>/<REF_AREA_CODELIST>/1.0 \
+  --manifest-only
 ```
-
-Scenario batch:
-
-```bash
-python scripts/agent_test_rig.py \
-  --scenarios scripts/agent_test_scenarios.example.jsonl \
-  --journey --verbose \
-  --save-output-dir demo_outputs
-```
-
-### Demo Scenarios Included
-
-In `scripts/agent_test_scenarios.example.jsonl`:
-- latest under-five mortality in South Asia
-- latest stunting and wasting in South Asia
-- immunization vs mortality comparison in South Asia
 
 ## Generic Eval Harness
 
@@ -514,8 +483,8 @@ The adapter asks Claude to return a single JSON object so grading can stay deter
 ### Claude (Connector / Integrations)
 
 If Claude supports remote MCP connectors in your plan/UI:
-- add connector URL: `https://sdmx-mcp.fly.dev/mcp`
-- test with a first prompt like: "List UNICEF agencies"
+- add connector URL: `https://<your-app>.fly.dev/mcp`
+- test with a first prompt like: "List agencies"
 
 ### Claude Desktop (config fallback)
 
@@ -524,9 +493,9 @@ If Claude supports remote MCP connectors in your plan/UI:
 ```json
 {
   "mcpServers": {
-    "unicef-sdmx": {
+    "sdmx": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://sdmx-mcp.fly.dev/mcp"]
+      "args": ["-y", "mcp-remote", "https://<your-app>.fly.dev/mcp"]
     }
   }
 }
@@ -560,14 +529,10 @@ Recommended discovery sequence:
 
 4. Data query 404 with SDMX message `No data for data query against the dataflow`
 - Query syntax is valid but the selected dimensional slice has no observations.
-- Use `find_indicator_candidates` + iterative attempts in the rig.
-
-## Presentation Notes
-
-For a live demo, use the scenario file plus `--save-output-dir` and keep the saved JSON outputs as known-good artifacts.
+- Use `find_indicator_candidates` and inspect the returned candidate flows, or configure stronger `flow_topic_hints` in `discovery_policy.json`.
 
 ## Latest Robustness Updates
 
 - Unspecified dimensions are now kept as empty SDMX key segments (`.` wildcard) instead of being auto-filled.
 - `query_data` supports optional `labels` for SDMX CSV output (`labels=both` works well for readable demos).
-- Journey-mode flow discovery in the test rig now uses fallback topic hints (for example, wasting/stunting -> nutrition).
+- Guided discovery can use configurable fallback topic hints from `discovery_policy.json`.

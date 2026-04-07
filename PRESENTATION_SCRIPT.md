@@ -62,15 +62,12 @@ What to highlight:
 
 ## 5. Reliability / Regression Story (45s)
 
-I also built a direct tool-call rig (`scripts/agent_test_rig.py`) to test this without depending on chat behavior.
+The server is designed for repeatable tool-based checks:
+- deterministic flow discovery and structure inspection
+- explicit query guardrails (`lastNObservations` or bounded periods)
+- reproducible requests through returned `query_url` values
 
-It supports:
-- journey mode (`--journey`)
-- verbose reasoning (`--verbose`)
-- scenario files (`--scenarios`)
-- output capture (`--save-output-dir`)
-
-This gives repeatable regression tests for demo prompts.
+This keeps demo behavior stable even when client chat behavior varies.
 
 ## 6. Current Scope + Next Steps (45s)
 
@@ -88,4 +85,3 @@ Next steps:
 ## 7. Closing (15s)
 
 This shows that an MCP layer over SDMX can make complex statistical systems directly usable in natural language, while still preserving data structure, traceability, and reproducibility.
-

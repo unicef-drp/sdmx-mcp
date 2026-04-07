@@ -1,13 +1,13 @@
 {
   "registry": {
-    "base_url": "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest",
+    "base_url": "https://example.org/ws/public/sdmxapi/rest",
     "user_agent": "sdmx-eval-runner/0.1",
     "time_dimension_id": "TIME_PERIOD"
   },
   "mcp": {
     "transport": "streamable-http",
-    "url": "https://sdmx-mcp.fly.dev/mcp",
-    "server_label": "unicef-sdmx"
+    "url": "https://example-mcp-host.example/mcp",
+    "server_label": "sdmx"
   },
   "concurrency": 8,
   "registry_profile": "sparse",
@@ -22,19 +22,19 @@
     "max_attempts_per_case": 20
   },
   "dataflows": [
-    "UNICEF/GLOBAL_DATAFLOW/1.0"
+    "AGENCY/DATAFLOW/1.0"
   ],
   "dimensions": [
     {
       "id": "INDICATOR",
       "mode": "external_codelist_intersection",
-      "codelist_url": "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest/codelist/UNICEF/CL_UNICEF_INDICATOR/1.0",
+      "codelist_url": "https://example.org/ws/public/sdmxapi/rest/codelist/AGENCY/CL_INDICATOR/1.0",
       "max_values": 10
     },
     {
       "id": "REF_AREA",
       "mode": "external_codelist_intersection",
-      "codelist_url": "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest/codelist/UNICEF/CL_COUNTRY/1.0",
+      "codelist_url": "https://example.org/ws/public/sdmxapi/rest/codelist/AGENCY/CL_REF_AREA/1.0",
       "max_values": 4
     },
     {

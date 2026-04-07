@@ -4,6 +4,7 @@ import asyncio
 import csv
 import io
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,11 +20,11 @@ if str(ROOT) not in sys.path:
 import server
 
 
-INDICATOR_CODELIST_URL = f"{server.BASE}/codelist/UNICEF/CL_UNICEF_INDICATOR/1.0"
-COUNTRY_CODELIST_URL = f"{server.BASE}/codelist/UNICEF/CL_COUNTRY/1.0"
+INDICATOR_CODELIST_URL = os.getenv("SDMX_EVAL_INDICATOR_CODELIST_URL", "").strip()
+COUNTRY_CODELIST_URL = os.getenv("SDMX_EVAL_COUNTRY_CODELIST_URL", "").strip()
 DEFAULT_OUTPUT_DIR = ROOT / "tmp" / "agent_test_rig"
-DEFAULT_MANIFEST_PATH = DEFAULT_OUTPUT_DIR / "unicef_agent_cases.jsonl"
-DEFAULT_RESULTS_PATH = DEFAULT_OUTPUT_DIR / "unicef_agent_results.jsonl"
+DEFAULT_MANIFEST_PATH = DEFAULT_OUTPUT_DIR / "sdmx_agent_cases.jsonl"
+DEFAULT_RESULTS_PATH = DEFAULT_OUTPUT_DIR / "sdmx_agent_results.jsonl"
 
 
 def _tag_name(element: ET.Element) -> str:
@@ -40,7 +41,7 @@ def _element_text(node: ET.Element, tag_name: str) -> str:
 
 
 def _flow_ref(flow: dict[str, Any]) -> str:
-    agency = str(flow.get("agencyID") or flow.get("agencyId") or "UNICEF").strip()
+    agency = str(flow.get("agencyID") or flow.get("agencyId") or "").strip()
     flow_id = str(flow.get("id") or flow.get("ID") or "").strip()
     version = str(flow.get("version") or "latest").strip() or "latest"
     return f"{agency}/{flow_id}/{version}"
@@ -87,13 +88,13 @@ async def _fetch_codelist(client: httpx.AsyncClient, url: str) -> dict[str, str]
     return codes
 
 
-async def _list_unicef_flows() -> list[dict[str, Any]]:
+async def _list_flows(agency_filter: str | None) -> list[dict[str, Any]]:
     payload = await server._cached_dataflows()
     flows = server._extract_scoped_dataflows(payload)
     filtered = []
     for flow in flows:
         agency = str(flow.get("agencyID") or flow.get("agencyId") or "").strip()
-        if agency == "UNICEF":
+        if not agency_filter or agency == agency_filter:
             filtered.append(flow)
     filtered.sort(key=lambda item: str(item.get("id") or item.get("ID") or ""))
     return filtered
@@ -108,7 +109,7 @@ async def _inspect_flow(
     async with semaphore:
         flow_ref = _flow_ref(flow)
         try:
-            payload = await server.get_flow_structure(flow_ref)
+            payload = await server._get_flow_structure(flow_ref)
         except Exception as exc:
             return {
                 "flowRef": flow_ref,
@@ -150,15 +151,23 @@ async def _build_manifest(
     concurrency: int,
     flow_limit: int | None,
     case_limit: int | None,
+    agency: str | None,
+    indicator_codelist_url: str,
+    country_codelist_url: str,
 ) -> dict[str, int]:
+    if not indicator_codelist_url or not country_codelist_url:
+        raise ValueError(
+            "Provide --indicator-codelist-url and --country-codelist-url, or set "
+            "SDMX_EVAL_INDICATOR_CODELIST_URL and SDMX_EVAL_COUNTRY_CODELIST_URL."
+        )
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     async with httpx.AsyncClient(timeout=60.0) as client:
         indicator_catalog, country_catalog = await asyncio.gather(
-            _fetch_codelist(client, INDICATOR_CODELIST_URL),
-            _fetch_codelist(client, COUNTRY_CODELIST_URL),
+            _fetch_codelist(client, indicator_codelist_url),
+            _fetch_codelist(client, country_codelist_url),
         )
 
-    flows = await _list_unicef_flows()
+    flows = await _list_flows(agency)
     if flow_limit is not None:
         flows = flows[:flow_limit]
 
@@ -271,7 +280,7 @@ async def _execute_case(client: httpx.AsyncClient, case: dict[str, Any], semapho
         start_period = str(case["startPeriod"])
         end_period = str(case["endPeriod"])
         query_url = (
-            f"{server.BASE}/data/{_quoted_flow_path(flow_ref)}/{quote(key, safe='+.')}?"
+            f"{server._sdmx_base()}/data/{_quoted_flow_path(flow_ref)}/{quote(key, safe='+.')}?"
             f"startPeriod={quote(start_period)}&endPeriod={quote(end_period)}&format=csv"
         )
 
@@ -344,6 +353,9 @@ async def _async_main(args: argparse.Namespace) -> None:
         concurrency=args.concurrency,
         flow_limit=args.flow_limit,
         case_limit=args.manifest_case_limit,
+        agency=args.agency,
+        indicator_codelist_url=args.indicator_codelist_url,
+        country_codelist_url=args.country_codelist_url,
     )
     print(json.dumps({"manifest": manifest_stats, "manifest_path": str(args.manifest)}, indent=2))
 
@@ -361,7 +373,7 @@ async def _async_main(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build and execute a UNICEF SDMX test rig for direct CSV-backed ground truth."
+        description="Build and execute an SDMX test rig for direct CSV-backed ground truth."
     )
     parser.add_argument(
         "--output-dir",
@@ -373,16 +385,27 @@ def main() -> None:
         "--manifest",
         type=Path,
         default=None,
-        help="Manifest JSONL path. Defaults to <output-dir>/unicef_agent_cases.jsonl.",
+        help="Manifest JSONL path. Defaults to <output-dir>/sdmx_agent_cases.jsonl.",
     )
     parser.add_argument(
         "--results",
         type=Path,
         default=None,
-        help="Results JSONL path. Defaults to <output-dir>/unicef_agent_results.jsonl.",
+        help="Results JSONL path. Defaults to <output-dir>/sdmx_agent_results.jsonl.",
+    )
+    parser.add_argument("--agency", default=None, help="Optional agency filter for inspected flows.")
+    parser.add_argument(
+        "--indicator-codelist-url",
+        default=INDICATOR_CODELIST_URL,
+        help="External indicator codelist URL used to build manifest cases.",
+    )
+    parser.add_argument(
+        "--country-codelist-url",
+        default=COUNTRY_CODELIST_URL,
+        help="External country/reference-area codelist URL used to build manifest cases.",
     )
     parser.add_argument("--concurrency", type=int, default=8, help="Concurrent HTTP requests.")
-    parser.add_argument("--flow-limit", type=int, default=None, help="Optional cap on inspected UNICEF flows.")
+    parser.add_argument("--flow-limit", type=int, default=None, help="Optional cap on inspected flows.")
     parser.add_argument(
         "--manifest-case-limit",
         type=int,
