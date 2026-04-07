@@ -65,6 +65,14 @@ QUERY_STOPWORDS = {
     "with",
 }
 
+FLOW_TOPIC_HINTS: tuple[tuple[set[str], tuple[str, ...]], ...] = (
+    ({"bmi", "malnutrition", "nutrition", "obesity", "overweight", "stunting", "underweight", "wasting"}, ("NUTRITION",)),
+    ({"education", "learning", "literacy", "school", "schools"}, ("EDUCATION",)),
+    ({"hygiene", "sanitation", "wash", "water"}, ("WASH",)),
+    ({"immunisation", "immunization", "vaccine", "vaccination"}, ("IMMUNISATION",)),
+    ({"mortality", "death", "deaths"}, ("CME", "CAUSE_OF_DEATH")),
+)
+
 # Starter mapping for common flow id prefixes to human-friendly labels.
 FALLBACK_THEME_PREFIX_MAP: dict[str, str] = {
     "PT": "Child Protection",
@@ -542,16 +550,32 @@ def _is_cross_sectional_flow(df_id: str, name: str = "", description: str = "") 
     return any(marker in text for marker in ("cross-sectional", "cross sectional", "cross_sectional"))
 
 
-def _pick_recommended_flow(candidates: list[dict[str, Any]], query: str) -> dict[str, Any] | None:
+def _flow_topic_score(item: dict[str, Any], query: str, indicator_text: str = "") -> int:
+    flow_name = str(item.get("flowName") or "")
+    flow_desc = str(item.get("flowDescription") or "")
+    flow_id = str(item.get("flowID") or "")
+    flow_ref = str(item.get("flowRef") or "")
+    flow_text = f"{flow_id} {flow_ref} {flow_name} {flow_desc}".lower()
+    score = _match_score(flow_text, query) + _match_score(flow_text, indicator_text)
+    topic_tokens = set(_query_tokens(f"{query} {indicator_text}"))
+    flow_id_upper = flow_id.upper()
+    flow_ref_upper = flow_ref.upper()
+    for trigger_tokens, preferred_flow_markers in FLOW_TOPIC_HINTS:
+        if not topic_tokens.intersection(trigger_tokens):
+            continue
+        if any(marker in flow_id_upper or marker in flow_ref_upper for marker in preferred_flow_markers):
+            score += 50
+    return score
+
+
+def _pick_recommended_flow(candidates: list[dict[str, Any]], query: str, indicator_text: str = "") -> dict[str, Any] | None:
     if not candidates:
         return None
 
     def _rank(item: dict[str, Any]) -> tuple[int, int, int, str]:
         agency = str(item.get("agencyID") or "")
-        flow_name = str(item.get("flowName") or "")
-        flow_desc = str(item.get("flowDescription") or "")
         flow_id = str(item.get("flowID") or "")
-        flow_score = _match_score(f"{flow_id} {flow_name} {flow_desc}".lower(), query)
+        flow_score = _flow_topic_score(item, query, indicator_text)
         cross_penalty = 1 if item.get("isCrossSectional") else 0
         unicef_bonus = 1 if agency == "UNICEF" else 0
         return (flow_score, unicef_bonus, -cross_penalty, flow_id)
@@ -3069,7 +3093,9 @@ async def _find_indicator_candidates_impl(
 
     for item in ranked:
         candidates = item.get("dataflows") or []
-        recommended = _pick_recommended_flow(candidates, q)
+        indicator_text = f"{item.get('id') or ''} {item.get('name') or ''} {item.get('description') or ''}"
+        candidates.sort(key=lambda candidate: _flow_topic_score(candidate, q, indicator_text), reverse=True)
+        recommended = _pick_recommended_flow(candidates, q, indicator_text)
         item["recommendedFlowRef"] = recommended.get("flowRef") if isinstance(recommended, dict) else None
         item.pop("_score", None)
 
