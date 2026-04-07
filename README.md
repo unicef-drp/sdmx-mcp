@@ -135,6 +135,16 @@ Override it with either:
 
 An example file is included at `query_dimension_policy.example.json`.
 
+Discovery ranking has its own lightweight policy so registry-specific language does not have to be hardcoded. By default the server auto-loads `discovery_policy.json`; override it with:
+
+- `SDMX_DISCOVERY_POLICY_JSON`
+- `SDMX_DISCOVERY_POLICY_FILE`
+
+An example file is included at `discovery_policy.example.json`. It controls:
+
+- `query_stopwords`: generic prompt words ignored during candidate scoring, such as `tell`, `show`, or `level`
+- `flow_topic_hints`: registry-specific term groups that prefer matching dataflow IDs, such as nutrition terms preferring `NUTRITION`
+
 Example UNICEF-oriented policy:
 
 ```json

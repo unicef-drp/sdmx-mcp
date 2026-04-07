@@ -1,0 +1,44 @@
+{
+  "query_stopwords": [
+    "about",
+    "chart",
+    "current",
+    "dashboard",
+    "data",
+    "give",
+    "latest",
+    "level",
+    "levels",
+    "make",
+    "most",
+    "recent",
+    "show",
+    "table",
+    "tell",
+    "the",
+    "widget",
+    "with"
+  ],
+  "flow_topic_hints": [
+    {
+      "terms": ["bmi", "malnutrition", "nutrition", "obesity", "overweight", "stunting", "underweight", "wasting"],
+      "preferred_flow_markers": ["NUTRITION"]
+    },
+    {
+      "terms": ["education", "learning", "literacy", "school", "schools"],
+      "preferred_flow_markers": ["EDUCATION"]
+    },
+    {
+      "terms": ["hygiene", "sanitation", "wash", "water"],
+      "preferred_flow_markers": ["WASH"]
+    },
+    {
+      "terms": ["immunisation", "immunization", "vaccine", "vaccination"],
+      "preferred_flow_markers": ["IMMUNISATION"]
+    },
+    {
+      "terms": ["mortality", "death", "deaths"],
+      "preferred_flow_markers": ["CME", "CAUSE_OF_DEATH"]
+    }
+  ]
+}

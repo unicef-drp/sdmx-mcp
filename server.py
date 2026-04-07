@@ -44,7 +44,7 @@ AGENCY_ALLOWLIST = {item.strip() for item in os.getenv("SDMX_AGENCY_ALLOWLIST", 
 
 mcp = FastMCP("unicef-sdmx")
 
-QUERY_STOPWORDS = {
+DEFAULT_DISCOVERY_STOPWORDS = [
     "about",
     "chart",
     "current",
@@ -63,15 +63,30 @@ QUERY_STOPWORDS = {
     "the",
     "widget",
     "with",
-}
+]
 
-FLOW_TOPIC_HINTS: tuple[tuple[set[str], tuple[str, ...]], ...] = (
-    ({"bmi", "malnutrition", "nutrition", "obesity", "overweight", "stunting", "underweight", "wasting"}, ("NUTRITION",)),
-    ({"education", "learning", "literacy", "school", "schools"}, ("EDUCATION",)),
-    ({"hygiene", "sanitation", "wash", "water"}, ("WASH",)),
-    ({"immunisation", "immunization", "vaccine", "vaccination"}, ("IMMUNISATION",)),
-    ({"mortality", "death", "deaths"}, ("CME", "CAUSE_OF_DEATH")),
-)
+DEFAULT_FLOW_TOPIC_HINTS = [
+    {
+        "terms": ["bmi", "malnutrition", "nutrition", "obesity", "overweight", "stunting", "underweight", "wasting"],
+        "preferred_flow_markers": ["NUTRITION"],
+    },
+    {
+        "terms": ["education", "learning", "literacy", "school", "schools"],
+        "preferred_flow_markers": ["EDUCATION"],
+    },
+    {
+        "terms": ["hygiene", "sanitation", "wash", "water"],
+        "preferred_flow_markers": ["WASH"],
+    },
+    {
+        "terms": ["immunisation", "immunization", "vaccine", "vaccination"],
+        "preferred_flow_markers": ["IMMUNISATION"],
+    },
+    {
+        "terms": ["mortality", "death", "deaths"],
+        "preferred_flow_markers": ["CME", "CAUSE_OF_DEATH"],
+    },
+]
 
 # Starter mapping for common flow id prefixes to human-friendly labels.
 FALLBACK_THEME_PREFIX_MAP: dict[str, str] = {
@@ -120,6 +135,18 @@ class QueryDimensionPolicyEntry:
 @dataclass(slots=True)
 class QueryDimensionPolicyConfig:
     default_query_dimensions: list[QueryDimensionPolicyEntry]
+
+
+@dataclass(slots=True)
+class FlowTopicHint:
+    terms: set[str]
+    preferred_flow_markers: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class DiscoveryPolicyConfig:
+    query_stopwords: set[str]
+    flow_topic_hints: tuple[FlowTopicHint, ...]
 
 
 def _env_flag(name: str, default: bool, legacy_names: list[str] | None = None) -> bool:
@@ -234,6 +261,58 @@ def _policy_config_from_dict(payload: dict[str, Any]) -> QueryDimensionPolicyCon
     if len({entry.priority for entry in dimensions}) != len(dimensions):
         raise ValueError("query dimension policy entry priorities must be unique.")
     return QueryDimensionPolicyConfig(default_query_dimensions=dimensions)
+
+
+def _discovery_policy_from_dict(payload: dict[str, Any]) -> DiscoveryPolicyConfig:
+    raw_stopwords = payload.get("query_stopwords", DEFAULT_DISCOVERY_STOPWORDS)
+    if not isinstance(raw_stopwords, list):
+        raise ValueError("discovery policy query_stopwords must be a list.")
+    query_stopwords = {str(item).strip().lower() for item in raw_stopwords if str(item).strip()}
+
+    raw_hints = payload.get("flow_topic_hints", DEFAULT_FLOW_TOPIC_HINTS)
+    if not isinstance(raw_hints, list):
+        raise ValueError("discovery policy flow_topic_hints must be a list.")
+    flow_topic_hints: list[FlowTopicHint] = []
+    for item in raw_hints:
+        if not isinstance(item, dict):
+            raise ValueError("discovery policy flow_topic_hints entries must be objects.")
+        raw_terms = item.get("terms") or []
+        raw_markers = item.get("preferred_flow_markers") or []
+        if not isinstance(raw_terms, list) or not isinstance(raw_markers, list):
+            raise ValueError("flow_topic_hints entries must define list fields terms and preferred_flow_markers.")
+        terms = {str(term).strip().lower() for term in raw_terms if str(term).strip()}
+        markers = tuple(str(marker).strip().upper() for marker in raw_markers if str(marker).strip())
+        if terms and markers:
+            flow_topic_hints.append(FlowTopicHint(terms=terms, preferred_flow_markers=markers))
+
+    return DiscoveryPolicyConfig(query_stopwords=query_stopwords, flow_topic_hints=tuple(flow_topic_hints))
+
+
+def _default_discovery_policy() -> DiscoveryPolicyConfig:
+    return _discovery_policy_from_dict(
+        {
+            "query_stopwords": DEFAULT_DISCOVERY_STOPWORDS,
+            "flow_topic_hints": DEFAULT_FLOW_TOPIC_HINTS,
+        }
+    )
+
+
+@lru_cache(maxsize=1)
+def _discovery_policy_config() -> DiscoveryPolicyConfig:
+    raw_json = os.getenv("SDMX_DISCOVERY_POLICY_JSON", "").strip()
+    raw_path = os.getenv("SDMX_DISCOVERY_POLICY_FILE", "").strip()
+    default_path = REPO_ROOT / "discovery_policy.json"
+
+    if raw_path:
+        loaded = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+        return _discovery_policy_from_dict(loaded)
+    if raw_json:
+        loaded = json.loads(raw_json)
+        return _discovery_policy_from_dict(loaded)
+    if default_path.exists():
+        loaded = json.loads(default_path.read_text(encoding="utf-8"))
+        return _discovery_policy_from_dict(loaded)
+    return _default_discovery_policy()
 
 
 @lru_cache(maxsize=1)
@@ -474,7 +553,8 @@ def _coerce_text(value: Any) -> str:
 
 def _query_tokens(query: str) -> list[str]:
     tokens = re.findall(r"[a-z0-9]+", (query or "").lower())
-    return [token for token in tokens if len(token) >= 3 and token not in QUERY_STOPWORDS]
+    stopwords = _discovery_policy_config().query_stopwords
+    return [token for token in tokens if len(token) >= 3 and token not in stopwords]
 
 
 def _match_score(text: str, query: str) -> int:
@@ -560,10 +640,10 @@ def _flow_topic_score(item: dict[str, Any], query: str, indicator_text: str = ""
     topic_tokens = set(_query_tokens(f"{query} {indicator_text}"))
     flow_id_upper = flow_id.upper()
     flow_ref_upper = flow_ref.upper()
-    for trigger_tokens, preferred_flow_markers in FLOW_TOPIC_HINTS:
-        if not topic_tokens.intersection(trigger_tokens):
+    for hint in _discovery_policy_config().flow_topic_hints:
+        if not topic_tokens.intersection(hint.terms):
             continue
-        if any(marker in flow_id_upper or marker in flow_ref_upper for marker in preferred_flow_markers):
+        if any(marker in flow_id_upper or marker in flow_ref_upper for marker in hint.preferred_flow_markers):
             score += 50
     return score
 
