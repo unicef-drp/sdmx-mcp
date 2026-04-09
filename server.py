@@ -1,42 +1,34 @@
+import asyncio
 import logging
 import csv
 import json
 import os
 import re
 from collections import Counter
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
 
 import httpx
 from cachetools import TTLCache
+from dotenv import load_dotenv
 
 from fastmcp import FastMCP
 
+from sdmx_utils import element_text as _element_text, tag_name as _tag_name
+
 # IMPORTANT for STDIO servers: do not print() to stdout.
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent
 
 
-def _load_dotenv(path: Path) -> None:
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        env_key = key.strip()
-        if not env_key or env_key in os.environ:
-            continue
-        os.environ[env_key] = value.strip().strip("\"'")
-
-
-_load_dotenv(REPO_ROOT / ".env")
+load_dotenv(REPO_ROOT / ".env", override=False)
 
 BASE = os.getenv("SDMX_BASE_URL", "").strip().rstrip("/")
 MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
@@ -73,7 +65,19 @@ SCOPE_ACTIVE = any(
 )
 ENFORCE_SCOPE = os.getenv("SDMX_ENFORCE_SCOPE", "").strip().lower() in {"1", "true", "yes", "on"} if os.getenv("SDMX_ENFORCE_SCOPE") else SCOPE_ACTIVE
 
-mcp = FastMCP(MCP_NAME)
+_http_client: httpx.AsyncClient | None = None
+
+
+@asynccontextmanager
+async def _lifespan(app: FastMCP):  # type: ignore[type-arg]
+    global _http_client
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": HTTP_USER_AGENT}) as client:
+        _http_client = client
+        yield
+    _http_client = None
+
+
+mcp = FastMCP(MCP_NAME, lifespan=_lifespan)
 
 DEFAULT_DISCOVERY_STOPWORDS = [
     "about",
@@ -103,13 +107,26 @@ FALLBACK_THEME_PREFIX_MAP: dict[str, str] = {}
 THEME_PREFIX_CSV = Path(__file__).resolve().parent / "theme_prefixes_domain.csv"
 
 # Small caches to keep things fast and reduce load.
-_dataflow_cache = TTLCache(maxsize=1, ttl=60 * 60 * 6)  # 6h
+_dataflow_cache = TTLCache(maxsize=256, ttl=60 * 60 * 6)  # 6h
 _structure_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 _dimension_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 _codelist_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 _hierarchical_codelist_cache = TTLCache(maxsize=32, ttl=60 * 60 * 24)  # 24h
 _hierarchical_codelist_detail_cache = TTLCache(maxsize=32, ttl=60 * 60 * 24)  # 24h
 _hierarchical_catalog_cache = TTLCache(maxsize=8, ttl=60 * 60 * 24)  # 24h
+
+# Limit concurrent structure fetches to avoid overwhelming SDMX servers.
+_STRUCTURE_FETCH_SEMAPHORE = asyncio.Semaphore(5)
+
+# SDMX dimension ID constants.
+DIM_INDICATOR = "INDICATOR"
+DIM_REF_AREA = "REF_AREA"
+DIM_TIME_PERIOD = "TIME_PERIOD"
+
+# Query dimension role constants.
+ROLE_SUBJECT = "subject"
+ROLE_GEOGRAPHY = "geography"
+ROLE_TIME = "time"
 
 
 def _sdmx_base() -> str:
@@ -166,6 +183,68 @@ class DiscoveryPolicyConfig:
     flow_topic_hints: tuple[FlowTopicHint, ...]
 
 
+# ---------------------------------------------------------------------------
+# Response shape TypedDicts — used as return type hints for key internal fns
+# ---------------------------------------------------------------------------
+
+
+class ProvenanceDict(TypedDict):
+    agencyID: str
+    flowID: str
+    version: str
+    requestedFlowRef: str
+    resolvedFlowRef: str
+    key: str
+    dimensionOrder: list[str]
+    queryURL: str
+    format: str
+    labels: str | None
+    startPeriod: str | None
+    endPeriod: str | None
+    lastNObservations: int | None
+    filters: dict[str, Any]
+
+
+class QueryContextDict(TypedDict):
+    sourceScope: dict[str, Any]
+    provenance: ProvenanceDict
+
+
+class ResolvedResponseDict(QueryContextDict):
+    status: str
+    assistant_guidance: str
+    notes: dict[str, Any]
+
+
+class UnresolvedResponseDict(QueryContextDict):
+    status: str
+    assistant_guidance: str
+    error: dict[str, Any]
+    notes: dict[str, Any]
+
+
+class DimensionResolutionDict(TypedDict):
+    name: str
+    role: str
+    dimension_id: str
+    values: list[str]
+    flowRef: str
+
+
+class TimeResolutionDict(TypedDict):
+    name: str
+    role: str
+    dimension_id: str
+    value: str
+    startPeriod: str | None
+    endPeriod: str | None
+    timeMode: str
+    useLatestObservation: bool
+    useAllObservations: bool
+    source: dict[str, str]
+    flowRef: str
+
+
 def _env_flag(name: str, default: bool, legacy_names: list[str] | None = None) -> bool:
     candidates = [name] + list(legacy_names or [])
     raw_value: str | None = None
@@ -183,17 +262,24 @@ def _env_flag(name: str, default: bool, legacy_names: list[str] | None = None) -
     return raw_value.lower() in {"1", "true", "yes", "on"}
 
 
+def _client() -> httpx.AsyncClient:
+    if _http_client is not None:
+        return _http_client
+    # Fallback for use outside of lifespan (e.g. tests). Caller is responsible for closing.
+    return httpx.AsyncClient(timeout=30.0, headers={"User-Agent": HTTP_USER_AGENT})
+
+
 async def _get_json(url: str) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers={"User-Agent": HTTP_USER_AGENT})
-        r.raise_for_status()
-        return r.json()
+    logger.debug("GET JSON %s", url)
+    r = await _client().get(url)
+    r.raise_for_status()
+    return r.json()
 
 
 async def _get_text_with_status(url: str) -> tuple[int, str]:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers={"User-Agent": HTTP_USER_AGENT})
-        return r.status_code, r.text
+    logger.debug("GET text %s", url)
+    r = await _client().get(url)
+    return r.status_code, r.text
 
 
 def _default_query_dimension_policy() -> QueryDimensionPolicyConfig:
@@ -365,17 +451,17 @@ def _sorted_query_dimension_policies() -> list[QueryDimensionPolicyEntry]:
 def _normalized_discovery_role(mode: str) -> str:
     normalized = (mode or "").strip().lower()
     if normalized in {"location", "geo", "geography", "ref_area"}:
-        return "geography"
+        return ROLE_GEOGRAPHY
     if normalized in {"subject", "indicator"}:
-        return "subject"
+        return ROLE_SUBJECT
     if normalized in {"time", "period"}:
-        return "time"
+        return ROLE_TIME
     raise ValueError("discoveryMode must be one of: subject, location, or time.")
 
 
 def _discovery_slug_for_role(role: str) -> str:
     normalized = _normalized_discovery_role(role)
-    if normalized == "geography":
+    if normalized == ROLE_GEOGRAPHY:
         return "location"
     return normalized
 
@@ -383,18 +469,18 @@ def _discovery_slug_for_role(role: str) -> str:
 def _default_discovery_label(role: str) -> str:
     normalized = _normalized_discovery_role(role)
     return {
-        "subject": "Discover by Subject",
-        "geography": "Discover by Location",
-        "time": "Discover by Time",
+        ROLE_SUBJECT: "Discover by Subject",
+        ROLE_GEOGRAPHY: "Discover by Location",
+        ROLE_TIME: "Discover by Time",
     }[normalized]
 
 
 def _default_discovery_description(role: str) -> str:
     normalized = _normalized_discovery_role(role)
     return {
-        "subject": "Start with the phenomenon, metric, or topic and let the system find the best indicator and flow.",
-        "geography": "Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
-        "time": "Start with the period or trend you want and let the system resolve the right subject, flow, and location slice.",
+        ROLE_SUBJECT: "Start with the phenomenon, metric, or topic and let the system find the best indicator and flow.",
+        ROLE_GEOGRAPHY: "Start with a country, region, or grouping and let the system resolve the right flow and indicator.",
+        ROLE_TIME: "Start with the period or trend you want and let the system resolve the right subject, flow, and location slice.",
     }[normalized]
 
 
@@ -630,7 +716,7 @@ def _scored_code_matches(codes: list[dict[str, Any]], query: str) -> list[dict[s
 
 def _indicator_codes_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     dims = _dimension_metadata(payload)
-    target = next((d for d in dims if d.get("id") == "INDICATOR"), None)
+    target = next((d for d in dims if d.get("id") == DIM_INDICATOR), None)
     if not target:
         return []
     codelist_id = target.get("codelist")
@@ -1061,18 +1147,6 @@ def _parse_sdmx_error(text: str) -> str | None:
     return None
 
 
-def _tag_name(element: ET.Element) -> str:
-    return element.tag.split("}")[-1]
-
-
-def _element_text(node: ET.Element, tag_name: str) -> str:
-    for elem in node.iter():
-        if _tag_name(elem) == tag_name and elem.text:
-            text = elem.text.strip()
-            if text:
-                return text
-    return ""
-
 
 def _hierarchical_ref_id(node: ET.Element) -> str | None:
     for elem in node.iter():
@@ -1147,10 +1221,6 @@ def _hierarchical_catalog_from_xml(text: str) -> list[dict[str, Any]]:
     return results
 
 
-def _looks_like_json(text: str) -> bool:
-    stripped = text.lstrip()
-    return stripped.startswith("{") or stripped.startswith("[")
-
 
 async def _resolved_flow_details(flowRef: str) -> dict[str, str]:
     requested_agency, flow_id, requested_version = _flow_identifiers(flowRef)
@@ -1178,7 +1248,7 @@ def _query_context(
     endPeriod: str | None,
     lastNObservations: int | None,
     filters: dict[str, Any] | None,
-) -> dict[str, Any]:
+) -> QueryContextDict:
     return {
         "sourceScope": _source_scope(),
         "provenance": {
@@ -1210,7 +1280,7 @@ def _resolved_response(
     filters: dict[str, Any] | None,
     maxObs: int,
     raw_csv: str | None = None,
-) -> dict[str, Any]:
+) -> ResolvedResponseDict:
     payload = _query_context(
         flow_details=flow_details,
         key=key,
@@ -1251,7 +1321,7 @@ def _unresolved_response(
     status_code: int | None,
     raw_text: str,
     message: str | None = None,
-) -> dict[str, Any]:
+) -> UnresolvedResponseDict:
     payload = _query_context(
         flow_details=flow_details,
         key=key,
@@ -1307,7 +1377,7 @@ def _find_column(columns: list[str], candidates: list[str]) -> str | None:
 def _time_column(rows: list[dict[str, Any]]) -> str | None:
     if not rows:
         return None
-    return _find_column(list(rows[0].keys()), ["TIME_PERIOD", "TIME"])
+    return _find_column(list(rows[0].keys()), [DIM_TIME_PERIOD, "TIME"])
 
 
 def _value_column(rows: list[dict[str, Any]]) -> str | None:
@@ -1391,7 +1461,7 @@ def _shape_compact_series(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _shape_latest_by_ref_area(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    ref_area_column = _dimension_column(rows, "REF_AREA")
+    ref_area_column = _dimension_column(rows, DIM_REF_AREA)
     time_column = _time_column(rows)
     value_column = _value_column(rows)
     if not ref_area_column:
@@ -1687,7 +1757,7 @@ def _codelist_meta(payload: dict[str, Any], dimension_id: str) -> dict[str, Any]
 
 
 def _ref_area_code_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return _dimension_code_map(payload, "REF_AREA")
+    return _dimension_code_map(payload, DIM_REF_AREA)
 
 
 def _code_parent_links(codes: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
@@ -2069,7 +2139,7 @@ def _hierarchy_match_score(
     if codelist_key and codelist_key in hierarchy_text:
         score += 30
         reasons.append("hierarchy id/name matches the dimension codelist")
-    if "region" in hierarchy_text and ("AREA" in dimension_upper or dimension_upper == "REF_AREA"):
+    if "region" in hierarchy_text and ("AREA" in dimension_upper or dimension_upper == DIM_REF_AREA):
         score += 10
         reasons.append("hierarchy looks geographically relevant to REF_AREA")
     return score, {
@@ -2213,19 +2283,19 @@ async def _dimension_order_for_flow(flowRef: str) -> list[str]:
     payload = await _get_flow_structure(flowRef)
     dims = _dimension_order_from_structure(payload)
     if not dims:
-        raise ValueError("Unable to determine dimension order for this flow.")
+        raise ValueError(f"Unable to determine dimension order for flow '{flow_ref}'.")
     _dimension_cache[cache_key] = dims
     return dims
 
 
 def _build_key_from_filters(dimension_order: list[str], filters: dict[str, Any]) -> str:
     if not filters:
-        raise ValueError("filters must include at least one dimension.")
+        raise ValueError("filters must include at least one dimension value.")
     normalized_filters = {str(k).upper(): v for k, v in filters.items()}
     unknown = sorted(k for k in normalized_filters if k not in dimension_order)
     if unknown:
         raise ValueError(
-            f"Unknown dimension(s): {', '.join(unknown)}. Available: {', '.join(dimension_order)}"
+            f"Unknown dimension(s) in filters: {', '.join(unknown)}. Available: {', '.join(dimension_order)}"
         )
 
     parts: list[str] = []
@@ -2402,8 +2472,10 @@ def _codelist_to_resource_payload(codelist: dict[str, Any]) -> dict[str, Any]:
 async def _get_codelist_detail(codelist_ref: str) -> dict[str, Any]:
     cache_key = codelist_ref.strip()
     if cache_key in _codelist_cache:
+        logger.debug("Codelist cache hit for %s", codelist_ref)
         return _codelist_cache[cache_key]
 
+    logger.info("Fetching codelist %s", codelist_ref)
     payload = await _get_json(_codelist_url(codelist_ref))
     requested_id = _flow_identifiers(codelist_ref)[1]
     requested_key = _codelist_key(requested_id)
@@ -2518,8 +2590,10 @@ async def _get_hierarchical_codelist_detail(hierarchy_ref: str) -> dict[str, Any
     agency, hierarchy_id, version = _flow_identifiers(hierarchy_ref)
     cache_key = f"{agency}/{hierarchy_id}/{version}"
     if cache_key in _hierarchical_codelist_detail_cache:
+        logger.debug("Hierarchical codelist cache hit for %s", hierarchy_ref)
         return _hierarchical_codelist_detail_cache[cache_key]
 
+    logger.info("Fetching hierarchical codelist %s", hierarchy_ref)
     url = _hierarchical_codelist_url(agency, hierarchy_id, version)
     status, text = await _get_text_with_status(url)
     if status >= 400:
@@ -2605,9 +2679,9 @@ async def _resolve_time_value(
     payload: dict[str, Any],
     raw_time_range: str,
     policy: QueryDimensionPolicyEntry,
-) -> dict[str, Any]:
+) -> TimeResolutionDict:
     start_period, end_period, time_mode = _parse_time_range(raw_time_range)
-    dim = _dimension_meta(payload, "TIME_PERIOD")
+    dim = _dimension_meta(payload, DIM_TIME_PERIOD)
     if not dim:
         raise ValueError(f"Unable to resolve time dimension for flow '{flow_ref}' using the configured policy.")
     return {
@@ -2620,7 +2694,7 @@ async def _resolve_time_value(
         "timeMode": time_mode,
         "useLatestObservation": time_mode == "latest",
         "useAllObservations": time_mode == "all",
-        "source": {"type": "dimension", "id": "TIME_PERIOD"},
+        "source": {"type": "dimension", "id": DIM_TIME_PERIOD},
         "flowRef": flow_ref,
     }
 
@@ -2630,15 +2704,15 @@ def _input_aliases_for_policy(policy: QueryDimensionPolicyEntry) -> list[str]:
         policy.name.strip().lower(),
         policy.role.strip().lower(),
     }
-    if policy.role == "subject":
+    if policy.role == ROLE_SUBJECT:
         aliases.add("indicator")
-        aliases.add("subject")
-    if policy.role == "geography":
-        aliases.add("geography")
+        aliases.add(ROLE_SUBJECT)
+    if policy.role == ROLE_GEOGRAPHY:
+        aliases.add(ROLE_GEOGRAPHY)
         aliases.add("location")
         aliases.add("ref_area")
-    if policy.role == "time":
-        aliases.add("time")
+    if policy.role == ROLE_TIME:
+        aliases.add(ROLE_TIME)
         aliases.add("time_range")
         aliases.add("period")
     return [alias for alias in aliases if alias]
@@ -2802,6 +2876,7 @@ async def _resolve_query_dimension_inputs(
     flow_ref: str,
     provided_inputs: dict[str, str],
 ) -> dict[str, Any]:
+    logger.info("Resolving query dimension inputs for flow %s: %s", flow_ref, list(provided_inputs.keys()))
     payload = await _get_flow_structure(flow_ref)
     resolved: dict[str, Any] = {}
     resolution_order: list[str] = []
@@ -2811,7 +2886,7 @@ async def _resolve_query_dimension_inputs(
             if policy.required_for_retrieval:
                 raise ValueError(f"Missing required input for query dimension '{policy.name}' ({policy.role}).")
             continue
-        if policy.role == "time":
+        if policy.role == ROLE_TIME:
             resolved[policy.name] = await _resolve_time_value(flow_ref, payload, raw_value, policy)
         else:
             resolved[policy.name] = await _resolve_coded_dimension_value(flow_ref, payload, raw_value, policy)
@@ -2844,13 +2919,19 @@ def _observation_rows_to_resource(
 async def _cached_dataflows() -> dict[str, Any]:
     """Internal cached SDMX dataflows payload for discovery tools."""
     if "dataflows" not in _dataflow_cache:
+        logger.info("Fetching dataflows from %s", _dataflow_url())
         _dataflow_cache["dataflows"] = await _get_json(_dataflow_url())
+    else:
+        logger.debug("Dataflows cache hit")
     return _dataflow_cache["dataflows"]
 
 
 async def _get_flow_structure(flowRef: str) -> dict[str, Any]:
     if flowRef not in _structure_cache:
+        logger.info("Fetching structure for flow %s", flowRef)
         _structure_cache[flowRef] = await _get_json(_structure_url(flowRef))
+    else:
+        logger.debug("Structure cache hit for flow %s", flowRef)
     payload = _structure_cache[flowRef]
     hierarchy_summaries = await _structure_hierarchy_summaries(flowRef, payload)
     enriched = dict(payload)
@@ -2882,6 +2963,7 @@ async def _execute_query_data(
     resultShape: Optional[str] = None,
     allowUnboundedTime: bool = False,
 ) -> dict[str, Any]:
+    logger.info("Executing query for flow %s key=%s", flowRef, key)
     requested_format = (format or "csv").strip() or "csv"
     fetch_format = "csv"
     plan = await _query_plan(
@@ -3070,6 +3152,14 @@ async def observations_resource(
     }
 
 
+def reload_config() -> dict[str, str]:
+    """Clear cached policy configs so they are reloaded from disk on next use."""
+    _query_dimension_policy_config.cache_clear()
+    _discovery_policy_config.cache_clear()
+    logger.info("Policy config caches cleared")
+    return {"status": "ok", "message": "Policy caches cleared. Configs will be reloaded on next use."}
+
+
 @mcp.tool()
 async def list_agencies(limit: int = 50) -> list[dict[str, Any]]:
     """
@@ -3131,7 +3221,7 @@ async def _find_indicator_candidates_impl(
         payload = await _get_flow_structure(flowRef)
         codes = _indicator_codes_from_payload(payload)
         if not codes:
-            raise ValueError("INDICATOR dimension not found for this flow.")
+            raise ValueError(f"No '{DIM_INDICATOR}' dimension or codelist found for flow '{flowRef}'.")
         return _ranked_code_matches(codes, q, limit=limit)
 
     payload = await _cached_dataflows()
@@ -3152,7 +3242,8 @@ async def _find_indicator_candidates_impl(
     if flowLimit > 0:
         flows = flows[:flowLimit]
 
-    merged: dict[str, dict[str, Any]] = {}
+    # Build flow metadata list, skipping entries without an id.
+    flow_metas: list[tuple[str, str, str, str, str, str]] = []
     for df in flows:
         df_id = str(df.get("id") or df.get("ID") or "").strip()
         if not df_id:
@@ -3162,10 +3253,21 @@ async def _find_indicator_candidates_impl(
         flow_ref = _flow_ref_for(df_id, version, agency)
         flow_name = _coerce_text(df.get("name")) or _coerce_text(df.get("names"))
         flow_desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
+        flow_metas.append((df_id, agency, version, flow_ref, flow_name, flow_desc))
 
-        try:
-            structure = await _get_flow_structure(flow_ref)
-        except Exception:
+    async def _fetch_safe(flow_ref: str) -> dict[str, Any] | None:
+        async with _STRUCTURE_FETCH_SEMAPHORE:
+            try:
+                return await _get_flow_structure(flow_ref)
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                logger.debug("Skipping flow %s: %s", flow_ref, exc)
+                return None
+
+    structures = await asyncio.gather(*[_fetch_safe(meta[3]) for meta in flow_metas])
+
+    merged: dict[str, dict[str, Any]] = {}
+    for (df_id, agency, version, flow_ref, flow_name, flow_desc), structure in zip(flow_metas, structures):
+        if structure is None:
             continue
 
         codes = _indicator_codes_from_payload(structure)
@@ -3250,7 +3352,7 @@ async def _plan_topic_query_impl(
 
     first_required = next((item for item in policy if item.required_for_retrieval), None)
     indicator_candidates: list[dict[str, Any]] = []
-    if first_required and first_required.role == "subject":
+    if first_required and first_required.role == ROLE_SUBJECT:
         indicator_candidates = await _find_indicator_candidates_impl(
             query=q,
             flowQuery=flowQuery,
@@ -3346,8 +3448,8 @@ def _fallback_time_resolution(question: str) -> dict[str, Any]:
     time_input = _time_input_from_question(question)
     use_all = time_input == "all"
     return {
-        "name": "time",
-        "role": "time",
+        "name": ROLE_TIME,
+        "role": ROLE_TIME,
         "dimension_id": "",
         "value": time_input,
         "startPeriod": None,
@@ -3498,21 +3600,21 @@ async def _guided_discover_impl(
             resolved = await _resolve_query_dimension_inputs(flow_ref, provided_inputs)
         except Exception as exc:
             payload_dimensions = {str(item.get("id") or "").upper() for item in _dimension_metadata(payload)}
-            if "TIME_PERIOD" not in payload_dimensions:
+            if DIM_TIME_PERIOD not in payload_dimensions:
                 resolved = {
-                    "subject": {
-                        "name": "subject",
-                        "role": "subject",
+                    ROLE_SUBJECT: {
+                        "name": ROLE_SUBJECT,
+                        "role": ROLE_SUBJECT,
                         "dimension_id": "",
                         "values": [str(selected_indicator.get("id") or "")],
                         "flowRef": flow_ref,
                     },
-                    "_resolution_order": ["subject"],
+                    "_resolution_order": [ROLE_SUBJECT],
                 }
                 if selected_geography and selected_geography.get("id"):
                     resolved["location"] = {
                         "name": "location",
-                        "role": "geography",
+                        "role": ROLE_GEOGRAPHY,
                         "dimension_id": str(geography_dimension.get("id") or "") if geography_dimension else "",
                         "values": [str(selected_geography.get("id"))],
                         "flowRef": flow_ref,
@@ -4271,7 +4373,7 @@ async def expand_ref_area_group(flowRef: str, refAreaCode: str) -> dict[str, Any
     Expand an aggregate REF_AREA code into its descendant members using hierarchy metadata
     present in the official SDMX structure payload when available.
     """
-    result = await expand_dimension_group(flowRef=flowRef, dimension="REF_AREA", code=refAreaCode)
+    result = await expand_dimension_group(flowRef=flowRef, dimension=DIM_REF_AREA, code=refAreaCode)
     if result.get("status") != "resolved":
         return result
     hierarchy = result.get("hierarchy") or {}
@@ -4463,7 +4565,7 @@ async def resolve_ref_area_fallback(
     """
     result = await _resolve_dimension_fallback_impl(
         flowRef=flowRef,
-        dimension="REF_AREA",
+        dimension=DIM_REF_AREA,
         code=refAreaCode,
         filters=filters,
         startPeriod=startPeriod,
@@ -4605,7 +4707,7 @@ async def resolve_and_query_data(
     topical questions such as stunting or wasting.
     """
     if not filters:
-        raise ValueError("filters must include at least one dimension.")
+        raise ValueError("filters must include at least one dimension value.")
     allow_unbounded_time = (resultShape or "").strip().lower() in {"compact_series", "topline_summary"}
 
     validation = await _validate_query_scope_impl(
