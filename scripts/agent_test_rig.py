@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import server
+from sdmx_utils import element_text as _element_text, tag_name as _tag_name
 
 
 INDICATOR_CODELIST_URL = os.getenv("SDMX_EVAL_INDICATOR_CODELIST_URL", "").strip()
@@ -25,19 +26,6 @@ COUNTRY_CODELIST_URL = os.getenv("SDMX_EVAL_COUNTRY_CODELIST_URL", "").strip()
 DEFAULT_OUTPUT_DIR = ROOT / "tmp" / "agent_test_rig"
 DEFAULT_MANIFEST_PATH = DEFAULT_OUTPUT_DIR / "sdmx_agent_cases.jsonl"
 DEFAULT_RESULTS_PATH = DEFAULT_OUTPUT_DIR / "sdmx_agent_results.jsonl"
-
-
-def _tag_name(element: ET.Element) -> str:
-    return element.tag.split("}")[-1]
-
-
-def _element_text(node: ET.Element, tag_name: str) -> str:
-    for elem in node.iter():
-        if _tag_name(elem) == tag_name and elem.text:
-            text = elem.text.strip()
-            if text:
-                return text
-    return ""
 
 
 def _flow_ref(flow: dict[str, Any]) -> str:

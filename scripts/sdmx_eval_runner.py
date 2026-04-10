@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import server
+from sdmx_utils import element_text as _element_text, tag_name as _tag_name
 
 
 DEFAULT_OUTPUT_DIR = ROOT / "tmp" / "sdmx_eval"
@@ -41,19 +42,6 @@ def _load_json_file(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Config at {path} must decode to a JSON object.")
     return payload
-
-
-def _tag_name(element: ET.Element) -> str:
-    return element.tag.split("}")[-1]
-
-
-def _element_text(node: ET.Element, tag_name: str) -> str:
-    for elem in node.iter():
-        if _tag_name(elem) == tag_name and elem.text:
-            text = elem.text.strip()
-            if text:
-                return text
-    return ""
 
 
 def _config_base_url(config: dict[str, Any]) -> str:
