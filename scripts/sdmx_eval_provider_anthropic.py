@@ -66,14 +66,21 @@ def _system_prompt(payload: dict[str, Any], provider: dict[str, Any]) -> str:
         provider.get("system_prompt")
         or (
             "You are evaluating an SDMX MCP integration. "
-            "Use the MCP tools when needed, answer only from the MCP-returned SDMX data, "
-            "and return exactly one JSON object with no markdown fences."
+            "Use the MCP tools for every case, answer only from the MCP-returned SDMX data, "
+            "and do not use training data, external facts, or estimates. "
+            "For single-value questions, first resolve the official query with validate_query_scope or "
+            "resolve_and_query_data, then answer only if the official MCP result resolves. "
+            "Prefer resolve_and_query_data with resultShape='latest_single_value' when the flow and code filters are known. "
+            "If the MCP reports unresolved_from_official_flows, no observations, or an ambiguous/non-single-value shape, abstain with a null value. "
+            "Return exactly one JSON object with no markdown fences."
         )
     ).strip()
     contract = (
         ' Return JSON with keys "answer_text" and "claims". '
         'Within "claims", include "value", "time_period", "flowRef", and "filters". '
-        'Use null for any field you cannot determine confidently.'
+        'Use null for any field you cannot determine confidently. '
+        'For resolved single-value results, answer_text must be terse: "value: <value>; period: <period>". '
+        'For no-data or unresolved results, answer_text must be terse: "value: null".'
     )
     return base + contract
 

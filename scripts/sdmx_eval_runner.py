@@ -270,6 +270,33 @@ def _render_prompt(template: str, context: dict[str, str]) -> str:
         raise ValueError(f"Prompt template references missing placeholder '{missing}'.") from exc
 
 
+def _dimension_values_from_case(case: dict[str, Any]) -> dict[str, DimensionValue]:
+    values: dict[str, DimensionValue] = {}
+    raw_dimensions = case.get("dimensions") or {}
+    if not isinstance(raw_dimensions, dict):
+        return values
+    for dimension_id, raw_value in raw_dimensions.items():
+        if not isinstance(raw_value, dict):
+            continue
+        values[str(dimension_id).upper()] = DimensionValue(
+            id=str(raw_value.get("id") or ""),
+            name=str(raw_value.get("name") or ""),
+        )
+    return values
+
+
+def _refresh_case_prompt(case: dict[str, Any], prompt_template: str) -> None:
+    context = _prompt_context(
+        case=case,
+        flow_name=str(case.get("flowName") or ""),
+        flow_id=str(case.get("flowID") or ""),
+        flow_ref=str(case.get("flowRef") or ""),
+        values=_dimension_values_from_case(case),
+        year=str(case.get("timePeriod") or "") if case.get("timePeriod") is not None else None,
+    )
+    case["prompt"] = _render_prompt(prompt_template, context)
+
+
 def _infer_value_column(rows: list[dict[str, Any]], hint: str | None = None) -> str | None:
     if not rows:
         return None
@@ -324,6 +351,19 @@ def _decimal_match(expected: Any, actual: Any, tolerance: float) -> bool | None:
     if expected_decimal is None or actual_decimal is None:
         return None
     return math.isclose(float(expected_decimal), float(actual_decimal), abs_tol=tolerance, rel_tol=0.0)
+
+
+def _tool_names_from_trace(tool_trace: Any) -> list[str]:
+    if not isinstance(tool_trace, list):
+        return []
+    names: list[str] = []
+    for item in tool_trace:
+        if not isinstance(item, dict) or item.get("type") != "mcp_tool_use":
+            continue
+        raw_name = item.get("name") or item.get("tool_name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            names.append(raw_name.strip())
+    return names
 
 
 async def _fetch_text(client: httpx.AsyncClient, url: str, user_agent: str) -> str:
@@ -485,6 +525,8 @@ async def _direct_query_case(
 def _ground_truth_outcome(ground_truth: dict[str, Any]) -> str:
     status = str(ground_truth.get("status") or "")
     if status == "http_error":
+        if ground_truth.get("http_status") == 404:
+            return "no_data"
         return "unresolved"
     expected = ground_truth.get("expected")
     if not isinstance(expected, dict):
@@ -504,6 +546,7 @@ async def _find_negative_variant(
     all_dimension_values: dict[str, list[DimensionValue]],
     query_mode_type: str,
     negative_case_options: dict[str, Any],
+    prompt_template: str,
     base_url: str,
     user_agent: str,
     wildcard_dimensions: set[str],
@@ -552,6 +595,7 @@ async def _find_negative_variant(
                     mutated_case["negativeStrategy"] = "swap_dimension_value"
                     mutated_case["expectedBehavior"] = "abstain_no_data"
                     mutated_case["ground_truth"] = ground_truth
+                    _refresh_case_prompt(mutated_case, prompt_template)
                     return mutated_case
 
         if strategy == "shift_year" and query_mode_type == "explicit_time_range" and base_time_period is not None:
@@ -581,6 +625,7 @@ async def _find_negative_variant(
                 mutated_case["negativeStrategy"] = "shift_year"
                 mutated_case["expectedBehavior"] = "abstain_no_data"
                 mutated_case["ground_truth"] = ground_truth
+                _refresh_case_prompt(mutated_case, prompt_template)
                 return mutated_case
 
     return None
@@ -634,7 +679,7 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                 if not isinstance(flow_ref, str) or not flow_ref.strip():
                     continue
                 normalized_flow_ref = flow_ref.strip()
-                payload = await server.get_flow_structure(normalized_flow_ref)
+                payload = await server._get_flow_structure(normalized_flow_ref)
                 dimension_order = await server._dimension_order_for_flow(normalized_flow_ref)
                 flow_name = _flow_name(normalized_flow_ref, payload)
                 flow_id = _flow_ref_parts(normalized_flow_ref)[1]
@@ -733,7 +778,7 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                 for case, task in zip(cases, tasks):
                     case["ground_truth"] = await task
                     outcome = _ground_truth_outcome(case["ground_truth"])
-                    if test_mode == "positive" and outcome != "resolved_single_value":
+                    if test_mode in {"positive", "mixed"} and outcome != "resolved_single_value":
                         continue
                     if test_mode == "negative":
                         continue
@@ -758,6 +803,7 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                             all_dimension_values=all_dimension_values,
                             query_mode_type=query_mode["type"],
                             negative_case_options=negative_case_options,
+                            prompt_template=prompt_template,
                             base_url=base_url,
                             user_agent=user_agent,
                             wildcard_dimensions=wildcard_dimensions,
@@ -898,6 +944,8 @@ async def run_provider(
             result = {
                 "case_id": case["case_id"],
                 "provider_name": provider_name,
+                "require_tool_use": bool(provider.get("require_tool_use")),
+                "max_answer_chars": provider.get("max_answer_chars"),
                 "status": provider_output.get("status", "ok"),
                 "prompt": case.get("prompt"),
                 "provider_output": provider_output,
@@ -938,6 +986,14 @@ def grade_results(
             claims = provider_output.get("claims") if isinstance(provider_output, dict) else {}
             if not isinstance(claims, dict):
                 claims = {}
+            used_tool_names = _tool_names_from_trace(provider_output.get("tool_trace") if isinstance(provider_output, dict) else None)
+            require_tool_use = bool(response.get("require_tool_use"))
+            tool_use_match = bool(used_tool_names) if require_tool_use else None
+            answer_text = provider_output.get("answer_text") if isinstance(provider_output, dict) else None
+            max_answer_chars = response.get("max_answer_chars")
+            answer_length_match = None
+            if isinstance(max_answer_chars, int) and max_answer_chars > 0 and isinstance(answer_text, str):
+                answer_length_match = len(answer_text) <= max_answer_chars
             expected_truth = case.get("ground_truth") or {}
             expected = expected_truth.get("expected") if isinstance(expected_truth, dict) else {}
             expected_value = expected.get("value") if isinstance(expected, dict) else None
@@ -971,6 +1027,10 @@ def grade_results(
             expected_behavior = str(case.get("expectedBehavior") or "")
             if response.get("status") != "ok":
                 overall = "manual_review"
+            elif tool_use_match is False:
+                overall = "fail"
+            elif answer_length_match is False:
+                overall = "fail"
             elif case_type == "negative" and expected_behavior == "abstain_no_data":
                 claim_value = claims.get("value")
                 if claim_value in (None, ""):
@@ -998,6 +1058,8 @@ def grade_results(
                 "provider_name": response.get("provider_name"),
                 "overall": overall,
                 "checks": {
+                    "tool_use_match": tool_use_match,
+                    "answer_length_match": answer_length_match,
                     "value_match": value_match,
                     "time_match": time_match,
                     "flow_match": flow_match,
@@ -1016,8 +1078,9 @@ def grade_results(
                     "query_url": expected_truth.get("query_url") if isinstance(expected_truth, dict) else None,
                 },
                 "actual": {
-                    "answer_text": provider_output.get("answer_text") if isinstance(provider_output, dict) else None,
+                    "answer_text": answer_text,
                     "claims": claims,
+                    "used_tools": used_tool_names,
                 },
             }
             handle.write(json.dumps(grade, ensure_ascii=True) + "\n")
