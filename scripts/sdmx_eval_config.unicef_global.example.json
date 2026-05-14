@@ -1,0 +1,64 @@
+{
+  "registry": {
+    "base_url": "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest",
+    "user_agent": "sdmx-eval-runner/0.1",
+    "time_dimension_id": "TIME_PERIOD"
+  },
+  "mcp": {
+    "transport": "streamable-http",
+    "url": "https://sdmx-mcp-eval.fly.dev/mcp",
+    "server_label": "sdmx"
+  },
+  "concurrency": 4,
+  "registry_profile": "sparse",
+  "test_mode": "mixed",
+  "query_mode": {
+    "type": "last_n_observations",
+    "last_n_observations": 1
+  },
+  "negative_case_options": {
+    "ratio": 0.5,
+    "strategies": ["swap_dimension_value"],
+    "max_attempts_per_case": 30
+  },
+  "dataflows": [
+    "UNICEF/GLOBAL_DATAFLOW/1.0"
+  ],
+  "dimensions": [
+    {
+      "id": "REF_AREA",
+      "mode": "fixed",
+      "values": ["FRA", "ITA", "USA"]
+    },
+    {
+      "id": "INDICATOR",
+      "mode": "fixed",
+      "values": ["CME_MRY0T4", "CME_MRY0", "CME_MRM0"]
+    },
+    {
+      "id": "SEX",
+      "mode": "fixed",
+      "values": ["_T", "_U"]
+    }
+  ],
+  "wildcard_dimensions": [],
+  "expected_value": {
+    "column_hint": "OBS_VALUE"
+  },
+  "prompt_template": "Use the SDMX MCP only. Query UNICEF/GLOBAL_DATAFLOW/1.0 with filters REF_AREA={REF_AREA_id}, INDICATOR={INDICATOR_id}, SEX={SEX_id}, and lastNObservations=1. Return a single JSON object only. In answer_text, use exactly this terse format when resolved: value: <value>; period: <period>. If the official MCP query has no observations or is unresolved, use answer_text: value: null.",
+  "provider": {
+    "type": "command",
+    "name": "anthropic",
+    "require_tool_use": true,
+    "max_answer_chars": 80,
+    "api_key_env": "ANTHROPIC_API_KEY",
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1200,
+    "temperature": 0,
+    "command": [
+      "python3",
+      "scripts/sdmx_eval_provider_anthropic.py"
+    ],
+    "env": {}
+  }
+}

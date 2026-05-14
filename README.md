@@ -412,6 +412,36 @@ python3 scripts/sdmx_eval_runner.py grade-results \
   --config scripts/sdmx_eval_config.example.json
 ```
 
+UNICEF global dataflow smoke/eval config:
+
+```bash
+python3 scripts/sdmx_eval_runner.py build-cases \
+  --config scripts/sdmx_eval_config.unicef_global.example.json \
+  --manifest tmp/sdmx_eval/unicef_global_cases.jsonl \
+  --case-limit 12
+
+export ANTHROPIC_API_KEY=...
+python3 scripts/sdmx_eval_runner.py run-provider \
+  --config scripts/sdmx_eval_config.unicef_global.example.json \
+  --manifest tmp/sdmx_eval/unicef_global_cases.jsonl \
+  --responses tmp/sdmx_eval/unicef_global_responses.jsonl \
+  --case-limit 12
+
+python3 scripts/sdmx_eval_runner.py grade-results \
+  --config scripts/sdmx_eval_config.unicef_global.example.json \
+  --manifest tmp/sdmx_eval/unicef_global_cases.jsonl \
+  --responses tmp/sdmx_eval/unicef_global_responses.jsonl \
+  --grades tmp/sdmx_eval/unicef_global_grades.jsonl
+```
+
+This config targets `UNICEF/GLOBAL_DATAFLOW/1.0`, the flow behind:
+
+```text
+https://sdmx.data.unicef.org/ws/public/sdmxapi/rest/data/UNICEF,GLOBAL_DATAFLOW,1.0/all?format=csv&labels=name
+```
+
+It builds direct SDMX ground truth first, then asks an MCP-connected agent to answer the same prompts. The Anthropic adapter instructs the agent to use the current validate/query flow (`validate_query_scope` or `resolve_and_query_data` with `resultShape='latest_single_value'`) and to abstain when official MCP results do not resolve. The grader checks the agent's structured claims for the numeric value, time period, flow reference, code filters, and MCP tool use so failures expose either retrieval errors or hallucinated claims.
+
 Anthropic setup:
 
 ```bash

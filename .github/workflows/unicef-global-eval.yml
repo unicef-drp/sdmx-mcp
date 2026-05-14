@@ -1,0 +1,100 @@
+name: UNICEF Global MCP Eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      case_limit:
+        description: Number of manifest cases to send to the agent
+        required: true
+        default: "12"
+      numeric_tolerance:
+        description: Absolute tolerance for numeric grading
+        required: true
+        default: "0.000000001"
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CONFIG: scripts/sdmx_eval_config.unicef_global.example.json
+      MANIFEST: tmp/sdmx_eval/unicef_global_cases.jsonl
+      RESPONSES: tmp/sdmx_eval/unicef_global_responses.jsonl
+      GRADES: tmp/sdmx_eval/unicef_global_grades.jsonl
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Validate Anthropic secret
+        run: |
+          test -n "$ANTHROPIC_API_KEY" || {
+            echo "ANTHROPIC_API_KEY GitHub Actions secret is not set"
+            exit 1
+          }
+
+      - name: Build direct SDMX ground truth cases
+        run: |
+          uv run python scripts/sdmx_eval_runner.py build-cases \
+            --config "$CONFIG" \
+            --manifest "$MANIFEST" \
+            --case-limit "${{ inputs.case_limit }}"
+
+      - name: Run MCP-connected agent
+        run: |
+          uv run python scripts/sdmx_eval_runner.py run-provider \
+            --config "$CONFIG" \
+            --manifest "$MANIFEST" \
+            --responses "$RESPONSES" \
+            --case-limit "${{ inputs.case_limit }}"
+
+      - name: Grade agent responses
+        run: |
+          uv run python scripts/sdmx_eval_runner.py grade-results \
+            --config "$CONFIG" \
+            --manifest "$MANIFEST" \
+            --responses "$RESPONSES" \
+            --grades "$GRADES" \
+            --numeric-tolerance "${{ inputs.numeric_tolerance }}"
+
+      - name: Summarize grades
+        run: |
+          uv run python - <<'PY'
+          import json
+          import os
+          import sys
+          from collections import Counter
+
+          grades_path = os.environ["GRADES"]
+          counts = Counter()
+          with open(grades_path, encoding="utf-8") as handle:
+              for line in handle:
+                  if line.strip():
+                      grade = json.loads(line)
+                      counts[grade.get("overall", "unknown")] += 1
+
+          print(json.dumps(dict(sorted(counts.items())), indent=2))
+          if counts.get("fail", 0):
+              sys.exit(1)
+          PY
+
+      - name: Upload eval artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: unicef-global-eval
+          path: |
+            ${{ env.MANIFEST }}
+            ${{ env.RESPONSES }}
+            ${{ env.GRADES }}
