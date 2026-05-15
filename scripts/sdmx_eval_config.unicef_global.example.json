@@ -45,11 +45,12 @@
   "expected_value": {
     "column_hint": "OBS_VALUE"
   },
-  "prompt_template": "Use the SDMX MCP only. Query UNICEF/GLOBAL_DATAFLOW/1.0 with filters REF_AREA={REF_AREA_id}, INDICATOR={INDICATOR_id}, SEX={SEX_id}, and lastNObservations=1. Return a single JSON object only. In answer_text, use exactly this terse format when resolved: value: <value>; period: <period>. If the official MCP query has no observations or is unresolved, use answer_text: value: null.",
+  "prompt_template": "Use the SDMX MCP only. Call get_single_observation for UNICEF/GLOBAL_DATAFLOW/1.0 with filters REF_AREA={REF_AREA_id}, INDICATOR={INDICATOR_id}, SEX={SEX_id}, and time=latest. Return a single JSON object only. In answer_text, use exactly this terse format when resolved: value: <value>; period: <period>. If the official MCP query has no observations or is unresolved, use answer_text: value: null.",
   "provider": {
     "type": "command",
     "name": "anthropic",
     "require_tool_use": true,
+    "required_tool_names": ["get_single_observation"],
     "max_answer_chars": 80,
     "api_key_env": "ANTHROPIC_API_KEY",
     "model": "claude-sonnet-4-20250514",

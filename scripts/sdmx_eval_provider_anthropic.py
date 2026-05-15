@@ -68,9 +68,9 @@ def _system_prompt(payload: dict[str, Any], provider: dict[str, Any]) -> str:
             "You are evaluating an SDMX MCP integration. "
             "Use the MCP tools for every case, answer only from the MCP-returned SDMX data, "
             "and do not use training data, external facts, or estimates. "
-            "For single-value questions, first resolve the official query with validate_query_scope or "
-            "resolve_and_query_data, then answer only if the official MCP result resolves. "
-            "Prefer resolve_and_query_data with resultShape='latest_single_value' when the flow and code filters are known. "
+            "For single-value questions, prefer get_single_observation when the flow and code filters are known, "
+            "then answer only if the official MCP result resolves. "
+            "Use get_indicator_table for multi-location tables and get_time_series for trend questions. "
             "If the MCP reports unresolved_from_official_flows, no observations, or an ambiguous/non-single-value shape, abstain with a null value. "
             "Return exactly one JSON object with no markdown fences."
         )
