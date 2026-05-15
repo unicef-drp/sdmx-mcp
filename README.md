@@ -412,6 +412,42 @@ python3 scripts/sdmx_eval_runner.py grade-results \
   --config scripts/sdmx_eval_config.example.json
 ```
 
+UNICEF global dataflow smoke/eval config:
+
+```bash
+python3 scripts/sdmx_eval_runner.py build-cases \
+  --config scripts/sdmx_eval_config.unicef_global.example.json \
+  --manifest tmp/sdmx_eval/unicef_global_cases.jsonl \
+  --case-limit 12
+
+export ANTHROPIC_API_KEY=...
+python3 scripts/sdmx_eval_runner.py run-provider \
+  --config scripts/sdmx_eval_config.unicef_global.example.json \
+  --manifest tmp/sdmx_eval/unicef_global_cases.jsonl \
+  --responses tmp/sdmx_eval/unicef_global_responses.jsonl \
+  --case-limit 12
+
+python3 scripts/sdmx_eval_runner.py grade-results \
+  --config scripts/sdmx_eval_config.unicef_global.example.json \
+  --manifest tmp/sdmx_eval/unicef_global_cases.jsonl \
+  --responses tmp/sdmx_eval/unicef_global_responses.jsonl \
+  --grades tmp/sdmx_eval/unicef_global_grades.jsonl
+```
+
+This config targets `UNICEF/GLOBAL_DATAFLOW/1.0`, the flow behind:
+
+```text
+https://sdmx.data.unicef.org/ws/public/sdmxapi/rest/data/UNICEF,GLOBAL_DATAFLOW,1.0/all?format=csv&labels=name
+```
+
+It builds direct SDMX ground truth first, then asks an MCP-connected agent to answer the same prompts through the configured MCP endpoint. The UNICEF config instructs the agent to use compact routing tools:
+
+- `get_single_observation` for one country, one indicator, and one period/latest.
+- `get_indicator_table` for multi-country, regional, comparison, or table-shaped requests.
+- `get_time_series` for trend, history, or chart-shaped requests.
+
+The grader checks the agent's structured claims for the numeric value, time period, flow reference, code filters, required MCP tool use, and concise answer shape so failures expose either retrieval errors, routing errors, or hallucinated claims.
+
 Anthropic setup:
 
 ```bash
@@ -420,6 +456,17 @@ python3 scripts/sdmx_eval_runner.py run-provider \
   --config scripts/sdmx_eval_config.example.json \
   --case-limit 25
 ```
+
+GitHub Actions setup:
+
+- Add `ANTHROPIC_API_KEY` as a repository or environment secret.
+- Run **UNICEF Global MCP Eval** manually from the Actions tab.
+- Use `target_ref=unicef` when evaluating the UNICEF branch.
+- Start with a small `case_limit` such as `4`, then run the full manifest once the smoke test passes.
+- Check the **Summarize grades** step for pass/fail counts, token usage, and estimated cost.
+- Download the `unicef-global-eval` artifact to inspect the generated manifest, raw provider responses, and grade records.
+
+The workflow is intentionally `workflow_dispatch` only. It does not run on `pull_request` or public fork events, and its `GITHUB_TOKEN` permissions are limited to `contents: read`. Public users cannot spend your Anthropic key just by opening a PR. Anyone with enough repository permission to manually run workflows could run this job with the configured secret, so keep write/workflow access limited and prefer an environment-protected secret if you need an approval gate for eval runs.
 
 ### Config Model
 

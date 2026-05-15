@@ -9,7 +9,11 @@ on:
       target_ref:
         description: Branch or ref to evaluate
         required: true
+        type: choice
         default: "unicef"
+        options:
+          - unicef
+          - main
       case_limit:
         description: Number of manifest cases to send to the agent
         required: true
