@@ -77,6 +77,7 @@ jobs:
           from collections import Counter
 
           grades_path = os.environ["GRADES"]
+          responses_path = os.environ["RESPONSES"]
           counts = Counter()
           with open(grades_path, encoding="utf-8") as handle:
               for line in handle:
@@ -84,7 +85,24 @@ jobs:
                       grade = json.loads(line)
                       counts[grade.get("overall", "unknown")] += 1
 
+          usage = Counter()
+          estimated_cost = 0.0
+          with open(responses_path, encoding="utf-8") as handle:
+              for line in handle:
+                  if not line.strip():
+                      continue
+                  response = json.loads(line)
+                  output = response.get("provider_output") or {}
+                  for key, value in (output.get("usage") or {}).items():
+                      if isinstance(value, int):
+                          usage[key] += value
+                  cost = output.get("estimated_cost_usd")
+                  if isinstance(cost, (int, float)):
+                      estimated_cost += float(cost)
+
           print(json.dumps(dict(sorted(counts.items())), indent=2))
+          print("token_usage=" + json.dumps(dict(sorted(usage.items())), sort_keys=True))
+          print(f"estimated_cost_usd={estimated_cost:.6f}")
           if counts.get("fail", 0):
               sys.exit(1)
           PY

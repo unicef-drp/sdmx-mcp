@@ -55,6 +55,12 @@
     "model": "claude-sonnet-4-20250514",
     "max_tokens": 1200,
     "temperature": 0,
+    "pricing": {
+      "input_usd_per_million": 3.0,
+      "output_usd_per_million": 15.0,
+      "cache_creation_input_usd_per_million": 3.75,
+      "cache_read_input_usd_per_million": 0.30
+    },
     "command": [
       "python3",
       "scripts/sdmx_eval_provider_anthropic.py"

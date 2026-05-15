@@ -150,10 +150,61 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _normalize_result(parsed: dict[str, Any], text: str, raw_response: dict[str, Any], tool_trace: list[dict[str, Any]]) -> dict[str, Any]:
+def _usage_summary(raw_response: dict[str, Any]) -> dict[str, int]:
+    raw_usage = raw_response.get("usage")
+    if not isinstance(raw_usage, dict):
+        return {}
+    usage: dict[str, int] = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ):
+        value = raw_usage.get(key)
+        if isinstance(value, int):
+            usage[key] = value
+    return usage
+
+
+def _estimated_cost_usd(usage: dict[str, int], provider: dict[str, Any]) -> float | None:
+    pricing = provider.get("pricing")
+    if not isinstance(pricing, dict):
+        return None
+
+    rate_map = {
+        "input_tokens": "input_usd_per_million",
+        "output_tokens": "output_usd_per_million",
+        "cache_creation_input_tokens": "cache_creation_input_usd_per_million",
+        "cache_read_input_tokens": "cache_read_input_usd_per_million",
+    }
+    total = 0.0
+    saw_rate = False
+    for usage_key, rate_key in rate_map.items():
+        token_count = usage.get(usage_key)
+        raw_rate = pricing.get(rate_key)
+        if token_count is None or raw_rate is None:
+            continue
+        try:
+            rate = float(raw_rate)
+        except (TypeError, ValueError):
+            continue
+        total += (token_count / 1_000_000) * rate
+        saw_rate = True
+    return round(total, 8) if saw_rate else None
+
+
+def _normalize_result(
+    parsed: dict[str, Any],
+    text: str,
+    raw_response: dict[str, Any],
+    tool_trace: list[dict[str, Any]],
+    provider: dict[str, Any],
+) -> dict[str, Any]:
     claims = parsed.get("claims")
     if not isinstance(claims, dict):
         claims = {}
+    usage = _usage_summary(raw_response)
     result = {
         "status": "ok",
         "answer_text": parsed.get("answer_text") if isinstance(parsed.get("answer_text"), str) else text,
@@ -164,6 +215,8 @@ def _normalize_result(parsed: dict[str, Any], text: str, raw_response: dict[str,
             "filters": claims.get("filters") if isinstance(claims.get("filters"), dict) else None,
         },
         "tool_trace": tool_trace,
+        "usage": usage,
+        "estimated_cost_usd": _estimated_cost_usd(usage, provider),
         "raw_response": raw_response,
     }
     return result
@@ -214,11 +267,13 @@ def main() -> None:
             "answer_text": text,
             "claims": {"value": None, "time_period": None, "flowRef": None, "filters": None},
             "tool_trace": tool_trace,
+            "usage": _usage_summary(raw),
+            "estimated_cost_usd": _estimated_cost_usd(_usage_summary(raw), provider),
             "raw_response": raw,
             "error": "Anthropic response did not contain a parseable JSON object.",
         }
     else:
-        result = _normalize_result(parsed, text, raw, tool_trace)
+        result = _normalize_result(parsed, text, raw, tool_trace, provider)
 
     json.dump(result, sys.stdout)
 

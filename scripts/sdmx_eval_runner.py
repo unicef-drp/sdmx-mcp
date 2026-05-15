@@ -372,6 +372,24 @@ async def _fetch_text(client: httpx.AsyncClient, url: str, user_agent: str) -> s
     return response.text
 
 
+async def _get_flow_structure_for_eval(flow_ref: str, user_agent: str) -> dict[str, Any]:
+    for attempt in range(1, 4):
+        try:
+            return await server._get_flow_structure(flow_ref)
+        except httpx.TimeoutException:
+            if attempt == 3:
+                break
+            await asyncio.sleep(attempt * 2)
+
+    url = server._structure_url(flow_ref)
+    async with httpx.AsyncClient(timeout=120.0, headers={"User-Agent": user_agent}) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        payload = response.json()
+    server._structure_cache[flow_ref] = payload
+    return payload
+
+
 async def _fetch_codelist(client: httpx.AsyncClient, url: str, user_agent: str) -> dict[str, DimensionValue]:
     text = await _fetch_text(client, url, user_agent)
     root = ET.fromstring(text)
@@ -679,7 +697,7 @@ async def build_cases(config: dict[str, Any], manifest_path: Path, case_limit: i
                 if not isinstance(flow_ref, str) or not flow_ref.strip():
                     continue
                 normalized_flow_ref = flow_ref.strip()
-                payload = await server._get_flow_structure(normalized_flow_ref)
+                payload = await _get_flow_structure_for_eval(normalized_flow_ref, user_agent)
                 dimension_order = await server._dimension_order_for_flow(normalized_flow_ref)
                 flow_name = _flow_name(normalized_flow_ref, payload)
                 flow_id = _flow_ref_parts(normalized_flow_ref)[1]
