@@ -367,6 +367,16 @@ Time inputs accepted by the query policy can be:
 - Purpose: high-level helper for common user questions.
 - Behavior: validates the direct query first, then attempts a single hierarchy-based member fallback when an aggregate code does not resolve, and finally returns a shaped result.
 
+25. `get_single_observation(flowRef, filters=None, subject=None, location=None, time='latest', extraFilters=None, labels='name')`
+- Purpose: compact exact-value tool for one indicator, one location, and one period/latest value.
+- Returns: only `status`, `value`, `period`, `unit`, and compact `source`; no raw CSV.
+
+26. `get_indicator_table(flowRef, filters=None, subject=None, locations=None, location=None, time='latest', extraFilters=None, labels='name', maxRows=200)`
+- Purpose: compact latest-by-location table for multi-country, group, comparison, ranking, or table requests.
+
+27. `get_time_series(flowRef, filters=None, subject=None, location=None, time='all', extraFilters=None, labels='name', maxObservations=500)`
+- Purpose: compact period/value series for trend, change-over-time, chart, or historical requests.
+
 ## Agent Test Rig
 
 `scripts/agent_test_rig.py` (direct call harness) simulates the intended LLM flow.

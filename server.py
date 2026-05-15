@@ -3031,6 +3031,182 @@ async def _execute_query_data(
     return payload
 
 
+def _compact_source(result: dict[str, Any]) -> dict[str, Any]:
+    provenance = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
+    return {
+        "flowRef": provenance.get("resolvedFlowRef") or provenance.get("requestedFlowRef"),
+        "key": provenance.get("key"),
+        "queryURL": provenance.get("queryURL"),
+        "filters": provenance.get("filters") or {},
+    }
+
+
+def _row_unit(row: dict[str, Any]) -> str | None:
+    for column in ("UNIT_MEASURE", "Unit of measure", "UNIT", "Unit"):
+        value = row.get(column)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _compact_unresolved(result: dict[str, Any], *, shape: str) -> dict[str, Any]:
+    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    return {
+        "status": result.get("status") or "unresolved",
+        "shape": shape,
+        "value": None,
+        "message": error.get("message") or result.get("assistant_guidance") or "The official SDMX query did not resolve.",
+        "source": _compact_source(result),
+    }
+
+
+def _compact_single_observation(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("status") != "resolved":
+        return _compact_unresolved(result, shape="single_observation")
+
+    shaped = result.get("shaped") if isinstance(result.get("shaped"), dict) else {}
+    source = _compact_source(result)
+    if shaped.get("status") != "resolved_single_value":
+        return {
+            "status": shaped.get("status") or "not_resolved_single_value",
+            "shape": "single_observation",
+            "value": None,
+            "period": shaped.get("latestPeriod"),
+            "message": shaped.get("message") or "The official query did not resolve to exactly one observation.",
+            "source": source,
+        }
+
+    observation = shaped.get("observation") if isinstance(shaped.get("observation"), dict) else {}
+    return {
+        "status": "resolved",
+        "shape": "single_observation",
+        "value": shaped.get("value"),
+        "period": shaped.get("latestPeriod"),
+        "unit": _row_unit(observation),
+        "source": source,
+    }
+
+
+def _compact_indicator_table(result: dict[str, Any], max_rows: int) -> dict[str, Any]:
+    if result.get("status") != "resolved":
+        return _compact_unresolved(result, shape="indicator_table")
+
+    shaped = result.get("shaped") if isinstance(result.get("shaped"), dict) else {}
+    if shaped.get("status") != "resolved":
+        return {
+            "status": shaped.get("status") or "not_resolved_table",
+            "shape": "indicator_table",
+            "message": shaped.get("reason") or "The official query did not resolve to a table.",
+            "source": _compact_source(result),
+            "rows": [],
+        }
+
+    rows = []
+    for item in (shaped.get("results") or [])[:max_rows]:
+        if not isinstance(item, dict):
+            continue
+        preview_rows = item.get("rows") or []
+        first_row = preview_rows[0] if preview_rows and isinstance(preview_rows[0], dict) else {}
+        rows.append(
+            {
+                "refArea": item.get("refArea"),
+                "period": item.get("latestPeriod"),
+                "value": item.get("value"),
+                "unit": _row_unit(first_row),
+                "rowCountAtLatestPeriod": item.get("rowCountAtLatestPeriod"),
+            }
+        )
+    return {
+        "status": "resolved",
+        "shape": "indicator_table",
+        "rows": rows,
+        "rowCount": len(rows),
+        "source": _compact_source(result),
+    }
+
+
+def _compact_time_series(result: dict[str, Any], max_observations: int) -> dict[str, Any]:
+    if result.get("status") != "resolved":
+        return _compact_unresolved(result, shape="time_series")
+
+    shaped = result.get("shaped") if isinstance(result.get("shaped"), dict) else {}
+    if shaped.get("status") != "resolved":
+        return {
+            "status": shaped.get("status") or "not_resolved_series",
+            "shape": "time_series",
+            "message": "The official query did not resolve to a time series.",
+            "source": _compact_source(result),
+            "series": [],
+        }
+
+    time_column = shaped.get("timeColumn")
+    value_column = shaped.get("valueColumn")
+    series = []
+    for row in (shaped.get("series") or [])[:max_observations]:
+        if not isinstance(row, dict):
+            continue
+        series.append(
+            {
+                "period": row.get(time_column) if isinstance(time_column, str) else None,
+                "value": row.get(value_column) if isinstance(value_column, str) else None,
+                "unit": _row_unit(row),
+            }
+        )
+    return {
+        "status": "resolved",
+        "shape": "time_series",
+        "series": series,
+        "observationCount": len(series),
+        "source": _compact_source(result),
+    }
+
+
+def _merge_filters(filters: dict[str, Any] | None, extra_filters: dict[str, Any] | None) -> dict[str, Any] | None:
+    merged: dict[str, Any] = {}
+    if filters:
+        merged.update({str(key).upper(): value for key, value in filters.items()})
+    if extra_filters:
+        merged.update({str(key).upper(): value for key, value in extra_filters.items()})
+    return merged or None
+
+
+async def _compact_query_args(
+    *,
+    flowRef: str,
+    filters: dict[str, Any] | None,
+    subject: str | None,
+    location: str | list[str] | None,
+    time: str | None,
+    extraFilters: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str | None, str | None, int | None, bool]:
+    merged_filters = _merge_filters(filters, extraFilters)
+    if merged_filters:
+        start_period, end_period, time_mode = _parse_time_range(time or "latest")
+        return (
+            merged_filters,
+            start_period,
+            end_period,
+            1 if time_mode == "latest" else None,
+            time_mode == "all",
+        )
+
+    location_value = "+".join(location) if isinstance(location, list) else location
+    provided_inputs = {
+        "subject": str(subject or "").strip(),
+        "location": str(location_value or "").strip(),
+        "time": str(time or "latest").strip(),
+    }
+    resolved = await _resolve_query_dimension_inputs(flowRef, provided_inputs)
+    resolved_filters, time_resolution, _, _ = _query_args_from_resolved_inputs(resolved)
+    return (
+        resolved_filters,
+        time_resolution.get("startPeriod"),
+        time_resolution.get("endPeriod"),
+        1 if time_resolution.get("useLatestObservation") else None,
+        bool(time_resolution.get("useAllObservations")),
+    )
+
+
 async def dataflows_resource() -> dict[str, Any]:
     return {"dataflows": await _dataflow_summaries()}
 
@@ -4690,6 +4866,131 @@ async def query_data(
         resultShape=resultShape,
         allowUnboundedTime=allowUnboundedTime,
     )
+
+
+@mcp.tool()
+async def get_single_observation(
+    flowRef: str,
+    filters: dict[str, Any] | None = None,
+    subject: Optional[str] = None,
+    location: Optional[str] = None,
+    time: Optional[str] = "latest",
+    extraFilters: dict[str, Any] | None = None,
+    labels: Optional[str] = "name",
+) -> dict[str, Any]:
+    """
+    Compact exact-value tool.
+
+    Use this when the user asks for one indicator, one location, and one period/latest value.
+    Prefer code-level filters when available. Otherwise provide subject/location/time text and
+    the configured query-dimension policy will resolve them.
+    Returns only a compact value payload; it does not return raw CSV.
+    """
+    query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
+        flowRef=flowRef,
+        filters=filters,
+        subject=subject,
+        location=location,
+        time=time,
+        extraFilters=extraFilters,
+    )
+    result = await _execute_query_data(
+        flowRef=flowRef,
+        filters=query_filters,
+        startPeriod=start_period,
+        endPeriod=end_period,
+        lastNObservations=last_n,
+        format="csv",
+        labels=labels,
+        maxObs=100,
+        resultShape="latest_single_value",
+        allowUnboundedTime=allow_unbounded,
+    )
+    return _compact_single_observation(result)
+
+
+@mcp.tool()
+async def get_indicator_table(
+    flowRef: str,
+    filters: dict[str, Any] | None = None,
+    subject: Optional[str] = None,
+    locations: list[str] | None = None,
+    location: Optional[str] = None,
+    time: Optional[str] = "latest",
+    extraFilters: dict[str, Any] | None = None,
+    labels: Optional[str] = "name",
+    maxRows: int = 200,
+) -> dict[str, Any]:
+    """
+    Compact latest-by-location table tool.
+
+    Use this when the user asks for multiple countries, a region/group table, a comparison,
+    or a ranking for one indicator and one period/latest value.
+    Returns compact rows rather than raw CSV.
+    """
+    location_input: str | list[str] | None = locations if locations else location
+    query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
+        flowRef=flowRef,
+        filters=filters,
+        subject=subject,
+        location=location_input,
+        time=time,
+        extraFilters=extraFilters,
+    )
+    result = await _execute_query_data(
+        flowRef=flowRef,
+        filters=query_filters,
+        startPeriod=start_period,
+        endPeriod=end_period,
+        lastNObservations=last_n,
+        format="csv",
+        labels=labels,
+        maxObs=maxRows,
+        resultShape="latest_by_ref_area",
+        allowUnboundedTime=allow_unbounded,
+    )
+    return _compact_indicator_table(result, max_rows=max(1, maxRows))
+
+
+@mcp.tool()
+async def get_time_series(
+    flowRef: str,
+    filters: dict[str, Any] | None = None,
+    subject: Optional[str] = None,
+    location: Optional[str] = None,
+    time: Optional[str] = "all",
+    extraFilters: dict[str, Any] | None = None,
+    labels: Optional[str] = "name",
+    maxObservations: int = 500,
+) -> dict[str, Any]:
+    """
+    Compact time-series tool.
+
+    Use this when the user asks for trends, change over time, a chart, or a series.
+    Set time to a single period, a range like '2000:2024', or 'all'.
+    Returns compact period/value rows rather than raw CSV.
+    """
+    query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
+        flowRef=flowRef,
+        filters=filters,
+        subject=subject,
+        location=location,
+        time=time,
+        extraFilters=extraFilters,
+    )
+    result = await _execute_query_data(
+        flowRef=flowRef,
+        filters=query_filters,
+        startPeriod=start_period,
+        endPeriod=end_period,
+        lastNObservations=last_n,
+        format="csv",
+        labels=labels,
+        maxObs=maxObservations,
+        resultShape="compact_series",
+        allowUnboundedTime=True if allow_unbounded else bool(start_period and end_period),
+    )
+    return _compact_time_series(result, max_observations=max(1, maxObservations))
 
 
 @mcp.tool()

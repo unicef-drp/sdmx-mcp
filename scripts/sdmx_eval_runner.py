@@ -366,6 +366,13 @@ def _tool_names_from_trace(tool_trace: Any) -> list[str]:
     return names
 
 
+def _tool_name_matches(used_tool_names: list[str], required_tool_name: str) -> bool:
+    required = required_tool_name.strip()
+    if not required:
+        return True
+    return any(name == required or name.endswith(required) for name in used_tool_names)
+
+
 async def _fetch_text(client: httpx.AsyncClient, url: str, user_agent: str) -> str:
     response = await client.get(url, headers={"User-Agent": user_agent})
     response.raise_for_status()
@@ -963,6 +970,7 @@ async def run_provider(
                 "case_id": case["case_id"],
                 "provider_name": provider_name,
                 "require_tool_use": bool(provider.get("require_tool_use")),
+                "required_tool_names": provider.get("required_tool_names"),
                 "max_answer_chars": provider.get("max_answer_chars"),
                 "status": provider_output.get("status", "ok"),
                 "prompt": case.get("prompt"),
@@ -1007,6 +1015,15 @@ def grade_results(
             used_tool_names = _tool_names_from_trace(provider_output.get("tool_trace") if isinstance(provider_output, dict) else None)
             require_tool_use = bool(response.get("require_tool_use"))
             tool_use_match = bool(used_tool_names) if require_tool_use else None
+            required_tool_names = response.get("required_tool_names")
+            if not isinstance(required_tool_names, list):
+                required_tool_names = []
+            required_tool_match = None
+            if required_tool_names:
+                required_tool_match = all(
+                    _tool_name_matches(used_tool_names, str(required_tool_name))
+                    for required_tool_name in required_tool_names
+                )
             answer_text = provider_output.get("answer_text") if isinstance(provider_output, dict) else None
             max_answer_chars = response.get("max_answer_chars")
             answer_length_match = None
@@ -1047,6 +1064,8 @@ def grade_results(
                 overall = "manual_review"
             elif tool_use_match is False:
                 overall = "fail"
+            elif required_tool_match is False:
+                overall = "fail"
             elif answer_length_match is False:
                 overall = "fail"
             elif case_type == "negative" and expected_behavior == "abstain_no_data":
@@ -1077,6 +1096,7 @@ def grade_results(
                 "overall": overall,
                 "checks": {
                     "tool_use_match": tool_use_match,
+                    "required_tool_match": required_tool_match,
                     "answer_length_match": answer_length_match,
                     "value_match": value_match,
                     "time_match": time_match,
