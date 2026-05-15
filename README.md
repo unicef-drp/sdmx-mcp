@@ -450,7 +450,13 @@ This config targets `UNICEF/GLOBAL_DATAFLOW/1.0`, the flow behind:
 https://sdmx.data.unicef.org/ws/public/sdmxapi/rest/data/UNICEF,GLOBAL_DATAFLOW,1.0/all?format=csv&labels=name
 ```
 
-It builds direct SDMX ground truth first, then asks an MCP-connected agent to answer the same prompts. The Anthropic adapter instructs the agent to use the current validate/query flow (`validate_query_scope` or `resolve_and_query_data` with `resultShape='latest_single_value'`) and to abstain when official MCP results do not resolve. The grader checks the agent's structured claims for the numeric value, time period, flow reference, code filters, and MCP tool use so failures expose either retrieval errors or hallucinated claims.
+It builds direct SDMX ground truth first, then asks an MCP-connected agent to answer the same prompts through the configured MCP endpoint. The UNICEF config instructs the agent to use compact routing tools:
+
+- `get_single_observation` for one country, one indicator, and one period/latest.
+- `get_indicator_table` for multi-country, regional, comparison, or table-shaped requests.
+- `get_time_series` for trend, history, or chart-shaped requests.
+
+The grader checks the agent's structured claims for the numeric value, time period, flow reference, code filters, required MCP tool use, and concise answer shape so failures expose either retrieval errors, routing errors, or hallucinated claims.
 
 Anthropic setup:
 
@@ -460,6 +466,17 @@ python3 scripts/sdmx_eval_runner.py run-provider \
   --config scripts/sdmx_eval_config.example.json \
   --case-limit 25
 ```
+
+GitHub Actions setup:
+
+- Add `ANTHROPIC_API_KEY` as a repository or environment secret.
+- Run **UNICEF Global MCP Eval** manually from the Actions tab.
+- Use `target_ref=unicef` when evaluating the UNICEF branch.
+- Start with a small `case_limit` such as `4`, then run the full manifest once the smoke test passes.
+- Check the **Summarize grades** step for pass/fail counts, token usage, and estimated cost.
+- Download the `unicef-global-eval` artifact to inspect the generated manifest, raw provider responses, and grade records.
+
+The workflow is intentionally `workflow_dispatch` only. It does not run on `pull_request` or public fork events, and its `GITHUB_TOKEN` permissions are limited to `contents: read`. Public users cannot spend your Anthropic key just by opening a PR. Anyone with enough repository permission to manually run workflows could run this job with the configured secret, so keep write/workflow access limited and prefer an environment-protected secret if you need an approval gate for eval runs.
 
 ### Config Model
 
