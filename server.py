@@ -33,6 +33,7 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 BASE = os.getenv("SDMX_BASE_URL", "").strip().rstrip("/")
 MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
 HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "sdmx-mcp/0.1").strip() or "sdmx-mcp/0.1"
+STRUCTURE_REFERENCES = os.getenv("SDMX_STRUCTURE_REFERENCES", "descendants").strip() or "descendants"
 
 
 def _env_csv(name: str) -> list[str]:
@@ -618,8 +619,11 @@ def _dataflow_url() -> str:
 
 
 def _structure_url(flow_ref: str) -> str:
-    # Fetch related structures (DSD, codelists) in one request when supported.
-    return f"{_sdmx_base()}/dataflow/{_flow_path_for(flow_ref)}/?format=sdmx-json&detail=full&references=all"
+    # Fetch the flow and descendant structures (DSD, codelists, concepts) in one request when supported.
+    return (
+        f"{_sdmx_base()}/dataflow/{_flow_path_for(flow_ref)}/?"
+        f"format=sdmx-json&detail=full&references={quote(STRUCTURE_REFERENCES)}"
+    )
 
 
 def _codelist_url(codelist_ref: str) -> str:
@@ -4145,7 +4149,7 @@ async def guided_discover(
 @mcp.tool()
 async def get_flow_structure(flowRef: str) -> dict[str, Any]:
     """
-    Fetch and cache a flow's structure payload (DSD + codelists via references=all).
+    Fetch and cache a flow's structure payload (DSD + codelists via configured references mode).
     """
     return await _get_flow_structure(flowRef)
 

@@ -314,7 +314,7 @@ Time inputs accepted by the query policy can be:
 - Behavior: uses the chosen discovery mode as the visible entry path, then resolves subject/location/time according to the configured backend policy before validating and executing the query.
 
 14. `get_flow_structure(flowRef)`
-- Purpose: fetch/cache structure payload (`references=all`).
+- Purpose: fetch/cache structure payload. By default, structure requests use `references=descendants` to retrieve the DSD, codelists, and concepts without unrelated registry artifacts. Override with `SDMX_STRUCTURE_REFERENCES` if a registry requires another SDMX references mode.
 
 15. `build_key(flowRef, selections)`
 - Purpose: build SDMX key from dimension selections.
