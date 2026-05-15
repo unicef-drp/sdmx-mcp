@@ -26,6 +26,7 @@ on:
 jobs:
   eval:
     runs-on: ubuntu-latest
+    environment: mcp-eval
     permissions:
       contents: read
     env:
