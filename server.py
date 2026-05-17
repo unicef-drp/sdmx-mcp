@@ -2686,19 +2686,23 @@ async def _resolve_time_value(
 ) -> TimeResolutionDict:
     start_period, end_period, time_mode = _parse_time_range(raw_time_range)
     dim = _dimension_meta(payload, DIM_TIME_PERIOD)
-    if not dim:
-        raise ValueError(f"Unable to resolve time dimension for flow '{flow_ref}' using the configured policy.")
+    dimension_id = str(dim.get("id") or DIM_TIME_PERIOD) if dim else DIM_TIME_PERIOD
+    source = (
+        {"type": "dimension", "id": dimension_id}
+        if dim
+        else {"type": "query_parameter", "id": DIM_TIME_PERIOD}
+    )
     return {
         "name": policy.name,
         "role": policy.role,
-        "dimension_id": str(dim.get("id") or ""),
+        "dimension_id": dimension_id,
         "value": raw_time_range.strip(),
         "startPeriod": start_period,
         "endPeriod": end_period,
         "timeMode": time_mode,
         "useLatestObservation": time_mode == "latest",
         "useAllObservations": time_mode == "all",
-        "source": {"type": "dimension", "id": DIM_TIME_PERIOD},
+        "source": source,
         "flowRef": flow_ref,
     }
 

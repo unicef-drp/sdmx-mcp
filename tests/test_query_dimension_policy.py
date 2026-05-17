@@ -303,6 +303,28 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(resolved["useAllObservations"])
         self.assertFalse(resolved["useLatestObservation"])
 
+    async def test_time_range_uses_query_parameter_when_time_dimension_absent(self) -> None:
+        payload = _payload_with_subject_geo_and_time()
+        dimensions = payload["structure"]["dataStructures"]["dataStructure"]["TEST_DSD"]["dataStructureComponents"][
+            "dimensionList"
+        ]["dimensions"]
+        payload["structure"]["dataStructures"]["dataStructure"]["TEST_DSD"]["dataStructureComponents"]["dimensionList"][
+            "dimensions"
+        ] = [dimension for dimension in dimensions if dimension["id"] != "TIME_PERIOD"]
+        policy = server.QueryDimensionPolicyEntry(
+            name="time",
+            role="time",
+            required_for_retrieval=True,
+            priority=3,
+        )
+
+        resolved = await server._resolve_time_value("UNICEF,CME,1.0", payload, "1990:2024", policy)
+
+        self.assertEqual(resolved["dimension_id"], "TIME_PERIOD")
+        self.assertEqual(resolved["startPeriod"], "1990")
+        self.assertEqual(resolved["endPeriod"], "2024")
+        self.assertEqual(resolved["source"], {"type": "query_parameter", "id": "TIME_PERIOD"})
+
     def test_codelist_key_supports_agency_id_version_format(self) -> None:
         self.assertEqual(server._codelist_key("UNICEF/CL_GEO/1.0"), "CL_GEO")
 
