@@ -3152,10 +3152,23 @@ def _compact_time_series(result: dict[str, Any], max_observations: int) -> dict[
 
     time_column = shaped.get("timeColumn")
     value_column = shaped.get("valueColumn")
+    raw_series = [row for row in (shaped.get("series") or []) if isinstance(row, dict)]
+    signatures = {
+        _series_signature(row, time_column=time_column, value_column=value_column)
+        for row in raw_series
+    }
+    if len(signatures) > 1:
+        summary = shaped.get("summary") if isinstance(shaped.get("summary"), dict) else {}
+        return {
+            "status": "not_a_single_series",
+            "shape": "time_series",
+            "message": "The official query returned multiple distinct series. Narrow more dimensions before returning a time series.",
+            "source": _compact_source(result),
+            "distinctCounts": summary.get("distinctCounts") or {},
+            "preview": raw_series[: min(max_observations, 10)],
+        }
     series = []
-    for row in (shaped.get("series") or [])[:max_observations]:
-        if not isinstance(row, dict):
-            continue
+    for row in raw_series[:max_observations]:
         series.append(
             {
                 "period": row.get(time_column) if isinstance(time_column, str) else None,

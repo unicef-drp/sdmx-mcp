@@ -179,6 +179,28 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(match, ("UNICEF_ESA", "Eastern and Southern Africa (UNICEF Rep.Regions)"))
 
+    def test_compact_time_series_rejects_multiple_distinct_series(self) -> None:
+        compact = server._compact_time_series(
+            {
+                "status": "resolved",
+                "provenance": {"resolvedFlowRef": "UNICEF/CME/1.0", "filters": {"REF_AREA": "UNICEF_ESA"}},
+                "shaped": {
+                    "status": "resolved",
+                    "timeColumn": "TIME_PERIOD",
+                    "valueColumn": "OBS_VALUE",
+                    "summary": {"distinctCounts": {"SEX": 2}},
+                    "series": [
+                        {"TIME_PERIOD": "2020", "OBS_VALUE": "1", "SEX": "_T"},
+                        {"TIME_PERIOD": "2020", "OBS_VALUE": "2", "SEX": "F"},
+                    ],
+                },
+            },
+            max_observations=5,
+        )
+
+        self.assertEqual(compact["status"], "not_a_single_series")
+        self.assertEqual(compact["distinctCounts"], {"SEX": 2})
+
     async def test_location_resolution_expands_hierarchy_members_when_enabled(self) -> None:
         payload = _payload_with_subject_geo_and_time()
         policy = server.QueryDimensionPolicyEntry(
