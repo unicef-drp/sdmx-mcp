@@ -1,3 +1,6 @@
 # flyctl launch added from .venv/.gitignore
 .venv/**/*
+.git
+.env
+tmp/
 fly.toml
