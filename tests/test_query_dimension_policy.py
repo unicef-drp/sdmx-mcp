@@ -399,6 +399,68 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved["endPeriod"], "2024")
         self.assertEqual(resolved["source"], {"type": "query_parameter", "id": "TIME_PERIOD"})
 
+    async def test_compact_query_args_merges_filters_with_resolved_text_inputs(self) -> None:
+        resolved = {
+            "subject": {
+                "role": "subject",
+                "dimension_id": "INDICATOR",
+                "values": ["CME_MRY0T4"],
+            },
+            "location": {
+                "role": "geography",
+                "dimension_id": "REF_AREA",
+                "values": ["UNICEF_ESA"],
+            },
+            "time": {
+                "role": "time",
+                "startPeriod": "1990",
+                "endPeriod": "2024",
+                "useLatestObservation": False,
+                "useAllObservations": False,
+            },
+            "_resolution_order": ["subject", "location", "time"],
+        }
+
+        with patch("server._resolve_query_dimension_inputs", return_value=resolved):
+            filters, start_period, end_period, last_n, allow_unbounded = await server._compact_query_args(
+                flowRef="UNICEF/CME/1.0",
+                filters={"SEX": "_T"},
+                subject="under-five mortality rate",
+                location="Eastern and Southern Africa",
+                time="1990:2024",
+                extraFilters={"WEALTH_QUINTILE": "_T"},
+            )
+
+        self.assertEqual(
+            filters,
+            {
+                "INDICATOR": ["CME_MRY0T4"],
+                "REF_AREA": ["UNICEF_ESA"],
+                "SEX": "_T",
+                "WEALTH_QUINTILE": "_T",
+            },
+        )
+        self.assertEqual(start_period, "1990")
+        self.assertEqual(end_period, "2024")
+        self.assertIsNone(last_n)
+        self.assertFalse(allow_unbounded)
+
+    async def test_compact_query_args_keeps_filters_only_path(self) -> None:
+        filters, start_period, end_period, last_n, allow_unbounded = await server._compact_query_args(
+            flowRef="UNICEF/CME/1.0",
+            filters={"REF_AREA": "UNICEF_ESA", "INDICATOR": "CME_MRY0T4"},
+            subject=None,
+            location=None,
+            time="latest",
+            extraFilters={"SEX": "_T"},
+        )
+
+        self.assertEqual(filters, {"REF_AREA": "UNICEF_ESA", "INDICATOR": "CME_MRY0T4", "SEX": "_T"})
+        self.assertIsNone(start_period)
+        self.assertIsNone(end_period)
+        self.assertEqual(last_n, 1)
+        self.assertFalse(allow_unbounded)
+
     def test_codelist_key_supports_agency_id_version_format(self) -> None:
         self.assertEqual(server._codelist_key("UNICEF/CL_GEO/1.0"), "CL_GEO")
 

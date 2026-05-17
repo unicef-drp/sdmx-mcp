@@ -3217,17 +3217,18 @@ async def _compact_query_args(
     extraFilters: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], str | None, str | None, int | None, bool]:
     merged_filters = _merge_filters(filters, extraFilters)
-    if merged_filters:
+    location_value = "+".join(location) if isinstance(location, list) else location
+    has_text_inputs = bool(str(subject or "").strip() or str(location_value or "").strip())
+    if not has_text_inputs:
         start_period, end_period, time_mode = _parse_time_range(time or "latest")
         return (
-            merged_filters,
+            merged_filters or {},
             start_period,
             end_period,
             1 if time_mode == "latest" else None,
             time_mode == "all",
         )
 
-    location_value = "+".join(location) if isinstance(location, list) else location
     provided_inputs = {
         "subject": str(subject or "").strip(),
         "location": str(location_value or "").strip(),
@@ -3235,8 +3236,11 @@ async def _compact_query_args(
     }
     resolved = await _resolve_query_dimension_inputs(flowRef, provided_inputs)
     resolved_filters, time_resolution, _, _ = _query_args_from_resolved_inputs(resolved)
+    query_filters = dict(resolved_filters)
+    if merged_filters:
+        query_filters.update(merged_filters)
     return (
-        resolved_filters,
+        query_filters,
         time_resolution.get("startPeriod"),
         time_resolution.get("endPeriod"),
         1 if time_resolution.get("useLatestObservation") else None,
