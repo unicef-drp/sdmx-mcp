@@ -1409,9 +1409,20 @@ def _series_signature(
     time_column: str | None,
     value_column: str | None,
 ) -> tuple[tuple[str, str], ...]:
+    ignored_columns = {
+        str(time_column or "").lower(),
+        str(value_column or "").lower(),
+        "obs_value",
+        "value",
+        "lower_bound",
+        "upper_bound",
+        "ref_period",
+        "observation status",
+        "obs_status",
+    }
     signature: list[tuple[str, str]] = []
     for key in sorted(row):
-        if key in {time_column, value_column}:
+        if key.lower() in ignored_columns:
             continue
         value = row.get(key)
         signature.append((key, "" if value is None else str(value).strip()))
@@ -1662,7 +1673,9 @@ def _dimension_order_from_structure(payload: dict[str, Any]) -> list[str]:
         for dim in dim_items:
             dim_id = dim.get("id") or dim.get("ID")
             if isinstance(dim_id, str):
-                ordered.append(dim_id.upper())
+                normalized_dim_id = dim_id.upper()
+                if normalized_dim_id != DIM_TIME_PERIOD:
+                    ordered.append(normalized_dim_id)
         if ordered:
             return ordered
     return []
@@ -2217,6 +2230,8 @@ def _matching_code_label(codes: list[dict[str, Any]], token: str) -> tuple[str, 
     wanted = token.strip().lower()
     if not wanted:
         return None
+    normalized_wanted = " ".join(re.findall(r"[a-z0-9]+", wanted))
+    phrase_matches: list[tuple[str, str]] = []
     for code in codes:
         code_id = code.get("id") or code.get("ID")
         if not isinstance(code_id, str):
@@ -2224,6 +2239,11 @@ def _matching_code_label(codes: list[dict[str, Any]], token: str) -> tuple[str, 
         name = _coerce_text(code.get("name")) or _coerce_text(code.get("names"))
         if name and name.strip().lower() == wanted:
             return code_id, name
+        normalized_name = " ".join(re.findall(r"[a-z0-9]+", name.lower()))
+        if normalized_wanted and normalized_name.startswith(normalized_wanted):
+            phrase_matches.append((code_id, name))
+    if phrase_matches:
+        return phrase_matches[0]
     return None
 
 
@@ -2686,19 +2706,23 @@ async def _resolve_time_value(
 ) -> TimeResolutionDict:
     start_period, end_period, time_mode = _parse_time_range(raw_time_range)
     dim = _dimension_meta(payload, DIM_TIME_PERIOD)
-    if not dim:
-        raise ValueError(f"Unable to resolve time dimension for flow '{flow_ref}' using the configured policy.")
+    dimension_id = str(dim.get("id") or DIM_TIME_PERIOD) if dim else DIM_TIME_PERIOD
+    source = (
+        {"type": "dimension", "id": dimension_id}
+        if dim
+        else {"type": "query_parameter", "id": DIM_TIME_PERIOD}
+    )
     return {
         "name": policy.name,
         "role": policy.role,
-        "dimension_id": str(dim.get("id") or ""),
+        "dimension_id": dimension_id,
         "value": raw_time_range.strip(),
         "startPeriod": start_period,
         "endPeriod": end_period,
         "timeMode": time_mode,
         "useLatestObservation": time_mode == "latest",
         "useAllObservations": time_mode == "all",
-        "source": {"type": "dimension", "id": DIM_TIME_PERIOD},
+        "source": source,
         "flowRef": flow_ref,
     }
 
@@ -3141,10 +3165,23 @@ def _compact_time_series(result: dict[str, Any], max_observations: int) -> dict[
 
     time_column = shaped.get("timeColumn")
     value_column = shaped.get("valueColumn")
+    raw_series = [row for row in (shaped.get("series") or []) if isinstance(row, dict)]
+    signatures = {
+        _series_signature(row, time_column=time_column, value_column=value_column)
+        for row in raw_series
+    }
+    if len(signatures) > 1:
+        summary = shaped.get("summary") if isinstance(shaped.get("summary"), dict) else {}
+        return {
+            "status": "not_a_single_series",
+            "shape": "time_series",
+            "message": "The official query returned multiple distinct series. Narrow more dimensions before returning a time series.",
+            "source": _compact_source(result),
+            "distinctCounts": summary.get("distinctCounts") or {},
+            "preview": raw_series[: min(max_observations, 10)],
+        }
     series = []
-    for row in (shaped.get("series") or [])[:max_observations]:
-        if not isinstance(row, dict):
-            continue
+    for row in raw_series[:max_observations]:
         series.append(
             {
                 "period": row.get(time_column) if isinstance(time_column, str) else None,

@@ -106,6 +106,11 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("format=csv", plan["queryURL"])
         self.assertIn("labels=name", plan["queryURL"])
 
+    def test_dimension_order_excludes_time_period_key_dimension(self) -> None:
+        payload = _payload_with_subject_geo_and_time()
+
+        self.assertEqual(server._dimension_order_from_structure(payload), ["REF_AREA", "SUBJECT"])
+
     async def test_query_plan_skips_default_last_n_when_env_disabled(self) -> None:
         with patch.dict(os.environ, {"SDMX_DEFAULT_LAST_N_OBSERVATIONS": "FALSE"}, clear=False), patch(
             "server._resolved_flow_details", return_value={"resolvedFlowRef": "UNICEF/TEST_FLOW/1.0"}
@@ -167,6 +172,75 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved["dimension_id"], "SUBJECT")
         self.assertEqual(resolved["values"], ["U5MR"])
         self.assertEqual(resolved["matches"][0]["source"], {"type": "codelist", "id": "UNICEF/CL_SUBJECT/1.0"})
+
+    def test_code_label_resolution_accepts_parenthetical_suffix(self) -> None:
+        match = server._matching_code_label(
+            [
+                {"id": "UNICEF_ESA", "name": {"en": "Eastern and Southern Africa (UNICEF Rep.Regions)"}},
+                {"id": "UNICEF_WCA", "name": {"en": "West and Central Africa (UNICEF Rep.Regions)"}},
+            ],
+            "Eastern and Southern Africa",
+        )
+
+        self.assertEqual(match, ("UNICEF_ESA", "Eastern and Southern Africa (UNICEF Rep.Regions)"))
+
+    def test_compact_time_series_rejects_multiple_distinct_series(self) -> None:
+        compact = server._compact_time_series(
+            {
+                "status": "resolved",
+                "provenance": {"resolvedFlowRef": "UNICEF/CME/1.0", "filters": {"REF_AREA": "UNICEF_ESA"}},
+                "shaped": {
+                    "status": "resolved",
+                    "timeColumn": "TIME_PERIOD",
+                    "valueColumn": "OBS_VALUE",
+                    "summary": {"distinctCounts": {"SEX": 2}},
+                    "series": [
+                        {"TIME_PERIOD": "2020", "OBS_VALUE": "1", "SEX": "_T"},
+                        {"TIME_PERIOD": "2020", "OBS_VALUE": "2", "SEX": "F"},
+                    ],
+                },
+            },
+            max_observations=5,
+        )
+
+        self.assertEqual(compact["status"], "not_a_single_series")
+        self.assertEqual(compact["distinctCounts"], {"SEX": 2})
+
+    def test_compact_time_series_ignores_observation_attributes_for_series_identity(self) -> None:
+        compact = server._compact_time_series(
+            {
+                "status": "resolved",
+                "provenance": {
+                    "resolvedFlowRef": "UNICEF/CME/1.0",
+                    "filters": {"REF_AREA": "UNICEF_ESA", "INDICATOR": "CME_MRY0T4", "SEX": "_T"},
+                },
+                "shaped": {
+                    "status": "resolved",
+                    "timeColumn": "TIME_PERIOD",
+                    "valueColumn": "OBS_VALUE",
+                    "series": [
+                        {
+                            "TIME_PERIOD": "2020",
+                            "OBS_VALUE": "1",
+                            "LOWER_BOUND": "0",
+                            "UPPER_BOUND": "2",
+                            "Sex": "Total",
+                        },
+                        {
+                            "TIME_PERIOD": "2021",
+                            "OBS_VALUE": "3",
+                            "LOWER_BOUND": "2",
+                            "UPPER_BOUND": "4",
+                            "Sex": "Total",
+                        },
+                    ],
+                },
+            },
+            max_observations=5,
+        )
+
+        self.assertEqual(compact["status"], "resolved")
+        self.assertEqual(len(compact["series"]), 2)
 
     async def test_location_resolution_expands_hierarchy_members_when_enabled(self) -> None:
         payload = _payload_with_subject_geo_and_time()
@@ -302,6 +376,28 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(resolved["endPeriod"])
         self.assertTrue(resolved["useAllObservations"])
         self.assertFalse(resolved["useLatestObservation"])
+
+    async def test_time_range_uses_query_parameter_when_time_dimension_absent(self) -> None:
+        payload = _payload_with_subject_geo_and_time()
+        dimensions = payload["structure"]["dataStructures"]["dataStructure"]["TEST_DSD"]["dataStructureComponents"][
+            "dimensionList"
+        ]["dimensions"]
+        payload["structure"]["dataStructures"]["dataStructure"]["TEST_DSD"]["dataStructureComponents"]["dimensionList"][
+            "dimensions"
+        ] = [dimension for dimension in dimensions if dimension["id"] != "TIME_PERIOD"]
+        policy = server.QueryDimensionPolicyEntry(
+            name="time",
+            role="time",
+            required_for_retrieval=True,
+            priority=3,
+        )
+
+        resolved = await server._resolve_time_value("UNICEF,CME,1.0", payload, "1990:2024", policy)
+
+        self.assertEqual(resolved["dimension_id"], "TIME_PERIOD")
+        self.assertEqual(resolved["startPeriod"], "1990")
+        self.assertEqual(resolved["endPeriod"], "2024")
+        self.assertEqual(resolved["source"], {"type": "query_parameter", "id": "TIME_PERIOD"})
 
     def test_codelist_key_supports_agency_id_version_format(self) -> None:
         self.assertEqual(server._codelist_key("UNICEF/CL_GEO/1.0"), "CL_GEO")
