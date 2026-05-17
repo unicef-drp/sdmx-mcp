@@ -1673,7 +1673,9 @@ def _dimension_order_from_structure(payload: dict[str, Any]) -> list[str]:
         for dim in dim_items:
             dim_id = dim.get("id") or dim.get("ID")
             if isinstance(dim_id, str):
-                ordered.append(dim_id.upper())
+                normalized_dim_id = dim_id.upper()
+                if normalized_dim_id != DIM_TIME_PERIOD:
+                    ordered.append(normalized_dim_id)
         if ordered:
             return ordered
     return []

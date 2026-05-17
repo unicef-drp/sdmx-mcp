@@ -106,6 +106,11 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("format=csv", plan["queryURL"])
         self.assertIn("labels=name", plan["queryURL"])
 
+    def test_dimension_order_excludes_time_period_key_dimension(self) -> None:
+        payload = _payload_with_subject_geo_and_time()
+
+        self.assertEqual(server._dimension_order_from_structure(payload), ["REF_AREA", "SUBJECT"])
+
     async def test_query_plan_skips_default_last_n_when_env_disabled(self) -> None:
         with patch.dict(os.environ, {"SDMX_DEFAULT_LAST_N_OBSERVATIONS": "FALSE"}, clear=False), patch(
             "server._resolved_flow_details", return_value={"resolvedFlowRef": "UNICEF/TEST_FLOW/1.0"}
