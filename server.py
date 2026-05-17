@@ -2217,6 +2217,8 @@ def _matching_code_label(codes: list[dict[str, Any]], token: str) -> tuple[str, 
     wanted = token.strip().lower()
     if not wanted:
         return None
+    normalized_wanted = " ".join(re.findall(r"[a-z0-9]+", wanted))
+    phrase_matches: list[tuple[str, str]] = []
     for code in codes:
         code_id = code.get("id") or code.get("ID")
         if not isinstance(code_id, str):
@@ -2224,6 +2226,11 @@ def _matching_code_label(codes: list[dict[str, Any]], token: str) -> tuple[str, 
         name = _coerce_text(code.get("name")) or _coerce_text(code.get("names"))
         if name and name.strip().lower() == wanted:
             return code_id, name
+        normalized_name = " ".join(re.findall(r"[a-z0-9]+", name.lower()))
+        if normalized_wanted and normalized_name.startswith(normalized_wanted):
+            phrase_matches.append((code_id, name))
+    if phrase_matches:
+        return phrase_matches[0]
     return None
 
 

@@ -168,6 +168,17 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved["values"], ["U5MR"])
         self.assertEqual(resolved["matches"][0]["source"], {"type": "codelist", "id": "UNICEF/CL_SUBJECT/1.0"})
 
+    def test_code_label_resolution_accepts_parenthetical_suffix(self) -> None:
+        match = server._matching_code_label(
+            [
+                {"id": "UNICEF_ESA", "name": {"en": "Eastern and Southern Africa (UNICEF Rep.Regions)"}},
+                {"id": "UNICEF_WCA", "name": {"en": "West and Central Africa (UNICEF Rep.Regions)"}},
+            ],
+            "Eastern and Southern Africa",
+        )
+
+        self.assertEqual(match, ("UNICEF_ESA", "Eastern and Southern Africa (UNICEF Rep.Regions)"))
+
     async def test_location_resolution_expands_hierarchy_members_when_enabled(self) -> None:
         payload = _payload_with_subject_geo_and_time()
         policy = server.QueryDimensionPolicyEntry(
