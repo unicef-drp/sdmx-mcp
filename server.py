@@ -1409,9 +1409,20 @@ def _series_signature(
     time_column: str | None,
     value_column: str | None,
 ) -> tuple[tuple[str, str], ...]:
+    ignored_columns = {
+        str(time_column or "").lower(),
+        str(value_column or "").lower(),
+        "obs_value",
+        "value",
+        "lower_bound",
+        "upper_bound",
+        "ref_period",
+        "observation status",
+        "obs_status",
+    }
     signature: list[tuple[str, str]] = []
     for key in sorted(row):
-        if key in {time_column, value_column}:
+        if key.lower() in ignored_columns:
             continue
         value = row.get(key)
         signature.append((key, "" if value is None else str(value).strip()))
