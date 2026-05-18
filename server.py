@@ -1408,7 +1408,15 @@ def _series_signature(
     *,
     time_column: str | None,
     value_column: str | None,
+    columns: set[str] | None = None,
 ) -> tuple[tuple[str, str], ...]:
+    if columns is not None:
+        return tuple(
+            (key, "" if row.get(key) is None else str(row.get(key)).strip())
+            for key in sorted(columns)
+            if key in row
+        )
+
     ignored_columns = {
         str(time_column or "").lower(),
         str(value_column or "").lower(),
@@ -1427,6 +1435,48 @@ def _series_signature(
         value = row.get(key)
         signature.append((key, "" if value is None else str(value).strip()))
     return tuple(signature)
+
+
+def _dimension_column_aliases(dimension_id: str) -> list[str]:
+    normalized = dimension_id.strip().upper()
+    aliases = [normalized]
+    aliases.extend(
+        {
+            DIM_REF_AREA: ["Geographic area", "Reference area", "Ref area"],
+            DIM_INDICATOR: ["Indicator"],
+            "SEX": ["Sex"],
+            "WEALTH_QUINTILE": ["Wealth Quintile", "Wealth quintile"],
+            "AGE": ["Age"],
+        }.get(normalized, [])
+    )
+    readable = normalized.replace("_", " ").title()
+    if readable not in aliases:
+        aliases.append(readable)
+    return aliases
+
+
+def _unfiltered_dimension_columns(row: dict[str, Any], provenance: dict[str, Any]) -> set[str] | None:
+    dimension_order = [
+        str(item).upper()
+        for item in (provenance.get("dimensionOrder") or [])
+        if str(item).strip()
+    ]
+    if not dimension_order:
+        return None
+
+    filters = provenance.get("filters") if isinstance(provenance.get("filters"), dict) else {}
+    filtered_dimensions = {str(key).upper() for key, value in filters.items() if value not in (None, "", [])}
+    unfiltered_dimensions = [dimension for dimension in dimension_order if dimension not in filtered_dimensions]
+    if not unfiltered_dimensions:
+        return set()
+
+    row_columns = list(row.keys())
+    columns: set[str] = set()
+    for dimension in unfiltered_dimensions:
+        column = _find_column(row_columns, _dimension_column_aliases(dimension))
+        if column:
+            columns.add(column)
+    return columns if columns else None
 
 
 def _latest_rows(rows: list[dict[str, Any]], time_column: str | None) -> tuple[str | None, list[dict[str, Any]]]:
@@ -3166,8 +3216,10 @@ def _compact_time_series(result: dict[str, Any], max_observations: int) -> dict[
     time_column = shaped.get("timeColumn")
     value_column = shaped.get("valueColumn")
     raw_series = [row for row in (shaped.get("series") or []) if isinstance(row, dict)]
+    provenance = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
+    signature_columns = _unfiltered_dimension_columns(raw_series[0], provenance) if raw_series else set()
     signatures = {
-        _series_signature(row, time_column=time_column, value_column=value_column)
+        _series_signature(row, time_column=time_column, value_column=value_column, columns=signature_columns)
         for row in raw_series
     }
     if len(signatures) > 1:
