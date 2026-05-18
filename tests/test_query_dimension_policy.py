@@ -212,6 +212,7 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
                 "status": "resolved",
                 "provenance": {
                     "resolvedFlowRef": "UNICEF/CME/1.0",
+                    "dimensionOrder": ["REF_AREA", "INDICATOR", "SEX"],
                     "filters": {"REF_AREA": "UNICEF_ESA", "INDICATOR": "CME_MRY0T4", "SEX": "_T"},
                 },
                 "shaped": {
@@ -222,6 +223,7 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "TIME_PERIOD": "2020",
                             "OBS_VALUE": "1",
+                            "DATA_SOURCE": "Survey 1",
                             "LOWER_BOUND": "0",
                             "UPPER_BOUND": "2",
                             "Sex": "Total",
@@ -229,6 +231,7 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "TIME_PERIOD": "2021",
                             "OBS_VALUE": "3",
+                            "DATA_SOURCE": "Survey 2",
                             "LOWER_BOUND": "2",
                             "UPPER_BOUND": "4",
                             "Sex": "Total",
@@ -241,6 +244,31 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(compact["status"], "resolved")
         self.assertEqual(len(compact["series"]), 2)
+
+    def test_compact_time_series_uses_unfiltered_dimensions_for_series_identity(self) -> None:
+        compact = server._compact_time_series(
+            {
+                "status": "resolved",
+                "provenance": {
+                    "resolvedFlowRef": "UNICEF/CME/1.0",
+                    "dimensionOrder": ["REF_AREA", "INDICATOR", "SEX"],
+                    "filters": {"REF_AREA": "UNICEF_ESA", "INDICATOR": "CME_MRY0T4"},
+                },
+                "shaped": {
+                    "status": "resolved",
+                    "timeColumn": "TIME_PERIOD",
+                    "valueColumn": "OBS_VALUE",
+                    "summary": {"distinctCounts": {"Sex": 2, "DATA_SOURCE": 2}},
+                    "series": [
+                        {"TIME_PERIOD": "2020", "OBS_VALUE": "1", "Sex": "Total", "DATA_SOURCE": "Survey 1"},
+                        {"TIME_PERIOD": "2020", "OBS_VALUE": "2", "Sex": "Female", "DATA_SOURCE": "Survey 2"},
+                    ],
+                },
+            },
+            max_observations=5,
+        )
+
+        self.assertEqual(compact["status"], "not_a_single_series")
 
     async def test_location_resolution_expands_hierarchy_members_when_enabled(self) -> None:
         payload = _payload_with_subject_geo_and_time()
