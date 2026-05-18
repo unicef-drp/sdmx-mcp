@@ -62,6 +62,60 @@ def _payload_with_subject_geo_and_time() -> dict:
     }
 
 
+def _payload_with_total_dimensions() -> dict:
+    return {
+        "structure": {
+            "dataStructures": {
+                "dataStructure": {
+                    "TEST_DSD": {
+                        "dataStructureComponents": {
+                            "dimensionList": {
+                                "dimensions": [
+                                    {
+                                        "id": "REF_AREA",
+                                        "position": 1,
+                                        "localRepresentation": {"enumeration": {"id": "CL_GEO"}},
+                                    },
+                                    {
+                                        "id": "INDICATOR",
+                                        "position": 2,
+                                        "localRepresentation": {"enumeration": {"id": "CL_INDICATOR"}},
+                                    },
+                                    {
+                                        "id": "SEX",
+                                        "position": 3,
+                                        "localRepresentation": {"enumeration": {"id": "CL_SEX"}},
+                                    },
+                                    {
+                                        "id": "AGE",
+                                        "position": 4,
+                                        "localRepresentation": {"enumeration": {"id": "CL_AGE"}},
+                                    },
+                                    {
+                                        "id": "RESIDENCE",
+                                        "position": 5,
+                                        "localRepresentation": {"enumeration": {"id": "CL_RESIDENCE"}},
+                                    },
+                                    {"id": "TIME_PERIOD", "position": 6},
+                                ]
+                            }
+                        }
+                    }
+                }
+            },
+            "codelists": {
+                "codelist": {
+                    "CL_GEO": {"id": "CL_GEO", "codes": [{"id": "GAB"}]},
+                    "CL_INDICATOR": {"id": "CL_INDICATOR", "codes": [{"id": "NT_STUNT"}]},
+                    "CL_SEX": {"id": "CL_SEX", "codes": [{"id": "_T"}, {"id": "F"}, {"id": "M"}]},
+                    "CL_AGE": {"id": "CL_AGE", "codes": [{"id": "_T"}, {"id": "Y0T4"}]},
+                    "CL_RESIDENCE": {"id": "CL_RESIDENCE", "codes": [{"id": "R"}, {"id": "U"}]},
+                }
+            },
+        }
+    }
+
+
 class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
     def test_policy_file_is_auto_discovered_when_env_not_set(self) -> None:
         server._query_dimension_policy_config.cache_clear()
@@ -86,6 +140,8 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
             "server._data_path_for", return_value="UNICEF,TEST_FLOW,1.0"
         ), patch("server._dimension_order_for_flow", return_value=["REF_AREA", "SUBJECT"]), patch(
             "server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}
+        ), patch(
+            "server._query_dimension_policy_config", return_value=server._default_query_dimension_policy()
         ):
             plan = await server._query_plan(
                 flowRef="UNICEF,TEST_FLOW,1.0",
@@ -111,6 +167,76 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(server._dimension_order_from_structure(payload), ["REF_AREA", "SUBJECT"])
 
+    def test_auto_apply_total_policy_defaults_to_disabled(self) -> None:
+        policy = server._policy_config_from_dict(
+            {
+                "default_query_dimensions": [
+                    {
+                        "name": "subject",
+                        "role": "subject",
+                        "required_for_retrieval": True,
+                        "priority": 1,
+                    }
+                ]
+            }
+        )
+
+        self.assertFalse(policy.auto_apply_total.enabled)
+        self.assertEqual(policy.auto_apply_total.dimensions, [])
+        self.assertEqual(policy.auto_apply_total.never_apply, ["TIME_PERIOD"])
+
+    async def test_auto_apply_total_adds_only_eligible_codelist_totals(self) -> None:
+        policy = server.QueryDimensionPolicyConfig(
+            default_query_dimensions=[
+                server.QueryDimensionPolicyEntry(
+                    name="subject",
+                    role="subject",
+                    required_for_retrieval=True,
+                    priority=1,
+                )
+            ],
+            auto_apply_total=server.AutoApplyTotalPolicy(
+                enabled=True,
+                dimensions=["AGE", "RESIDENCE", "SEX", "TIME_PERIOD"],
+                never_apply=["AGE", "INDICATOR", "REF_AREA"],
+            ),
+        )
+
+        with patch("server._query_dimension_policy_config", return_value=policy), patch(
+            "server._get_flow_structure", return_value=_payload_with_total_dimensions()
+        ):
+            filters = await server._apply_auto_total_filters(
+                "UNICEF/NUTRITION/1.0",
+                ["REF_AREA", "INDICATOR", "SEX", "AGE", "RESIDENCE"],
+                {"REF_AREA": "GAB", "INDICATOR": "NT_STUNT"},
+            )
+
+        self.assertEqual(filters, {"REF_AREA": "GAB", "INDICATOR": "NT_STUNT", "SEX": "_T"})
+
+    async def test_auto_apply_total_never_overrides_explicit_filter(self) -> None:
+        policy = server.QueryDimensionPolicyConfig(
+            default_query_dimensions=[
+                server.QueryDimensionPolicyEntry(
+                    name="subject",
+                    role="subject",
+                    required_for_retrieval=True,
+                    priority=1,
+                )
+            ],
+            auto_apply_total=server.AutoApplyTotalPolicy(enabled=True, dimensions=["SEX"], never_apply=[]),
+        )
+
+        with patch("server._query_dimension_policy_config", return_value=policy), patch(
+            "server._get_flow_structure", return_value=_payload_with_total_dimensions()
+        ):
+            filters = await server._apply_auto_total_filters(
+                "UNICEF/NUTRITION/1.0",
+                ["REF_AREA", "INDICATOR", "SEX"],
+                {"REF_AREA": "GAB", "INDICATOR": "NT_STUNT", "SEX": "F"},
+            )
+
+        self.assertEqual(filters["SEX"], "F")
+
     async def test_query_plan_skips_default_last_n_when_env_disabled(self) -> None:
         with patch.dict(os.environ, {"SDMX_DEFAULT_LAST_N_OBSERVATIONS": "FALSE"}, clear=False), patch(
             "server._resolved_flow_details", return_value={"resolvedFlowRef": "UNICEF/TEST_FLOW/1.0"}
@@ -118,7 +244,9 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
             "server._sdmx_base", return_value="https://example.org/rest"
         ), patch("server._data_path_for", return_value="UNICEF,TEST_FLOW,1.0"), patch(
             "server._dimension_order_for_flow", return_value=["REF_AREA", "SUBJECT"]
-        ), patch("server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}):
+        ), patch("server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}), patch(
+            "server._query_dimension_policy_config", return_value=server._default_query_dimension_policy()
+        ):
             plan = await server._query_plan(
                 flowRef="UNICEF,TEST_FLOW,1.0",
                 filters={"REF_AREA": "IND"},
@@ -141,6 +269,8 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
             "server._data_path_for", return_value="UNICEF,TEST_FLOW,1.0"
         ), patch("server._dimension_order_for_flow", return_value=["REF_AREA", "SUBJECT"]), patch(
             "server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}
+        ), patch(
+            "server._query_dimension_policy_config", return_value=server._default_query_dimension_policy()
         ):
             plan = await server._query_plan(
                 flowRef="UNICEF,TEST_FLOW,1.0",
