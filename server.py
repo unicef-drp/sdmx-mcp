@@ -170,6 +170,14 @@ class QueryDimensionPolicyEntry:
 @dataclass(slots=True)
 class QueryDimensionPolicyConfig:
     default_query_dimensions: list[QueryDimensionPolicyEntry]
+    auto_apply_total: "AutoApplyTotalPolicy" = field(default_factory=lambda: AutoApplyTotalPolicy())
+
+
+@dataclass(slots=True)
+class AutoApplyTotalPolicy:
+    enabled: bool = False
+    dimensions: list[str] = field(default_factory=list)
+    never_apply: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -285,6 +293,7 @@ async def _get_text_with_status(url: str) -> tuple[int, str]:
 
 def _default_query_dimension_policy() -> QueryDimensionPolicyConfig:
     return QueryDimensionPolicyConfig(
+        auto_apply_total=AutoApplyTotalPolicy(),
         default_query_dimensions=[
             QueryDimensionPolicyEntry(
                 name="subject",
@@ -316,6 +325,34 @@ def _default_query_dimension_policy() -> QueryDimensionPolicyConfig:
                 example_prompts=["Tell me about an indicator in a region.", "Compare an indicator across a country group."],
             ),
         ]
+    )
+
+
+def _auto_apply_total_policy_from_dict(payload: dict[str, Any]) -> AutoApplyTotalPolicy:
+    raw_policy = payload.get("auto_apply_total") or {}
+    if not isinstance(raw_policy, dict):
+        raise ValueError("auto_apply_total must be an object when provided.")
+    raw_dimensions = raw_policy.get("dimensions") or []
+    raw_never_apply = raw_policy.get("never_apply") or []
+    if not isinstance(raw_dimensions, list):
+        raise ValueError("auto_apply_total.dimensions must be a list.")
+    if not isinstance(raw_never_apply, list):
+        raise ValueError("auto_apply_total.never_apply must be a list.")
+    dimensions = {
+        str(item).strip().upper()
+        for item in raw_dimensions
+        if str(item).strip()
+    }
+    never_apply = {
+        str(item).strip().upper()
+        for item in raw_never_apply
+        if str(item).strip()
+    }
+    never_apply.add(DIM_TIME_PERIOD)
+    return AutoApplyTotalPolicy(
+        enabled=bool(raw_policy.get("enabled", False)),
+        dimensions=sorted(dimensions),
+        never_apply=sorted(never_apply),
     )
 
 
@@ -362,7 +399,10 @@ def _policy_config_from_dict(payload: dict[str, Any]) -> QueryDimensionPolicyCon
         raise ValueError("query dimension policy entry names must be unique.")
     if len({entry.priority for entry in dimensions}) != len(dimensions):
         raise ValueError("query dimension policy entry priorities must be unique.")
-    return QueryDimensionPolicyConfig(default_query_dimensions=dimensions)
+    return QueryDimensionPolicyConfig(
+        default_query_dimensions=dimensions,
+        auto_apply_total=_auto_apply_total_policy_from_dict(payload),
+    )
 
 
 def _discovery_policy_from_dict(payload: dict[str, Any]) -> DiscoveryPolicyConfig:
@@ -2362,6 +2402,42 @@ async def _dimension_order_for_flow(flowRef: str) -> list[str]:
     return dims
 
 
+async def _apply_auto_total_filters(
+    flowRef: str,
+    dimension_order: list[str],
+    filters: dict[str, Any],
+) -> dict[str, Any]:
+    policy = _query_dimension_policy_config().auto_apply_total
+    if not policy.enabled:
+        return filters
+
+    eligible_dimensions = set(policy.dimensions)
+    never_apply = set(policy.never_apply)
+    never_apply.add(DIM_TIME_PERIOD)
+    normalized_filters = {str(key).upper(): value for key, value in filters.items()}
+    candidates = [
+        dim
+        for dim in dimension_order
+        if dim in eligible_dimensions
+        and dim not in never_apply
+        and dim not in normalized_filters
+    ]
+    if not candidates:
+        return normalized_filters
+
+    payload = await _get_flow_structure(flowRef)
+    applied: dict[str, Any] = {}
+    for dim in candidates:
+        codelist = _dimension_codelist(payload, dim)
+        if not codelist:
+            continue
+        if _canonical_code_id(_codelist_codes(codelist), "_T"):
+            applied[dim] = "_T"
+    if not applied:
+        return normalized_filters
+    return {**normalized_filters, **applied}
+
+
 def _build_key_from_filters(dimension_order: list[str], filters: dict[str, Any]) -> str:
     if not filters:
         raise ValueError("filters must include at least one dimension value.")
@@ -2447,6 +2523,7 @@ async def _query_plan(
     if filters:
         dimension_order = await _dimension_order_for_flow(flowRef)
         normalized_filters = await _normalize_filters_to_code_ids(flowRef, filters)
+        normalized_filters = await _apply_auto_total_filters(flowRef, dimension_order, normalized_filters)
         key = _build_key_from_filters(dimension_order, normalized_filters)
         wildcard_dimensions = [dim for dim in dimension_order if dim not in normalized_filters]
     elif key:

@@ -1,4 +1,19 @@
 {
+  "auto_apply_total": {
+    "enabled": false,
+    "dimensions": [
+      "SEX",
+      "WEALTH_QUINTILE",
+      "RESIDENCE",
+      "MATERNAL_EDU_LVL",
+      "HEAD_OF_HOUSE"
+    ],
+    "never_apply": [
+      "INDICATOR",
+      "REF_AREA",
+      "AGE"
+    ]
+  },
   "default_query_dimensions": [
     {
       "name": "subject",

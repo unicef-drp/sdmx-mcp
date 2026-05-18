@@ -146,6 +146,11 @@ Example policy:
 
 ```json
 {
+  "auto_apply_total": {
+    "enabled": false,
+    "dimensions": ["SEX", "WEALTH_QUINTILE", "RESIDENCE"],
+    "never_apply": ["INDICATOR", "REF_AREA", "AGE"]
+  },
   "default_query_dimensions": [
     {
       "name": "subject",
@@ -197,6 +202,8 @@ Example policy:
 ```
 
 Resolution order follows policy `priority`, not hardcoded dimension names. Non-time dimensions are resolved through the configured code-list or hierarchy sources, and policy source IDs should use the SDMX reference form `agency/id/version` where applicable. `time` is resolved against `TIME_PERIOD`.
+
+`auto_apply_total` lets a registry owner opt in to filling omitted dimensions with `_T`. It is disabled by default. When enabled, the server only applies `_T` to listed dimensions that are present in the selected flow and whose codelist actually contains `_T`; explicit user filters always win. `never_apply` blocks dimensions even if they are also listed in `dimensions`. `TIME_PERIOD` is always treated as special query-parameter time and never receives `_T`.
 
 The same policy can also drive three user-facing discovery resources:
 
