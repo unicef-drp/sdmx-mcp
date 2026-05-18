@@ -140,6 +140,8 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
             "server._data_path_for", return_value="UNICEF,TEST_FLOW,1.0"
         ), patch("server._dimension_order_for_flow", return_value=["REF_AREA", "SUBJECT"]), patch(
             "server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}
+        ), patch(
+            "server._query_dimension_policy_config", return_value=server._default_query_dimension_policy()
         ):
             plan = await server._query_plan(
                 flowRef="UNICEF,TEST_FLOW,1.0",
@@ -242,7 +244,9 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
             "server._sdmx_base", return_value="https://example.org/rest"
         ), patch("server._data_path_for", return_value="UNICEF,TEST_FLOW,1.0"), patch(
             "server._dimension_order_for_flow", return_value=["REF_AREA", "SUBJECT"]
-        ), patch("server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}):
+        ), patch("server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}), patch(
+            "server._query_dimension_policy_config", return_value=server._default_query_dimension_policy()
+        ):
             plan = await server._query_plan(
                 flowRef="UNICEF,TEST_FLOW,1.0",
                 filters={"REF_AREA": "IND"},
@@ -265,6 +269,8 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
             "server._data_path_for", return_value="UNICEF,TEST_FLOW,1.0"
         ), patch("server._dimension_order_for_flow", return_value=["REF_AREA", "SUBJECT"]), patch(
             "server._normalize_filters_to_code_ids", return_value={"REF_AREA": "IND"}
+        ), patch(
+            "server._query_dimension_policy_config", return_value=server._default_query_dimension_policy()
         ):
             plan = await server._query_plan(
                 flowRef="UNICEF,TEST_FLOW,1.0",
