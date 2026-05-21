@@ -486,13 +486,14 @@ python3 scripts/sdmx_eval_runner.py run-provider \
 GitHub Actions setup:
 
 - Add `ANTHROPIC_API_KEY` as a repository or environment secret.
-- Run **UNICEF Global MCP Eval** manually from the Actions tab.
-- Use `target_ref=unicef` when evaluating the UNICEF branch.
+- Run **UNICEF Global MCP Eval** manually from the Actions tab for the paid Anthropic agent eval.
+- Run **UNICEF MCP Policy Contract Eval** manually from the Actions tab for the no-LLM strict/permissive policy contract checks.
+- Select the `unicef` branch in the Actions UI when evaluating the UNICEF deployment configuration.
 - Start with a small `case_limit` such as `4`, then run the full manifest once the smoke test passes.
 - Check the **Summarize grades** step for pass/fail counts, token usage, and estimated cost.
 - Download the `unicef-global-eval` artifact to inspect the generated manifest, raw provider responses, and grade records.
 
-The workflow is intentionally `workflow_dispatch` only. It does not run on `pull_request` or public fork events, and its `GITHUB_TOKEN` permissions are limited to `contents: read`. Public users cannot spend your Anthropic key just by opening a PR. Anyone with enough repository permission to manually run workflows could run this job with the configured secret, so keep write/workflow access limited and prefer an environment-protected secret if you need an approval gate for eval runs.
+The eval workflows are intentionally `workflow_dispatch` only. They do not run on `pull_request` or public fork events, and their `GITHUB_TOKEN` permissions are limited to `contents: read`. Public users cannot spend your Anthropic key just by opening a PR. The `mcp-eval` GitHub environment should require approval from the repository owner and have admin bypass disabled for cost-bearing eval runs.
 
 ### Config Model
 
