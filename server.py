@@ -212,6 +212,7 @@ class ProvenanceDict(TypedDict):
     endPeriod: str | None
     lastNObservations: int | None
     filters: dict[str, Any]
+    appliedDefaults: dict[str, Any]
 
 
 class QueryContextDict(TypedDict):
@@ -1292,6 +1293,7 @@ def _query_context(
     endPeriod: str | None,
     lastNObservations: int | None,
     filters: dict[str, Any] | None,
+    appliedDefaults: dict[str, Any] | None = None,
 ) -> QueryContextDict:
     return {
         "sourceScope": _source_scope(),
@@ -1306,6 +1308,7 @@ def _query_context(
             "endPeriod": endPeriod,
             "lastNObservations": lastNObservations,
             "filters": filters or {},
+            "appliedDefaults": appliedDefaults or {},
         },
     }
 
@@ -1322,6 +1325,7 @@ def _resolved_response(
     endPeriod: str | None,
     lastNObservations: int | None,
     filters: dict[str, Any] | None,
+    appliedDefaults: dict[str, Any] | None = None,
     maxObs: int,
     raw_csv: str | None = None,
 ) -> ResolvedResponseDict:
@@ -1336,6 +1340,7 @@ def _resolved_response(
         endPeriod=endPeriod,
         lastNObservations=lastNObservations,
         filters=filters,
+        appliedDefaults=appliedDefaults,
     )
     payload.update(
         {
@@ -1361,6 +1366,7 @@ def _unresolved_response(
     endPeriod: str | None,
     lastNObservations: int | None,
     filters: dict[str, Any] | None,
+    appliedDefaults: dict[str, Any] | None = None,
     maxObs: int,
     status_code: int | None,
     raw_text: str,
@@ -1377,6 +1383,7 @@ def _unresolved_response(
         endPeriod=endPeriod,
         lastNObservations=lastNObservations,
         filters=filters,
+        appliedDefaults=appliedDefaults,
     )
     payload.update(
         {
@@ -2406,10 +2413,10 @@ async def _apply_auto_total_filters(
     flowRef: str,
     dimension_order: list[str],
     filters: dict[str, Any],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     policy = _query_dimension_policy_config().auto_apply_total
     if not policy.enabled:
-        return filters
+        return filters, {}
 
     eligible_dimensions = set(policy.dimensions)
     never_apply = set(policy.never_apply)
@@ -2423,7 +2430,7 @@ async def _apply_auto_total_filters(
         and dim not in normalized_filters
     ]
     if not candidates:
-        return normalized_filters
+        return normalized_filters, {}
 
     payload = await _get_flow_structure(flowRef)
     applied: dict[str, Any] = {}
@@ -2434,8 +2441,17 @@ async def _apply_auto_total_filters(
         if _canonical_code_id(_codelist_codes(codelist), "_T"):
             applied[dim] = "_T"
     if not applied:
-        return normalized_filters
-    return {**normalized_filters, **applied}
+        return normalized_filters, {}
+    return {**normalized_filters, **applied}, applied
+
+
+def _wildcard_dimensions_from_filters(dimension_order: list[str], filters: dict[str, Any]) -> list[str]:
+    normalized_filters = {str(key).upper(): value for key, value in filters.items()}
+    wildcards: list[str] = []
+    for dim in dimension_order:
+        if not _normalize_selection_values(normalized_filters.get(dim)):
+            wildcards.append(dim)
+    return wildcards
 
 
 def _build_key_from_filters(dimension_order: list[str], filters: dict[str, Any]) -> str:
@@ -2499,6 +2515,7 @@ async def _query_plan(
 ) -> dict[str, Any]:
     dimension_order: list[str] | None = None
     normalized_filters: dict[str, Any] | None = None
+    applied_defaults: dict[str, Any] = {}
     wildcard_dimensions: list[str] = []
     effective_format = (format or "csv").strip() or "csv"
     effective_labels = labels.strip() if isinstance(labels, str) and labels.strip() else None
@@ -2523,9 +2540,9 @@ async def _query_plan(
     if filters:
         dimension_order = await _dimension_order_for_flow(flowRef)
         normalized_filters = await _normalize_filters_to_code_ids(flowRef, filters)
-        normalized_filters = await _apply_auto_total_filters(flowRef, dimension_order, normalized_filters)
+        normalized_filters, applied_defaults = await _apply_auto_total_filters(flowRef, dimension_order, normalized_filters)
         key = _build_key_from_filters(dimension_order, normalized_filters)
-        wildcard_dimensions = [dim for dim in dimension_order if dim not in normalized_filters]
+        wildcard_dimensions = _wildcard_dimensions_from_filters(dimension_order, normalized_filters)
     elif key:
         dimension_order = await _dimension_order_for_flow(flowRef)
         key = _normalize_manual_key(key, dimension_order)
@@ -2557,6 +2574,7 @@ async def _query_plan(
         "flowDetails": flow_details,
         "dimensionOrder": dimension_order,
         "normalizedFilters": normalized_filters,
+        "appliedDefaults": applied_defaults,
         "wildcardDimensions": wildcard_dimensions,
         "key": key,
         "format": effective_format,
@@ -3141,6 +3159,7 @@ async def _execute_query_data(
     effective_format = str(plan["format"] or fetch_format)
     effective_labels = plan["labels"]
     effective_last_n = plan["lastNObservations"]
+    applied_defaults = plan["appliedDefaults"]
 
     status, text = await _get_text_with_status(url)
     if status >= 400:
@@ -3155,6 +3174,7 @@ async def _execute_query_data(
             endPeriod=endPeriod,
             lastNObservations=effective_last_n,
             filters=normalized_filters,
+            appliedDefaults=applied_defaults,
             maxObs=maxObs,
             status_code=status,
             raw_text=text,
@@ -3170,6 +3190,7 @@ async def _execute_query_data(
         endPeriod=endPeriod,
         lastNObservations=effective_last_n,
         filters=normalized_filters,
+        appliedDefaults=applied_defaults,
         maxObs=maxObs,
         raw_csv=text,
     )
@@ -3189,6 +3210,7 @@ def _compact_source(result: dict[str, Any]) -> dict[str, Any]:
         "key": provenance.get("key"),
         "queryURL": provenance.get("queryURL"),
         "filters": provenance.get("filters") or {},
+        "appliedDefaults": provenance.get("appliedDefaults") or {},
     }
 
 
@@ -4966,6 +4988,7 @@ async def plan_query(
         "queryURL": plan["queryURL"],
         "dimensionOrder": plan["dimensionOrder"] or [],
         "filters": plan["normalizedFilters"] or {},
+        "appliedDefaults": plan["appliedDefaults"],
         "wildcardDimensions": plan["wildcardDimensions"],
         "shape": resultShape,
         "notes": {

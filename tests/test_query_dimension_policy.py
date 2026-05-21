@@ -167,6 +167,21 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(server._dimension_order_from_structure(payload), ["REF_AREA", "SUBJECT"])
 
+    def test_compact_source_exposes_applied_defaults(self) -> None:
+        source = server._compact_source(
+            {
+                "provenance": {
+                    "resolvedFlowRef": "UNICEF/NUTRITION/1.0",
+                    "key": "GAB.NT_STUNT._T",
+                    "queryURL": "https://example.org/query",
+                    "filters": {"REF_AREA": "GAB", "INDICATOR": "NT_STUNT", "SEX": "_T"},
+                    "appliedDefaults": {"SEX": "_T"},
+                }
+            }
+        )
+
+        self.assertEqual(source["appliedDefaults"], {"SEX": "_T"})
+
     def test_auto_apply_total_policy_defaults_to_disabled(self) -> None:
         policy = server._policy_config_from_dict(
             {
@@ -205,13 +220,14 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         with patch("server._query_dimension_policy_config", return_value=policy), patch(
             "server._get_flow_structure", return_value=_payload_with_total_dimensions()
         ):
-            filters = await server._apply_auto_total_filters(
+            filters, applied = await server._apply_auto_total_filters(
                 "UNICEF/NUTRITION/1.0",
                 ["REF_AREA", "INDICATOR", "SEX", "AGE", "RESIDENCE"],
                 {"REF_AREA": "GAB", "INDICATOR": "NT_STUNT"},
             )
 
         self.assertEqual(filters, {"REF_AREA": "GAB", "INDICATOR": "NT_STUNT", "SEX": "_T"})
+        self.assertEqual(applied, {"SEX": "_T"})
 
     async def test_auto_apply_total_never_overrides_explicit_filter(self) -> None:
         policy = server.QueryDimensionPolicyConfig(
@@ -229,13 +245,92 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
         with patch("server._query_dimension_policy_config", return_value=policy), patch(
             "server._get_flow_structure", return_value=_payload_with_total_dimensions()
         ):
-            filters = await server._apply_auto_total_filters(
+            filters, applied = await server._apply_auto_total_filters(
                 "UNICEF/NUTRITION/1.0",
                 ["REF_AREA", "INDICATOR", "SEX"],
                 {"REF_AREA": "GAB", "INDICATOR": "NT_STUNT", "SEX": "F"},
             )
 
         self.assertEqual(filters["SEX"], "F")
+        self.assertEqual(applied, {})
+
+    async def test_query_plan_reports_applied_defaults(self) -> None:
+        policy = server.QueryDimensionPolicyConfig(
+            default_query_dimensions=[
+                server.QueryDimensionPolicyEntry(
+                    name="subject",
+                    role="subject",
+                    required_for_retrieval=True,
+                    priority=1,
+                )
+            ],
+            auto_apply_total=server.AutoApplyTotalPolicy(enabled=True, dimensions=["SEX"], never_apply=[]),
+        )
+
+        with patch("server._resolved_flow_details", return_value={"resolvedFlowRef": "UNICEF/NUTRITION/1.0"}), patch(
+            "server._sdmx_base", return_value="https://example.org/rest"
+        ), patch("server._data_path_for", return_value="UNICEF,NUTRITION,1.0"), patch(
+            "server._dimension_order_for_flow", return_value=["REF_AREA", "INDICATOR", "SEX"]
+        ), patch(
+            "server._normalize_filters_to_code_ids",
+            return_value={"REF_AREA": "GAB", "INDICATOR": "NT_STUNT"},
+        ), patch("server._query_dimension_policy_config", return_value=policy), patch(
+            "server._get_flow_structure", return_value=_payload_with_total_dimensions()
+        ):
+            plan = await server._query_plan(
+                flowRef="UNICEF/NUTRITION/1.0",
+                filters={"REF_AREA": "GAB", "INDICATOR": "NT_STUNT"},
+                key=None,
+                startPeriod="2020",
+                endPeriod="2020",
+                lastNObservations=None,
+                format="csv",
+                labels=None,
+                resultShape=None,
+            )
+
+        self.assertEqual(plan["normalizedFilters"]["SEX"], "_T")
+        self.assertEqual(plan["appliedDefaults"], {"SEX": "_T"})
+        self.assertEqual(plan["wildcardDimensions"], [])
+
+    async def test_explicit_null_filter_prevents_auto_total_and_remains_wildcard(self) -> None:
+        policy = server.QueryDimensionPolicyConfig(
+            default_query_dimensions=[
+                server.QueryDimensionPolicyEntry(
+                    name="subject",
+                    role="subject",
+                    required_for_retrieval=True,
+                    priority=1,
+                )
+            ],
+            auto_apply_total=server.AutoApplyTotalPolicy(enabled=True, dimensions=["SEX"], never_apply=[]),
+        )
+
+        with patch("server._resolved_flow_details", return_value={"resolvedFlowRef": "UNICEF/NUTRITION/1.0"}), patch(
+            "server._sdmx_base", return_value="https://example.org/rest"
+        ), patch("server._data_path_for", return_value="UNICEF,NUTRITION,1.0"), patch(
+            "server._dimension_order_for_flow", return_value=["REF_AREA", "INDICATOR", "SEX"]
+        ), patch(
+            "server._normalize_filters_to_code_ids",
+            return_value={"REF_AREA": "GAB", "INDICATOR": "NT_STUNT", "SEX": None},
+        ), patch("server._query_dimension_policy_config", return_value=policy), patch(
+            "server._get_flow_structure", return_value=_payload_with_total_dimensions()
+        ):
+            plan = await server._query_plan(
+                flowRef="UNICEF/NUTRITION/1.0",
+                filters={"REF_AREA": "GAB", "INDICATOR": "NT_STUNT", "SEX": None},
+                key=None,
+                startPeriod="2020",
+                endPeriod="2020",
+                lastNObservations=None,
+                format="csv",
+                labels=None,
+                resultShape=None,
+            )
+
+        self.assertIsNone(plan["normalizedFilters"]["SEX"])
+        self.assertEqual(plan["appliedDefaults"], {})
+        self.assertEqual(plan["wildcardDimensions"], ["SEX"])
 
     async def test_query_plan_skips_default_last_n_when_env_disabled(self) -> None:
         with patch.dict(os.environ, {"SDMX_DEFAULT_LAST_N_OBSERVATIONS": "FALSE"}, clear=False), patch(

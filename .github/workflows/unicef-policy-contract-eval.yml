@@ -1,0 +1,37 @@
+name: UNICEF MCP Policy Contract Eval
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: Policy contract config path
+        required: true
+        default: scripts/mcp_policy_contract.unicef.example.json
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    environment: mcp-eval
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run policy contract checks
+        run: |
+          uv run python scripts/mcp_policy_contract_eval.py \
+            --config "${{ inputs.config }}"
