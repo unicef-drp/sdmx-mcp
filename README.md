@@ -465,6 +465,15 @@ It builds direct SDMX ground truth first, then asks an MCP-connected agent to an
 
 The grader checks the agent's structured claims for the numeric value, time period, flow reference, code filters, required MCP tool use, and concise answer shape so failures expose either retrieval errors, routing errors, or hallucinated claims.
 
+Policy contract eval:
+
+```bash
+python3 scripts/mcp_policy_contract_eval.py \
+  --config scripts/mcp_policy_contract.example.json
+```
+
+This direct MCP eval does not call an LLM or spend Anthropic tokens. It compares strict and permissive deployments for the `auto_apply_total` contract: strict wildcard queries stay multi-series, explicit total queries resolve, permissive wildcard queries surface `appliedDefaults`, explicit user filters override defaults, and explicit queries match across both modes.
+
 Anthropic setup:
 
 ```bash

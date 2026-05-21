@@ -1,0 +1,27 @@
+{
+  "strict_url": "https://strict-mcp-host.example/mcp",
+  "permissive_url": "https://permissive-mcp-host.example/mcp",
+  "timeout_seconds": 90,
+  "cme": {
+    "flowRef": "AGENCY/FLOW/1.0",
+    "baseFilters": {
+      "REF_AREA": "REGION",
+      "INDICATOR": "INDICATOR_CODE"
+    },
+    "totalFilters": {
+      "REF_AREA": "REGION",
+      "INDICATOR": "INDICATOR_CODE",
+      "SEX": "_T",
+      "WEALTH_QUINTILE": "_T"
+    },
+    "femaleFilters": {
+      "REF_AREA": "REGION",
+      "INDICATOR": "INDICATOR_CODE",
+      "SEX": "F"
+    },
+    "time": "1990:2024",
+    "expectedPeriod": "2024",
+    "expectedValue": 50.2,
+    "tolerance": 0.5
+  }
+}
