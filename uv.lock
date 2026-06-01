@@ -1262,7 +1262,7 @@ requires-dist = [
     { name = "cachetools", specifier = ">=7.1.4" },
     { name = "fastmcp", specifier = ">=3.3.1" },
     { name = "httpx", specifier = ">=0.28.1" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.27.1" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.27.2" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
 ]
 
