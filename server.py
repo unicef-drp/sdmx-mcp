@@ -1443,6 +1443,31 @@ def _dimension_column(rows: list[dict[str, Any]], dimension_id: str) -> str | No
     return _find_column(list(rows[0].keys()), [dimension_id])
 
 
+def _inject_constant_dim_from_filters(
+    rows: list[dict[str, Any]],
+    dim_id: str,
+    filters: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Re-inject a single-valued dimension SDMX dropped from the CSV as a constant column.
+
+    When only one value is queried for a dimension, some SDMX endpoints omit that column
+    from the response because it carries no information. The shaper then can't find the
+    pivot column and aborts. This function detects that case and backfills the column.
+    """
+    if not rows or not filters:
+        return rows
+    if _dimension_column(rows, dim_id):
+        return rows
+    raw = filters.get(dim_id) or filters.get(dim_id.upper())
+    if not raw:
+        return rows
+    tokens = [t.strip() for t in str(raw).replace("+", ",").split(",") if t.strip()]
+    if len(tokens) != 1:
+        return rows
+    const_value = tokens[0]
+    return [{**row, dim_id: const_value} for row in rows]
+
+
 def _row_time_value(row: dict[str, Any], time_column: str | None) -> str:
     if not time_column:
         return ""
@@ -1577,10 +1602,20 @@ def _shape_latest_by_ref_area(rows: list[dict[str, Any]]) -> dict[str, Any]:
     time_column = _time_column(rows)
     value_column = _value_column(rows)
     if not ref_area_column:
+        if rows:
+            # Observations present but REF_AREA column absent even after injection.
+            # Return long-form rows so callers can still extract the data.
+            return {
+                "status": "shape_degraded",
+                "shape": "latest_by_ref_area",
+                "reason": "REF_AREA column was not present in the returned dataset; observations returned in long form.",
+                "rows": rows,
+                "summary": _topline_summary(rows),
+            }
         return {
-            "status": "shape_not_applicable",
+            "status": "no_observations",
             "shape": "latest_by_ref_area",
-            "reason": "REF_AREA column was not present in the returned dataset.",
+            "reason": "The query returned no observations.",
             "summary": _topline_summary(rows),
         }
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -3199,6 +3234,8 @@ async def _execute_query_data(
         payload["notes"]["formatOverride"] = "SDMX data queries are forced to CSV for efficiency and simpler downstream parsing."
     if resultShape:
         rows = _csv_rows(text)
+        if (resultShape or "").strip().lower() == "latest_by_ref_area":
+            rows = _inject_constant_dim_from_filters(rows, DIM_REF_AREA, normalized_filters)
         payload["shaped"] = _shape_rows(rows, resultShape)
     return payload
 
@@ -3265,6 +3302,33 @@ def _compact_indicator_table(result: dict[str, Any], max_rows: int) -> dict[str,
         return _compact_unresolved(result, shape="indicator_table")
 
     shaped = result.get("shaped") if isinstance(result.get("shaped"), dict) else {}
+
+    if shaped.get("status") == "shape_degraded":
+        # Observations exist but REF_AREA was absent from the SDMX response even after
+        # injection; fall back to long-form rows rather than returning nothing.
+        raw_rows = shaped.get("rows") or []
+        time_col = _time_column(raw_rows)
+        value_col = _value_column(raw_rows)
+        rows = []
+        for raw in raw_rows[:max_rows]:
+            if not isinstance(raw, dict):
+                continue
+            rows.append({
+                "refArea": None,
+                "period": raw.get(time_col) if time_col else None,
+                "value": raw.get(value_col) if value_col else None,
+                "unit": _row_unit(raw),
+                "rowCountAtLatestPeriod": 1,
+            })
+        return {
+            "status": "resolved",
+            "shape": "indicator_table",
+            "rows": rows,
+            "rowCount": len(rows),
+            "note": shaped.get("reason"),
+            "source": _compact_source(result),
+        }
+
     if shaped.get("status") != "resolved":
         return {
             "status": shaped.get("status") or "not_resolved_table",
