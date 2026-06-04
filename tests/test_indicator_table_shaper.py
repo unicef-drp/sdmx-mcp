@@ -266,6 +266,96 @@ class TestCompactIndicatorTable(unittest.TestCase):
         rows = result.get("rows") or []
         self.assertEqual(rows, [], "genuine no-data must yield empty rows")
 
+    # --- multi-series expansion (the value:null fix) ---
+
+    def _multi_series_shaped(self, ref_area: str = "DZA") -> dict:
+        """Shaped result for a single refArea with 6 obs (3 indicators × 2 sexes)."""
+        obs_rows = [
+            _make_row(REF_AREA=ref_area, INDICATOR=ind, SEX=sex, OBS_VALUE=str(i * 10.0))
+            for i, (ind, sex) in enumerate([
+                ("ED_CR_L1", "F"), ("ED_CR_L1", "M"),
+                ("ED_CR_L2", "F"), ("ED_CR_L2", "M"),
+                ("ED_CR_L3", "F"), ("ED_CR_L3", "M"),
+            ])
+        ]
+        return {
+            "status": "resolved",
+            "shape": "latest_by_ref_area",
+            "refAreaColumn": "REF_AREA",
+            "timeColumn": "TIME_PERIOD",
+            "valueColumn": "OBS_VALUE",
+            "results": [
+                {
+                    "refArea": ref_area,
+                    "latestPeriod": "2022",
+                    "rowCountAtLatestPeriod": len(obs_rows),
+                    "value": None,  # multi-series → shaper sets null
+                    "rows": obs_rows,
+                }
+            ],
+            "summary": {},
+        }
+
+    def test_multi_series_expands_to_one_row_per_observation(self):
+        shaped = self._multi_series_shaped()
+        result = server._compact_indicator_table(self._resolved_with_shape(shaped), max_rows=200)
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["rowCount"], 6)
+
+    def test_multi_series_rows_have_non_null_values(self):
+        shaped = self._multi_series_shaped()
+        result = server._compact_indicator_table(self._resolved_with_shape(shaped), max_rows=200)
+        for row in result["rows"]:
+            self.assertIsNotNone(row["value"], "no row should have value: null when observations exist")
+
+    def test_multi_series_rows_include_varying_dimensions(self):
+        shaped = self._multi_series_shaped()
+        result = server._compact_indicator_table(self._resolved_with_shape(shaped), max_rows=200)
+        indicators = {r.get("INDICATOR") for r in result["rows"]}
+        sexes = {r.get("SEX") for r in result["rows"]}
+        self.assertEqual(indicators, {"ED_CR_L1", "ED_CR_L2", "ED_CR_L3"})
+        self.assertEqual(sexes, {"F", "M"})
+
+    def test_multi_series_ref_area_present_in_every_row(self):
+        shaped = self._multi_series_shaped("DZA")
+        result = server._compact_indicator_table(self._resolved_with_shape(shaped), max_rows=200)
+        for row in result["rows"]:
+            self.assertEqual(row["refArea"], "DZA")
+
+    def test_multi_series_ref_area_column_not_duplicated_in_extra_dims(self):
+        shaped = self._multi_series_shaped("DZA")
+        result = server._compact_indicator_table(self._resolved_with_shape(shaped), max_rows=200)
+        for row in result["rows"]:
+            self.assertNotIn("REF_AREA", row, "REF_AREA should be folded into refArea, not duplicated")
+
+    def test_multi_location_multi_series_all_expanded(self):
+        """Two countries × 2 series each → 4 total rows."""
+        shaped = {
+            "status": "resolved",
+            "shape": "latest_by_ref_area",
+            "refAreaColumn": "REF_AREA",
+            "timeColumn": "TIME_PERIOD",
+            "valueColumn": "OBS_VALUE",
+            "results": [
+                {
+                    "refArea": country,
+                    "latestPeriod": "2022",
+                    "rowCountAtLatestPeriod": 2,
+                    "value": None,
+                    "rows": [
+                        _make_row(REF_AREA=country, SEX="F", OBS_VALUE="80.0"),
+                        _make_row(REF_AREA=country, SEX="M", OBS_VALUE="85.0"),
+                    ],
+                }
+                for country in ("DZA", "EGY")
+            ],
+            "summary": {},
+        }
+        result = server._compact_indicator_table(self._resolved_with_shape(shaped), max_rows=200)
+        self.assertEqual(result["rowCount"], 4)
+        ref_areas = {r["refArea"] for r in result["rows"]}
+        self.assertEqual(ref_areas, {"DZA", "EGY"})
+
     # --- max_rows respected ---
 
     def test_max_rows_respected(self):

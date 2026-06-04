@@ -1630,7 +1630,7 @@ def _shape_latest_by_ref_area(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "latestPeriod": latest_period,
                 "rowCountAtLatestPeriod": len(latest_rows),
                 "value": latest_rows[0].get(value_column) if value_column and len(latest_rows) == 1 else None,
-                "rows": latest_rows[:10],
+                "rows": latest_rows,
             }
         )
     return {
@@ -3338,21 +3338,49 @@ def _compact_indicator_table(result: dict[str, Any], max_rows: int) -> dict[str,
             "rows": [],
         }
 
+    # Columns to absorb into the standard output keys rather than pass through as extra dims.
+    _ref_area_upper = {a.upper() for a in _dimension_column_aliases(DIM_REF_AREA)}
+    _always_absorbed = _ref_area_upper | {
+        "OBS_VALUE", "VALUE",
+        "TIME_PERIOD", "TIME",
+        "UNIT_MEASURE", "UNIT OF MEASURE", "UNIT",
+        "OBS_STATUS", "OBSERVATION STATUS",
+        "LOWER_BOUND", "UPPER_BOUND", "REF_PERIOD",
+    }
+
     rows = []
-    for item in (shaped.get("results") or [])[:max_rows]:
-        if not isinstance(item, dict):
-            continue
-        preview_rows = item.get("rows") or []
-        first_row = preview_rows[0] if preview_rows and isinstance(preview_rows[0], dict) else {}
-        rows.append(
-            {
+    for item in (shaped.get("results") or []):
+        if not isinstance(item, dict) or len(rows) >= max_rows:
+            break
+        item_obs = [r for r in (item.get("rows") or []) if isinstance(r, dict)]
+        item_value = item.get("value")
+
+        if item_value is not None or len(item_obs) <= 1:
+            # Single scalar — emit the compact collapsed row.
+            first_row = item_obs[0] if item_obs else {}
+            rows.append({
                 "refArea": item.get("refArea"),
                 "period": item.get("latestPeriod"),
-                "value": item.get("value"),
+                "value": item_value,
                 "unit": _row_unit(first_row),
                 "rowCountAtLatestPeriod": item.get("rowCountAtLatestPeriod"),
-            }
-        )
+            })
+        else:
+            # Multiple series for this refArea — expand tidy/long, one row per observation.
+            time_col = _time_column(item_obs)
+            value_col = _value_column(item_obs)
+            absorbed = _always_absorbed | {(time_col or "").upper(), (value_col or "").upper()}
+            for obs in item_obs:
+                if len(rows) >= max_rows:
+                    break
+                extra_dims = {k: v for k, v in obs.items() if k.upper() not in absorbed}
+                rows.append({
+                    "refArea": item.get("refArea"),
+                    "period": obs.get(time_col) if time_col else item.get("latestPeriod"),
+                    "value": obs.get(value_col) if value_col else None,
+                    "unit": _row_unit(obs),
+                    **extra_dims,
+                })
     return {
         "status": "resolved",
         "shape": "indicator_table",
