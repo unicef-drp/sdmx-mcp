@@ -34,6 +34,10 @@ BASE = os.getenv("SDMX_BASE_URL", "").strip().rstrip("/")
 MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
 HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "sdmx-mcp/0.1").strip() or "sdmx-mcp/0.1"
 STRUCTURE_REFERENCES = os.getenv("SDMX_STRUCTURE_REFERENCES", "descendants").strip() or "descendants"
+# Set SDMX_BUILD_ID in the deploy pipeline (e.g. to the git SHA) to make the
+# running version verifiable without a code deploy.
+_SERVER_VERSION = "1.2.0"
+BUILD_ID = os.getenv("SDMX_BUILD_ID", "").strip() or _SERVER_VERSION
 
 
 def _env_csv(name: str) -> list[str]:
@@ -1909,6 +1913,29 @@ def _ref_area_code_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return _dimension_code_map(payload, DIM_REF_AREA)
 
 
+def _resolve_codes_from_payload(
+    payload: dict[str, Any],
+    dimension_id: str,
+    code_ids: set[str],
+) -> dict[str, str]:
+    """Return {code_id: display_name} using the flow's DSD codelists.
+
+    Falls back to the raw code ID for any entry that cannot be resolved so that
+    the caller always gets a usable string, never None.
+    """
+    if not code_ids:
+        return {}
+    code_map = _dimension_code_map(payload, dimension_id)
+    result: dict[str, str] = {}
+    for code_id in code_ids:
+        code = code_map.get(code_id)
+        name = _code_name(code) if code else None
+        if not name:
+            logger.debug("No codelist name for %s=%s; falling back to code", dimension_id, code_id)
+        result[code_id] = name or code_id
+    return result
+
+
 def _code_parent_links(codes: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
     edges: dict[str, set[str]] = {}
     for code_id, code in codes.items():
@@ -3257,6 +3284,87 @@ def _row_unit(row: dict[str, Any]) -> str | None:
         if value is not None and str(value).strip():
             return str(value).strip()
     return None
+
+
+async def _enrich_indicator_table_rows(
+    flowRef: str,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add refAreaName, indicatorName, and resolved unit names to indicator table rows.
+
+    Fetches the flow's DSD once and resolves all unique codes in a single pass.
+    Falls back to the raw code string on any resolution failure so rows are never nulled.
+    """
+    if not rows:
+        return rows
+    try:
+        payload = await _get_flow_structure(flowRef)
+    except Exception as exc:
+        logger.warning("Name enrichment skipped for %s: %s", flowRef, exc)
+        return rows
+
+    ref_area_codes = {r["refArea"] for r in rows if r.get("refArea")}
+    indicator_codes = {r.get(DIM_INDICATOR) for r in rows if r.get(DIM_INDICATOR)}
+    unit_codes = {r.get("unit") for r in rows if r.get("unit")}
+
+    ref_area_names = _resolve_codes_from_payload(payload, DIM_REF_AREA, ref_area_codes)
+    indicator_names = _resolve_codes_from_payload(payload, DIM_INDICATOR, indicator_codes)
+    unit_names = _resolve_codes_from_payload(payload, "UNIT_MEASURE", unit_codes)
+
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        r = dict(row)
+        ref_area = r.get("refArea")
+        indicator = r.get(DIM_INDICATOR)
+        unit_code = r.get("unit")
+        if ref_area:
+            r["refAreaName"] = ref_area_names.get(ref_area, ref_area)
+        if indicator:
+            r["indicatorName"] = indicator_names.get(indicator, indicator)
+        if unit_code:
+            r["unit"] = unit_names.get(unit_code, unit_code)
+        enriched.append(r)
+    return enriched
+
+
+async def _enrich_single_result(
+    flowRef: str,
+    compact: dict[str, Any],
+    query_filters: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve unit code and add refArea/refAreaName/indicator/indicatorName to a
+    single-series compact result (get_single_observation or get_time_series).
+
+    Dimensions are read from query_filters because they are not per-row in these shapes.
+    """
+    if compact.get("status") not in ("resolved", "resolved_single_value"):
+        return compact
+    try:
+        payload = await _get_flow_structure(flowRef)
+    except Exception as exc:
+        logger.warning("Name enrichment skipped for %s: %s", flowRef, exc)
+        return compact
+
+    result = dict(compact)
+
+    ref_area = str(query_filters.get(DIM_REF_AREA) or "").strip()
+    if ref_area and "+" not in ref_area:
+        names = _resolve_codes_from_payload(payload, DIM_REF_AREA, {ref_area})
+        result["refArea"] = ref_area
+        result["refAreaName"] = names.get(ref_area, ref_area)
+
+    indicator = str(query_filters.get(DIM_INDICATOR) or "").strip()
+    if indicator and "+" not in indicator:
+        names = _resolve_codes_from_payload(payload, DIM_INDICATOR, {indicator})
+        result["indicator"] = indicator
+        result["indicatorName"] = names.get(indicator, indicator)
+
+    unit_code = compact.get("unit")
+    if unit_code:
+        names = _resolve_codes_from_payload(payload, "UNIT_MEASURE", {unit_code})
+        result["unit"] = names.get(unit_code, unit_code)
+
+    return result
 
 
 def _compact_unresolved(result: dict[str, Any], *, shape: str) -> dict[str, Any]:
@@ -5161,7 +5269,7 @@ async def get_single_observation(
     location: Optional[str] = None,
     time: Optional[str] = "latest",
     extraFilters: dict[str, Any] | None = None,
-    labels: Optional[str] = "name",
+    labels: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Compact exact-value tool.
@@ -5186,12 +5294,13 @@ async def get_single_observation(
         endPeriod=end_period,
         lastNObservations=last_n,
         format="csv",
-        labels=labels,
+        labels="id",
         maxObs=100,
         resultShape="latest_single_value",
         allowUnboundedTime=allow_unbounded,
     )
-    return _compact_single_observation(result)
+    compact = _compact_single_observation(result)
+    return await _enrich_single_result(flowRef, compact, query_filters)
 
 
 @mcp.tool()
@@ -5203,7 +5312,7 @@ async def get_indicator_table(
     location: Optional[str] = None,
     time: Optional[str] = "latest",
     extraFilters: dict[str, Any] | None = None,
-    labels: Optional[str] = "name",
+    labels: Optional[str] = None,
     maxRows: int = 200,
 ) -> dict[str, Any]:
     """
@@ -5229,12 +5338,15 @@ async def get_indicator_table(
         endPeriod=end_period,
         lastNObservations=last_n,
         format="csv",
-        labels=labels,
+        labels="id",
         maxObs=maxRows,
         resultShape="latest_by_ref_area",
         allowUnboundedTime=allow_unbounded,
     )
-    return _compact_indicator_table(result, max_rows=max(1, maxRows))
+    compact = _compact_indicator_table(result, max_rows=max(1, maxRows))
+    if compact.get("status") == "resolved" and compact.get("rows"):
+        compact["rows"] = await _enrich_indicator_table_rows(flowRef, compact["rows"])
+    return compact
 
 
 @mcp.tool()
@@ -5245,7 +5357,7 @@ async def get_time_series(
     location: Optional[str] = None,
     time: Optional[str] = "all",
     extraFilters: dict[str, Any] | None = None,
-    labels: Optional[str] = "name",
+    labels: Optional[str] = None,
     maxObservations: int = 500,
 ) -> dict[str, Any]:
     """
@@ -5270,12 +5382,29 @@ async def get_time_series(
         endPeriod=end_period,
         lastNObservations=last_n,
         format="csv",
-        labels=labels,
+        labels="id",
         maxObs=maxObservations,
         resultShape="compact_series",
         allowUnboundedTime=True if allow_unbounded else bool(start_period and end_period),
     )
-    return _compact_time_series(result, max_observations=max(1, maxObservations))
+    compact = _compact_time_series(result, max_observations=max(1, maxObservations))
+    return await _enrich_single_result(flowRef, compact, query_filters)
+
+
+@mcp.tool()
+async def ping() -> dict[str, Any]:
+    """
+    Returns server and build information.
+
+    Use this to verify which version of the server is running after a deploy,
+    or to confirm the server is reachable before making data queries.
+    """
+    return {
+        "status": "ok",
+        "server": MCP_NAME,
+        "build": BUILD_ID,
+        "sdmxBase": BASE or None,
+    }
 
 
 @mcp.tool()
