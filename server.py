@@ -3373,6 +3373,97 @@ def _row_unit(row: dict[str, Any]) -> str | None:
     return None
 
 
+def _coded_dim_ids(payload: dict[str, Any]) -> set[str]:
+    """Return component IDs that are DSD *dimensions* with codelists (not attributes)."""
+    return {d["id"] for d in _dimension_metadata(payload) if d.get("codelist")}
+
+
+# Fields always emitted in compact mode regardless of query shape.
+_COMPACT_CORE_KEYS: frozenset[str] = frozenset({
+    "value", "period", "unit",
+    "refArea", "refAreaName",
+    "indicator", "indicatorName",   # single-obs / time-series shape
+    "INDICATOR", "indicatorName",   # table-row shape (uppercase from CSV)
+    "rowCountAtLatestPeriod",
+})
+
+# Structural/status fields kept in compact single-result output.
+_COMPACT_SINGLE_KEEP: frozenset[str] = frozenset({
+    "status", "shape", "value", "period", "unit", "source",
+    "refArea", "refAreaName",
+    "indicator", "indicatorName",
+    "series", "observationCount",
+    # Error / partial-resolution fields that may appear:
+    "message", "note", "distinctCounts", "preview",
+    "latestPeriod", "latestRowCount",
+})
+
+
+def _project_rows(
+    rows: list[dict[str, Any]],
+    verbose: bool,
+    coded_dim_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Apply compact projection to indicator-table rows after resolution.
+
+    Verbose — return rows unchanged (empty-column drop already applied by _apply_code_resolution).
+    Compact — keep only:
+      • Core fields (value, period, unit, refArea/Name, indicator/Name, rowCountAtLatestPeriod).
+      • Every coded *dimension* column (not attribute) that VARIES across rows, plus its *Name.
+      • DATA_SOURCE (high-value provenance attribute).
+    Constant coded dimensions (SEX=_T everywhere, AGE=_T, …) and all other attributes
+    are dropped because they carry zero information for this result set.
+    """
+    if verbose or not rows:
+        return rows
+
+    all_keys: set[str] = set()
+    for row in rows:
+        all_keys.update(row.keys())
+
+    # Identify coded-dimension columns that are neither REF_AREA nor INDICATOR
+    # (those two are always kept via _COMPACT_CORE_KEYS).
+    _always_core_comps = {"REF_AREA", "INDICATOR"}
+    dim_col_to_comp: dict[str, str] = {}
+    for key in all_keys:
+        upper = key.upper()
+        if upper in coded_dim_ids and upper not in _always_core_comps:
+            dim_col_to_comp[key] = upper
+
+    # Keep a coded dimension only if it takes more than one distinct non-empty value.
+    keep_dim_cols: set[str] = set()
+    for col_key in dim_col_to_comp:
+        unique_vals = {str(r.get(col_key) or "").strip() for r in rows}
+        unique_vals.discard("")
+        if len(unique_vals) > 1:
+            keep_dim_cols.add(col_key)
+
+    # Build the final keep set.
+    keep: set[str] = set(_COMPACT_CORE_KEYS)
+    for col_key in keep_dim_cols:
+        comp_id = dim_col_to_comp[col_key]
+        keep.add(col_key)
+        keep.add(_camel_name_key(comp_id))
+    # DATA_SOURCE is a provenance attribute kept even in compact mode.
+    for key in all_keys:
+        if key.upper() == "DATA_SOURCE":
+            keep.add(key)
+
+    return [{k: v for k, v in row.items() if k in keep} for row in rows]
+
+
+def _project_single(result: dict[str, Any], verbose: bool) -> dict[str, Any]:
+    """Apply compact projection to a single-observation or time-series result dict.
+
+    Verbose — return unchanged.
+    Compact — retain only the structural and core semantic fields; drop coded filter
+    dimensions that were injected for resolution (sex/sexName, age/ageName, etc.).
+    """
+    if verbose:
+        return result
+    return {k: v for k, v in result.items() if k in _COMPACT_SINGLE_KEEP}
+
+
 def _apply_code_resolution(payload: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """DSD-driven code→label resolution for all coded components present in rows.
 
@@ -3458,7 +3549,10 @@ def _apply_code_resolution(payload: dict[str, Any], rows: list[dict[str, Any]]) 
     _never_drop = {"refArea", "period", "value", "unit", "rowCountAtLatestPeriod"}
     to_drop: set[str] = set()
     for key in all_enriched_keys:
-        if key in _never_drop or key.endswith("Name") or key.upper() in coded_ids:
+        # Protect core output fields and *Name labels; everything else can be dropped if empty.
+        # Deliberately NOT protecting coded_ids members so empty coded-attribute columns
+        # (e.g. SOWC_FLAG_A, FREQ_COLL) are removed just like any other empty column.
+        if key in _never_drop or key.endswith("Name"):
             continue
         if all(r.get(key) is None or str(r.get(key) or "").strip() == "" for r in enriched):
             to_drop.add(key)
@@ -3471,8 +3565,10 @@ def _apply_code_resolution(payload: dict[str, Any], rows: list[dict[str, Any]]) 
 async def _enrich_indicator_table_rows(
     flowRef: str,
     rows: list[dict[str, Any]],
+    *,
+    verbose: bool = False,
 ) -> list[dict[str, Any]]:
-    """DSD-driven code→label resolution for all coded components in indicator table rows."""
+    """DSD-driven code→label resolution + compact projection for indicator table rows."""
     if not rows:
         return rows
     try:
@@ -3480,18 +3576,22 @@ async def _enrich_indicator_table_rows(
     except Exception as exc:
         logger.warning("Name enrichment skipped for %s: %s", flowRef, exc)
         return rows
-    return _apply_code_resolution(payload, rows)
+    resolved = _apply_code_resolution(payload, rows)
+    return _project_rows(resolved, verbose=verbose, coded_dim_ids=_coded_dim_ids(payload))
 
 
 async def _enrich_single_result(
     flowRef: str,
     compact: dict[str, Any],
     query_filters: dict[str, Any],
+    *,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """Resolve all coded components from query_filters and add labels to the compact result.
 
     Also resolves the top-level 'unit' field and unit values embedded in time-series points.
-    Dimensions come from query_filters because they are not per-row in single/time-series shapes.
+    Compact mode (default) strips filter-dimension fields (sex/sexName, age/ageName, …) that
+    carry no extra information for a single-observation or time-series result.
     Falls back to raw code on any resolution failure — never null.
     """
     if compact.get("status") not in ("resolved", "resolved_single_value"):
@@ -3550,7 +3650,7 @@ async def _enrich_single_result(
                 for pt in series
             ]
 
-    return result
+    return _project_single(result, verbose=verbose)
 
 
 def _compact_unresolved(result: dict[str, Any], *, shape: str) -> dict[str, Any]:
@@ -5463,6 +5563,7 @@ async def get_single_observation(
     time: Optional[str] = "latest",
     extraFilters: dict[str, Any] | None = None,
     labels: Optional[str] = None,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """
     Compact exact-value tool.
@@ -5471,6 +5572,7 @@ async def get_single_observation(
     Prefer code-level filters when available. Otherwise provide subject/location/time text and
     the configured query-dimension policy will resolve them.
     Returns only a compact value payload; it does not return raw CSV.
+    Set verbose=true to include all coded filter dimensions and provenance attributes.
     """
     query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
         flowRef=flowRef,
@@ -5493,7 +5595,7 @@ async def get_single_observation(
         allowUnboundedTime=allow_unbounded,
     )
     compact = _compact_single_observation(result)
-    return await _enrich_single_result(flowRef, compact, query_filters)
+    return await _enrich_single_result(flowRef, compact, query_filters, verbose=verbose)
 
 
 @mcp.tool()
@@ -5507,6 +5609,7 @@ async def get_indicator_table(
     extraFilters: dict[str, Any] | None = None,
     labels: Optional[str] = None,
     maxRows: int = 200,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """
     Compact latest-by-location table tool.
@@ -5514,6 +5617,7 @@ async def get_indicator_table(
     Use this when the user asks for multiple countries, a region/group table, a comparison,
     or a ranking for one indicator and one period/latest value.
     Returns compact rows rather than raw CSV.
+    Set verbose=true to include constant coded dimensions and provenance attributes in every row.
     """
     location_input: str | list[str] | None = locations if locations else location
     query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
@@ -5538,7 +5642,7 @@ async def get_indicator_table(
     )
     compact = _compact_indicator_table(result, max_rows=max(1, maxRows))
     if compact.get("status") == "resolved" and compact.get("rows"):
-        compact["rows"] = await _enrich_indicator_table_rows(flowRef, compact["rows"])
+        compact["rows"] = await _enrich_indicator_table_rows(flowRef, compact["rows"], verbose=verbose)
     return compact
 
 
@@ -5552,6 +5656,7 @@ async def get_time_series(
     extraFilters: dict[str, Any] | None = None,
     labels: Optional[str] = None,
     maxObservations: int = 500,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """
     Compact time-series tool.
@@ -5559,6 +5664,7 @@ async def get_time_series(
     Use this when the user asks for trends, change over time, a chart, or a series.
     Set time to a single period, a range like '2000:2024', or 'all'.
     Returns compact period/value rows rather than raw CSV.
+    Set verbose=true to include coded filter dimensions and provenance attributes.
     """
     query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
         flowRef=flowRef,
@@ -5581,7 +5687,7 @@ async def get_time_series(
         allowUnboundedTime=True if allow_unbounded else bool(start_period and end_period),
     )
     compact = _compact_time_series(result, max_observations=max(1, maxObservations))
-    return await _enrich_single_result(flowRef, compact, query_filters)
+    return await _enrich_single_result(flowRef, compact, query_filters, verbose=verbose)
 
 
 @mcp.tool()
