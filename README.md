@@ -374,15 +374,28 @@ Time inputs accepted by the query policy can be:
 - Purpose: high-level helper for common user questions.
 - Behavior: validates the direct query first, then attempts a single hierarchy-based member fallback when an aggregate code does not resolve, and finally returns a shaped result.
 
-25. `get_single_observation(flowRef, filters=None, subject=None, location=None, time='latest', extraFilters=None, labels='name')`
+25. `get_single_observation(flowRef, filters=None, subject=None, location=None, time='latest', extraFilters=None, verbose=False)`
 - Purpose: compact exact-value tool for one indicator, one location, and one period/latest value.
-- Returns: only `status`, `value`, `period`, `unit`, and compact `source`; no raw CSV.
+- Returns: `status`, `value`, `period`, `unit` (resolved label), `refArea`, `refAreaName`, `indicator`, `indicatorName`, and compact `source`; no raw CSV.
+- `verbose=False` (default): compact — strips filter-dimension fields beyond core context (e.g. `sex`, `age`).
+- `verbose=True`: includes all resolved coded filter dimensions and their labels.
 
-26. `get_indicator_table(flowRef, filters=None, subject=None, locations=None, location=None, time='latest', extraFilters=None, labels='name', maxRows=200)`
+26. `get_indicator_table(flowRef, filters=None, subject=None, locations=None, location=None, time='latest', extraFilters=None, maxRows=200, verbose=False)`
 - Purpose: compact latest-by-location table for multi-country, group, comparison, ranking, or table requests.
+- Each row: `refArea`, `refAreaName`, `INDICATOR`, `indicatorName`, `value`, `period`, `unit` (resolved label), `rowCountAtLatestPeriod`.
+- `verbose=False` (default): coded dimensions constant across all rows (e.g. `SEX=_T` everywhere) are dropped — they carry no information for this result set. Provenance attributes (UNIT_MULTIPLIER, OBS_CONF, …) are dropped except `DATA_SOURCE`, which is always kept.
+- `verbose=True`: all coded dimensions (constant or varying) and all non-empty attributes, each with a companion `*Name` label field.
+- Single-location and multi-location queries produce identical row schemas for the same flow and mode.
 
-27. `get_time_series(flowRef, filters=None, subject=None, location=None, time='all', extraFilters=None, labels='name', maxObservations=500)`
+27. `get_time_series(flowRef, filters=None, subject=None, location=None, time='all', extraFilters=None, maxObservations=500, verbose=False)`
 - Purpose: compact period/value series for trend, change-over-time, chart, or historical requests.
+- Each point: `period`, `value`, `unit` (resolved label). Top-level context: `refArea`, `refAreaName`, `indicator`, `indicatorName`.
+- `verbose=False` (default): compact — omits injected filter-dimension fields beyond core context.
+- `verbose=True`: includes all resolved coded filter dimensions.
+
+#### DSD-driven label resolution
+
+All three compact tools resolve codes to human-readable labels from the flow's DSD rather than relying on the SDMX endpoint's `labels=name` parameter. This works correctly when components such as `UNIT_MEASURE` live in `attributeList` rather than `dimensionList`, applies the same resolution logic to every coded component, and falls back to the raw code string on any resolution failure (never `null`). Codelists are discovered from the DSD structure — no codelist IDs are hardcoded.
 
 ## Agent Test Rig
 
