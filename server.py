@@ -1864,6 +1864,17 @@ def _code_name(code: dict[str, Any]) -> str:
     return _coerce_text(code.get("name")) or _coerce_text(code.get("names"))
 
 
+def _camel_key(component_id: str) -> str:
+    """SCREAMING_SNAKE_CASE component ID → camelCase. E.g. EDUCATION_LEVEL → educationLevel."""
+    parts = component_id.upper().split("_")
+    return parts[0].lower() + "".join(p.capitalize() for p in parts[1:])
+
+
+def _camel_name_key(component_id: str) -> str:
+    """SCREAMING_SNAKE_CASE component ID → camelCaseName. E.g. EDUCATION_LEVEL → educationLevelName."""
+    return _camel_key(component_id) + "Name"
+
+
 def _dimension_code_map(payload: dict[str, Any], dimension_id: str) -> dict[str, dict[str, Any]]:
     dims = _dimension_metadata(payload)
     target = next((d for d in dims if d.get("id") == dimension_id.strip().upper()), None)
@@ -1913,6 +1924,80 @@ def _ref_area_code_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return _dimension_code_map(payload, DIM_REF_AREA)
 
 
+def _attribute_code_map(payload: dict[str, Any], component_id: str) -> dict[str, dict[str, Any]]:
+    """Return code→dict mapping for a DSD *attribute* (attributeList) component.
+
+    Mirrors _dimension_code_map but searches attributeList instead of dimensionList.
+    This handles flows where UNIT_MEASURE (and similar) is declared as an attribute.
+    """
+    norm_id = component_id.strip().upper()
+    for ds in _extract_data_structures(payload):
+        components = ds.get("dataStructureComponents")
+        if not isinstance(components, dict):
+            continue
+        attr_list = components.get("attributeList")
+        if not isinstance(attr_list, dict):
+            continue
+        attrs = attr_list.get("attributes") or attr_list.get("attribute") or []
+        if isinstance(attrs, dict):
+            attrs = list(attrs.values())
+        if not isinstance(attrs, list):
+            continue
+        for attr in attrs:
+            if not isinstance(attr, dict):
+                continue
+            attr_id = (attr.get("id") or attr.get("ID") or "").upper()
+            if attr_id != norm_id:
+                continue
+            local_rep = attr.get("localRepresentation") or {}
+            codelist_ref: str | None = None
+            if isinstance(local_rep, dict):
+                enumeration = local_rep.get("enumeration") or {}
+                if isinstance(enumeration, dict):
+                    codelist_ref = enumeration.get("id") or enumeration.get("ID")
+                elif isinstance(enumeration, str):
+                    codelist_ref = enumeration
+            if not isinstance(codelist_ref, str) or not codelist_ref.strip():
+                return {}
+            codelists = _codelist_map(payload)
+            codelist = codelists.get(codelist_ref) or codelists.get(_codelist_key(codelist_ref))
+            if not codelist:
+                return {}
+            mapping: dict[str, dict[str, Any]] = {}
+            for code in _codelist_codes(codelist):
+                code_id = _code_identifier(code)
+                if code_id:
+                    mapping[code_id] = code
+            return mapping
+    return {}
+
+
+def _all_coded_component_ids(payload: dict[str, Any]) -> set[str]:
+    """Return all component IDs (dimensions + attributes) that have a codelist in this DSD."""
+    result: set[str] = set()
+    for dim in _dimension_metadata(payload):
+        if dim.get("codelist"):
+            result.add(dim["id"])
+    for ds in _extract_data_structures(payload):
+        components = ds.get("dataStructureComponents") or {}
+        attr_list = components.get("attributeList") or {}
+        attrs = attr_list.get("attributes") or attr_list.get("attribute") or []
+        if isinstance(attrs, dict):
+            attrs = list(attrs.values())
+        if not isinstance(attrs, list):
+            continue
+        for attr in attrs:
+            if not isinstance(attr, dict):
+                continue
+            attr_id = (attr.get("id") or attr.get("ID") or "").upper()
+            if not attr_id:
+                continue
+            local_rep = attr.get("localRepresentation") or {}
+            if isinstance(local_rep, dict) and local_rep.get("enumeration"):
+                result.add(attr_id)
+    return result
+
+
 def _resolve_codes_from_payload(
     payload: dict[str, Any],
     dimension_id: str,
@@ -1926,6 +2011,8 @@ def _resolve_codes_from_payload(
     if not code_ids:
         return {}
     code_map = _dimension_code_map(payload, dimension_id)
+    if not code_map:
+        code_map = _attribute_code_map(payload, dimension_id)
     result: dict[str, str] = {}
     for code_id in code_ids:
         code = code_map.get(code_id)
@@ -3286,15 +3373,106 @@ def _row_unit(row: dict[str, Any]) -> str | None:
     return None
 
 
+def _apply_code_resolution(payload: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """DSD-driven code→label resolution for all coded components present in rows.
+
+    For every coded component column (detected from the DSD, not hardcoded):
+    - Adds a <camelCase>Name companion field with the resolved label.
+    - The special 'unit' field (UNIT_MEASURE) is resolved in-place.
+    - REF_AREA via 'refArea' → adds 'refAreaName'.
+    - Drops non-core columns that are null/empty across all rows (attribute clutter).
+    Falls back to the raw code string on any resolution failure — never null.
+    """
+    if not rows:
+        return rows
+
+    coded_ids = _all_coded_component_ids(payload)
+    # Compact-row keys that map to DSD component IDs (not the raw CSV column name).
+    _compact_key_to_comp = {"refArea": "REF_AREA", "unit": "UNIT_MEASURE"}
+
+    all_row_keys: set[str] = set()
+    for row in rows:
+        all_row_keys.update(row.keys())
+
+    # Map actual row key → component_id for every coded column present in any row.
+    key_to_comp: dict[str, str] = {}
+    for key in all_row_keys:
+        if key in _compact_key_to_comp:
+            comp_id = _compact_key_to_comp[key]
+            if comp_id in coded_ids or comp_id == "UNIT_MEASURE":
+                key_to_comp[key] = comp_id
+        elif key.upper() in coded_ids:
+            key_to_comp[key] = key.upper()
+
+    # Collect unique code values per component.
+    codes_per_comp: dict[str, set[str]] = {}
+    for key, comp_id in key_to_comp.items():
+        codes: set[str] = set()
+        for row in rows:
+            v = row.get(key)
+            if v is not None and str(v).strip():
+                codes.add(str(v).strip())
+        if codes:
+            codes_per_comp[comp_id] = codes
+
+    # Resolve all codes via the DSD in one pass per component.
+    resolution: dict[str, dict[str, str]] = {
+        comp_id: _resolve_codes_from_payload(payload, comp_id, codes)
+        for comp_id, codes in codes_per_comp.items()
+    }
+
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        r = dict(row)
+
+        # Resolve 'unit' in-place (UNIT_MEASURE).
+        unit_val = r.get("unit")
+        if unit_val and "UNIT_MEASURE" in resolution:
+            r["unit"] = resolution["UNIT_MEASURE"].get(str(unit_val).strip(), unit_val)
+
+        # For every other coded column add a companion <camelCase>Name field.
+        for key, comp_id in key_to_comp.items():
+            if comp_id == "UNIT_MEASURE":
+                continue
+            code = r.get(key)
+            if code is None:
+                continue
+            code_str = str(code).strip()
+            if not code_str:
+                continue
+            label = resolution.get(comp_id, {}).get(code_str, code_str)
+            if comp_id == "REF_AREA":
+                r["refAreaName"] = label
+            elif comp_id == "INDICATOR":
+                r["indicatorName"] = label
+            else:
+                r[_camel_name_key(comp_id)] = label
+
+        enriched.append(r)
+
+    # Drop non-core columns that are null/empty across every row (e.g. empty SDMX attributes).
+    all_enriched_keys: set[str] = set()
+    for r in enriched:
+        all_enriched_keys.update(r.keys())
+
+    _never_drop = {"refArea", "period", "value", "unit", "rowCountAtLatestPeriod"}
+    to_drop: set[str] = set()
+    for key in all_enriched_keys:
+        if key in _never_drop or key.endswith("Name") or key.upper() in coded_ids:
+            continue
+        if all(r.get(key) is None or str(r.get(key) or "").strip() == "" for r in enriched):
+            to_drop.add(key)
+    if to_drop:
+        enriched = [{k: v for k, v in r.items() if k not in to_drop} for r in enriched]
+
+    return enriched
+
+
 async def _enrich_indicator_table_rows(
     flowRef: str,
     rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Add refAreaName, indicatorName, and resolved unit names to indicator table rows.
-
-    Fetches the flow's DSD once and resolves all unique codes in a single pass.
-    Falls back to the raw code string on any resolution failure so rows are never nulled.
-    """
+    """DSD-driven code→label resolution for all coded components in indicator table rows."""
     if not rows:
         return rows
     try:
@@ -3302,29 +3480,7 @@ async def _enrich_indicator_table_rows(
     except Exception as exc:
         logger.warning("Name enrichment skipped for %s: %s", flowRef, exc)
         return rows
-
-    ref_area_codes = {r["refArea"] for r in rows if r.get("refArea")}
-    indicator_codes = {r.get(DIM_INDICATOR) for r in rows if r.get(DIM_INDICATOR)}
-    unit_codes = {r.get("unit") for r in rows if r.get("unit")}
-
-    ref_area_names = _resolve_codes_from_payload(payload, DIM_REF_AREA, ref_area_codes)
-    indicator_names = _resolve_codes_from_payload(payload, DIM_INDICATOR, indicator_codes)
-    unit_names = _resolve_codes_from_payload(payload, "UNIT_MEASURE", unit_codes)
-
-    enriched: list[dict[str, Any]] = []
-    for row in rows:
-        r = dict(row)
-        ref_area = r.get("refArea")
-        indicator = r.get(DIM_INDICATOR)
-        unit_code = r.get("unit")
-        if ref_area:
-            r["refAreaName"] = ref_area_names.get(ref_area, ref_area)
-        if indicator:
-            r["indicatorName"] = indicator_names.get(indicator, indicator)
-        if unit_code:
-            r["unit"] = unit_names.get(unit_code, unit_code)
-        enriched.append(r)
-    return enriched
+    return _apply_code_resolution(payload, rows)
 
 
 async def _enrich_single_result(
@@ -3332,10 +3488,11 @@ async def _enrich_single_result(
     compact: dict[str, Any],
     query_filters: dict[str, Any],
 ) -> dict[str, Any]:
-    """Resolve unit code and add refArea/refAreaName/indicator/indicatorName to a
-    single-series compact result (get_single_observation or get_time_series).
+    """Resolve all coded components from query_filters and add labels to the compact result.
 
-    Dimensions are read from query_filters because they are not per-row in these shapes.
+    Also resolves the top-level 'unit' field and unit values embedded in time-series points.
+    Dimensions come from query_filters because they are not per-row in single/time-series shapes.
+    Falls back to raw code on any resolution failure — never null.
     """
     if compact.get("status") not in ("resolved", "resolved_single_value"):
         return compact
@@ -3346,23 +3503,52 @@ async def _enrich_single_result(
         return compact
 
     result = dict(compact)
+    coded_ids = _all_coded_component_ids(payload)
 
-    ref_area = str(query_filters.get(DIM_REF_AREA) or "").strip()
-    if ref_area and "+" not in ref_area:
-        names = _resolve_codes_from_payload(payload, DIM_REF_AREA, {ref_area})
-        result["refArea"] = ref_area
-        result["refAreaName"] = names.get(ref_area, ref_area)
+    for filter_key, filter_val in query_filters.items():
+        comp_id = filter_key.strip().upper()
+        # Skip time period (not coded) and UNIT_MEASURE (handled separately via compact["unit"]).
+        if comp_id in {DIM_TIME_PERIOD, "UNIT_MEASURE"}:
+            continue
+        if comp_id not in coded_ids:
+            continue
+        val_str = str(filter_val or "").strip()
+        if not val_str or "+" in val_str:
+            continue
+        names = _resolve_codes_from_payload(payload, comp_id, {val_str})
+        label = names.get(val_str, val_str)
+        if comp_id == "REF_AREA":
+            result["refArea"] = val_str
+            result["refAreaName"] = label
+        elif comp_id == "INDICATOR":
+            result["indicator"] = val_str
+            result["indicatorName"] = label
+        else:
+            result[_camel_key(comp_id)] = val_str
+            result[_camel_name_key(comp_id)] = label
 
-    indicator = str(query_filters.get(DIM_INDICATOR) or "").strip()
-    if indicator and "+" not in indicator:
-        names = _resolve_codes_from_payload(payload, DIM_INDICATOR, {indicator})
-        result["indicator"] = indicator
-        result["indicatorName"] = names.get(indicator, indicator)
-
+    # Resolve unit at compact level (get_single_observation).
     unit_code = compact.get("unit")
     if unit_code:
-        names = _resolve_codes_from_payload(payload, "UNIT_MEASURE", {unit_code})
-        result["unit"] = names.get(unit_code, unit_code)
+        unit_map = _resolve_codes_from_payload(payload, "UNIT_MEASURE", {unit_code})
+        result["unit"] = unit_map.get(unit_code, unit_code)
+
+    # Resolve unit values embedded in time-series points (get_time_series).
+    series = result.get("series")
+    if isinstance(series, list):
+        series_unit_codes = {
+            str(pt.get("unit")).strip()
+            for pt in series
+            if isinstance(pt, dict) and pt.get("unit") and str(pt.get("unit")).strip()
+        }
+        if series_unit_codes:
+            unit_map = _resolve_codes_from_payload(payload, "UNIT_MEASURE", series_unit_codes)
+            result["series"] = [
+                {**pt, "unit": unit_map.get(str(pt.get("unit", "")).strip(), pt.get("unit"))}
+                if isinstance(pt, dict) and pt.get("unit")
+                else pt
+                for pt in series
+            ]
 
     return result
 
@@ -3465,13 +3651,20 @@ def _compact_indicator_table(result: dict[str, Any], max_rows: int) -> dict[str,
 
         if item_value is not None or len(item_obs) <= 1:
             # Single scalar — emit the compact collapsed row.
+            # Also pass through coded dimension columns (INDICATOR, SEX, AGE, …) so
+            # that downstream enrichment produces the same schema as multi-series rows.
             first_row = item_obs[0] if item_obs else {}
+            time_col = _time_column(item_obs)
+            value_col = _value_column(item_obs)
+            absorbed_single = _always_absorbed | {(time_col or "").upper(), (value_col or "").upper()}
+            extra_dims = {k: v for k, v in first_row.items() if k.upper() not in absorbed_single}
             rows.append({
                 "refArea": item.get("refArea"),
                 "period": item.get("latestPeriod"),
                 "value": item_value,
                 "unit": _row_unit(first_row),
                 "rowCountAtLatestPeriod": item.get("rowCountAtLatestPeriod"),
+                **extra_dims,
             })
         else:
             # Multiple series for this refArea — expand tidy/long, one row per observation.
