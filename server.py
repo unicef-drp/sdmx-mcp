@@ -34,6 +34,10 @@ BASE = os.getenv("SDMX_BASE_URL", "").strip().rstrip("/")
 MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
 HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "sdmx-mcp/0.1").strip() or "sdmx-mcp/0.1"
 STRUCTURE_REFERENCES = os.getenv("SDMX_STRUCTURE_REFERENCES", "descendants").strip() or "descendants"
+# Set SDMX_BUILD_ID in the deploy pipeline (e.g. to the git SHA) to make the
+# running version verifiable without a code deploy.
+_SERVER_VERSION = "1.2.0"
+BUILD_ID = os.getenv("SDMX_BUILD_ID", "").strip() or _SERVER_VERSION
 
 
 def _env_csv(name: str) -> list[str]:
@@ -1443,6 +1447,31 @@ def _dimension_column(rows: list[dict[str, Any]], dimension_id: str) -> str | No
     return _find_column(list(rows[0].keys()), [dimension_id])
 
 
+def _inject_constant_dim_from_filters(
+    rows: list[dict[str, Any]],
+    dim_id: str,
+    filters: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Re-inject a single-valued dimension SDMX dropped from the CSV as a constant column.
+
+    When only one value is queried for a dimension, some SDMX endpoints omit that column
+    from the response because it carries no information. The shaper then can't find the
+    pivot column and aborts. This function detects that case and backfills the column.
+    """
+    if not rows or not filters:
+        return rows
+    if _dimension_column(rows, dim_id):
+        return rows
+    raw = filters.get(dim_id) or filters.get(dim_id.upper())
+    if not raw:
+        return rows
+    tokens = [t.strip() for t in str(raw).replace("+", ",").split(",") if t.strip()]
+    if len(tokens) != 1:
+        return rows
+    const_value = tokens[0]
+    return [{**row, dim_id: const_value} for row in rows]
+
+
 def _row_time_value(row: dict[str, Any], time_column: str | None) -> str:
     if not time_column:
         return ""
@@ -1577,10 +1606,20 @@ def _shape_latest_by_ref_area(rows: list[dict[str, Any]]) -> dict[str, Any]:
     time_column = _time_column(rows)
     value_column = _value_column(rows)
     if not ref_area_column:
+        if rows:
+            # Observations present but REF_AREA column absent even after injection.
+            # Return long-form rows so callers can still extract the data.
+            return {
+                "status": "shape_degraded",
+                "shape": "latest_by_ref_area",
+                "reason": "REF_AREA column was not present in the returned dataset; observations returned in long form.",
+                "rows": rows,
+                "summary": _topline_summary(rows),
+            }
         return {
-            "status": "shape_not_applicable",
+            "status": "no_observations",
             "shape": "latest_by_ref_area",
-            "reason": "REF_AREA column was not present in the returned dataset.",
+            "reason": "The query returned no observations.",
             "summary": _topline_summary(rows),
         }
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -1595,7 +1634,7 @@ def _shape_latest_by_ref_area(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "latestPeriod": latest_period,
                 "rowCountAtLatestPeriod": len(latest_rows),
                 "value": latest_rows[0].get(value_column) if value_column and len(latest_rows) == 1 else None,
-                "rows": latest_rows[:10],
+                "rows": latest_rows,
             }
         )
     return {
@@ -1825,6 +1864,17 @@ def _code_name(code: dict[str, Any]) -> str:
     return _coerce_text(code.get("name")) or _coerce_text(code.get("names"))
 
 
+def _camel_key(component_id: str) -> str:
+    """SCREAMING_SNAKE_CASE component ID → camelCase. E.g. EDUCATION_LEVEL → educationLevel."""
+    parts = component_id.upper().split("_")
+    return parts[0].lower() + "".join(p.capitalize() for p in parts[1:])
+
+
+def _camel_name_key(component_id: str) -> str:
+    """SCREAMING_SNAKE_CASE component ID → camelCaseName. E.g. EDUCATION_LEVEL → educationLevelName."""
+    return _camel_key(component_id) + "Name"
+
+
 def _dimension_code_map(payload: dict[str, Any], dimension_id: str) -> dict[str, dict[str, Any]]:
     dims = _dimension_metadata(payload)
     target = next((d for d in dims if d.get("id") == dimension_id.strip().upper()), None)
@@ -1872,6 +1922,105 @@ def _codelist_meta(payload: dict[str, Any], dimension_id: str) -> dict[str, Any]
 
 def _ref_area_code_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return _dimension_code_map(payload, DIM_REF_AREA)
+
+
+def _attribute_code_map(payload: dict[str, Any], component_id: str) -> dict[str, dict[str, Any]]:
+    """Return code→dict mapping for a DSD *attribute* (attributeList) component.
+
+    Mirrors _dimension_code_map but searches attributeList instead of dimensionList.
+    This handles flows where UNIT_MEASURE (and similar) is declared as an attribute.
+    """
+    norm_id = component_id.strip().upper()
+    for ds in _extract_data_structures(payload):
+        components = ds.get("dataStructureComponents")
+        if not isinstance(components, dict):
+            continue
+        attr_list = components.get("attributeList")
+        if not isinstance(attr_list, dict):
+            continue
+        attrs = attr_list.get("attributes") or attr_list.get("attribute") or []
+        if isinstance(attrs, dict):
+            attrs = list(attrs.values())
+        if not isinstance(attrs, list):
+            continue
+        for attr in attrs:
+            if not isinstance(attr, dict):
+                continue
+            attr_id = (attr.get("id") or attr.get("ID") or "").upper()
+            if attr_id != norm_id:
+                continue
+            local_rep = attr.get("localRepresentation") or {}
+            codelist_ref: str | None = None
+            if isinstance(local_rep, dict):
+                enumeration = local_rep.get("enumeration") or {}
+                if isinstance(enumeration, dict):
+                    codelist_ref = enumeration.get("id") or enumeration.get("ID")
+                elif isinstance(enumeration, str):
+                    codelist_ref = enumeration
+            if not isinstance(codelist_ref, str) or not codelist_ref.strip():
+                return {}
+            codelists = _codelist_map(payload)
+            codelist = codelists.get(codelist_ref) or codelists.get(_codelist_key(codelist_ref))
+            if not codelist:
+                return {}
+            mapping: dict[str, dict[str, Any]] = {}
+            for code in _codelist_codes(codelist):
+                code_id = _code_identifier(code)
+                if code_id:
+                    mapping[code_id] = code
+            return mapping
+    return {}
+
+
+def _all_coded_component_ids(payload: dict[str, Any]) -> set[str]:
+    """Return all component IDs (dimensions + attributes) that have a codelist in this DSD."""
+    result: set[str] = set()
+    for dim in _dimension_metadata(payload):
+        if dim.get("codelist"):
+            result.add(dim["id"])
+    for ds in _extract_data_structures(payload):
+        components = ds.get("dataStructureComponents") or {}
+        attr_list = components.get("attributeList") or {}
+        attrs = attr_list.get("attributes") or attr_list.get("attribute") or []
+        if isinstance(attrs, dict):
+            attrs = list(attrs.values())
+        if not isinstance(attrs, list):
+            continue
+        for attr in attrs:
+            if not isinstance(attr, dict):
+                continue
+            attr_id = (attr.get("id") or attr.get("ID") or "").upper()
+            if not attr_id:
+                continue
+            local_rep = attr.get("localRepresentation") or {}
+            if isinstance(local_rep, dict) and local_rep.get("enumeration"):
+                result.add(attr_id)
+    return result
+
+
+def _resolve_codes_from_payload(
+    payload: dict[str, Any],
+    dimension_id: str,
+    code_ids: set[str],
+) -> dict[str, str]:
+    """Return {code_id: display_name} using the flow's DSD codelists.
+
+    Falls back to the raw code ID for any entry that cannot be resolved so that
+    the caller always gets a usable string, never None.
+    """
+    if not code_ids:
+        return {}
+    code_map = _dimension_code_map(payload, dimension_id)
+    if not code_map:
+        code_map = _attribute_code_map(payload, dimension_id)
+    result: dict[str, str] = {}
+    for code_id in code_ids:
+        code = code_map.get(code_id)
+        name = _code_name(code) if code else None
+        if not name:
+            logger.debug("No codelist name for %s=%s; falling back to code", dimension_id, code_id)
+        result[code_id] = name or code_id
+    return result
 
 
 def _code_parent_links(codes: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
@@ -3199,6 +3348,8 @@ async def _execute_query_data(
         payload["notes"]["formatOverride"] = "SDMX data queries are forced to CSV for efficiency and simpler downstream parsing."
     if resultShape:
         rows = _csv_rows(text)
+        if (resultShape or "").strip().lower() == "latest_by_ref_area":
+            rows = _inject_constant_dim_from_filters(rows, DIM_REF_AREA, normalized_filters)
         payload["shaped"] = _shape_rows(rows, resultShape)
     return payload
 
@@ -3220,6 +3371,286 @@ def _row_unit(row: dict[str, Any]) -> str | None:
         if value is not None and str(value).strip():
             return str(value).strip()
     return None
+
+
+def _coded_dim_ids(payload: dict[str, Any]) -> set[str]:
+    """Return component IDs that are DSD *dimensions* with codelists (not attributes)."""
+    return {d["id"] for d in _dimension_metadata(payload) if d.get("codelist")}
+
+
+# Fields always emitted in compact mode regardless of query shape.
+_COMPACT_CORE_KEYS: frozenset[str] = frozenset({
+    "value", "period", "unit",
+    "refArea", "refAreaName",
+    "indicator", "indicatorName",   # single-obs / time-series shape
+    "INDICATOR", "indicatorName",   # table-row shape (uppercase from CSV)
+    "rowCountAtLatestPeriod",
+})
+
+# Structural/status fields kept in compact single-result output.
+_COMPACT_SINGLE_KEEP: frozenset[str] = frozenset({
+    "status", "shape", "value", "period", "unit", "source",
+    "refArea", "refAreaName",
+    "indicator", "indicatorName",
+    "series", "observationCount",
+    # Error / partial-resolution fields that may appear:
+    "message", "note", "distinctCounts", "preview",
+    "latestPeriod", "latestRowCount",
+})
+
+
+def _project_rows(
+    rows: list[dict[str, Any]],
+    verbose: bool,
+    coded_dim_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Apply compact projection to indicator-table rows after resolution.
+
+    Verbose — return rows unchanged (empty-column drop already applied by _apply_code_resolution).
+    Compact — keep only:
+      • Core fields (value, period, unit, refArea/Name, indicator/Name, rowCountAtLatestPeriod).
+      • Every coded *dimension* column (not attribute) that VARIES across rows, plus its *Name.
+      • DATA_SOURCE (high-value provenance attribute).
+    Constant coded dimensions (SEX=_T everywhere, AGE=_T, …) and all other attributes
+    are dropped because they carry zero information for this result set.
+    """
+    if verbose or not rows:
+        return rows
+
+    all_keys: set[str] = set()
+    for row in rows:
+        all_keys.update(row.keys())
+
+    # Identify coded-dimension columns that are neither REF_AREA nor INDICATOR
+    # (those two are always kept via _COMPACT_CORE_KEYS).
+    _always_core_comps = {"REF_AREA", "INDICATOR"}
+    dim_col_to_comp: dict[str, str] = {}
+    for key in all_keys:
+        upper = key.upper()
+        if upper in coded_dim_ids and upper not in _always_core_comps:
+            dim_col_to_comp[key] = upper
+
+    # Keep a coded dimension only if it takes more than one distinct non-empty value.
+    keep_dim_cols: set[str] = set()
+    for col_key in dim_col_to_comp:
+        unique_vals = {str(r.get(col_key) or "").strip() for r in rows}
+        unique_vals.discard("")
+        if len(unique_vals) > 1:
+            keep_dim_cols.add(col_key)
+
+    # Build the final keep set.
+    keep: set[str] = set(_COMPACT_CORE_KEYS)
+    for col_key in keep_dim_cols:
+        comp_id = dim_col_to_comp[col_key]
+        keep.add(col_key)
+        keep.add(_camel_name_key(comp_id))
+    # DATA_SOURCE is a provenance attribute kept even in compact mode.
+    for key in all_keys:
+        if key.upper() == "DATA_SOURCE":
+            keep.add(key)
+
+    return [{k: v for k, v in row.items() if k in keep} for row in rows]
+
+
+def _project_single(result: dict[str, Any], verbose: bool) -> dict[str, Any]:
+    """Apply compact projection to a single-observation or time-series result dict.
+
+    Verbose — return unchanged.
+    Compact — retain only the structural and core semantic fields; drop coded filter
+    dimensions that were injected for resolution (sex/sexName, age/ageName, etc.).
+    """
+    if verbose:
+        return result
+    return {k: v for k, v in result.items() if k in _COMPACT_SINGLE_KEEP}
+
+
+def _apply_code_resolution(payload: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """DSD-driven code→label resolution for all coded components present in rows.
+
+    For every coded component column (detected from the DSD, not hardcoded):
+    - Adds a <camelCase>Name companion field with the resolved label.
+    - The special 'unit' field (UNIT_MEASURE) is resolved in-place.
+    - REF_AREA via 'refArea' → adds 'refAreaName'.
+    - Drops non-core columns that are null/empty across all rows (attribute clutter).
+    Falls back to the raw code string on any resolution failure — never null.
+    """
+    if not rows:
+        return rows
+
+    coded_ids = _all_coded_component_ids(payload)
+    # Compact-row keys that map to DSD component IDs (not the raw CSV column name).
+    _compact_key_to_comp = {"refArea": "REF_AREA", "unit": "UNIT_MEASURE"}
+
+    all_row_keys: set[str] = set()
+    for row in rows:
+        all_row_keys.update(row.keys())
+
+    # Map actual row key → component_id for every coded column present in any row.
+    key_to_comp: dict[str, str] = {}
+    for key in all_row_keys:
+        if key in _compact_key_to_comp:
+            comp_id = _compact_key_to_comp[key]
+            if comp_id in coded_ids or comp_id == "UNIT_MEASURE":
+                key_to_comp[key] = comp_id
+        elif key.upper() in coded_ids:
+            key_to_comp[key] = key.upper()
+
+    # Collect unique code values per component.
+    codes_per_comp: dict[str, set[str]] = {}
+    for key, comp_id in key_to_comp.items():
+        codes: set[str] = set()
+        for row in rows:
+            v = row.get(key)
+            if v is not None and str(v).strip():
+                codes.add(str(v).strip())
+        if codes:
+            codes_per_comp[comp_id] = codes
+
+    # Resolve all codes via the DSD in one pass per component.
+    resolution: dict[str, dict[str, str]] = {
+        comp_id: _resolve_codes_from_payload(payload, comp_id, codes)
+        for comp_id, codes in codes_per_comp.items()
+    }
+
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        r = dict(row)
+
+        # Resolve 'unit' in-place (UNIT_MEASURE).
+        unit_val = r.get("unit")
+        if unit_val and "UNIT_MEASURE" in resolution:
+            r["unit"] = resolution["UNIT_MEASURE"].get(str(unit_val).strip(), unit_val)
+
+        # For every other coded column add a companion <camelCase>Name field.
+        for key, comp_id in key_to_comp.items():
+            if comp_id == "UNIT_MEASURE":
+                continue
+            code = r.get(key)
+            if code is None:
+                continue
+            code_str = str(code).strip()
+            if not code_str:
+                continue
+            label = resolution.get(comp_id, {}).get(code_str, code_str)
+            if comp_id == "REF_AREA":
+                r["refAreaName"] = label
+            elif comp_id == "INDICATOR":
+                r["indicatorName"] = label
+            else:
+                r[_camel_name_key(comp_id)] = label
+
+        enriched.append(r)
+
+    # Drop non-core columns that are null/empty across every row (e.g. empty SDMX attributes).
+    all_enriched_keys: set[str] = set()
+    for r in enriched:
+        all_enriched_keys.update(r.keys())
+
+    _never_drop = {"refArea", "period", "value", "unit", "rowCountAtLatestPeriod"}
+    to_drop: set[str] = set()
+    for key in all_enriched_keys:
+        # Protect core output fields and *Name labels; everything else can be dropped if empty.
+        # Deliberately NOT protecting coded_ids members so empty coded-attribute columns
+        # (e.g. SOWC_FLAG_A, FREQ_COLL) are removed just like any other empty column.
+        if key in _never_drop or key.endswith("Name"):
+            continue
+        if all(r.get(key) is None or str(r.get(key) or "").strip() == "" for r in enriched):
+            to_drop.add(key)
+    if to_drop:
+        enriched = [{k: v for k, v in r.items() if k not in to_drop} for r in enriched]
+
+    return enriched
+
+
+async def _enrich_indicator_table_rows(
+    flowRef: str,
+    rows: list[dict[str, Any]],
+    *,
+    verbose: bool = False,
+) -> list[dict[str, Any]]:
+    """DSD-driven code→label resolution + compact projection for indicator table rows."""
+    if not rows:
+        return rows
+    try:
+        payload = await _get_flow_structure(flowRef)
+    except Exception as exc:
+        logger.warning("Name enrichment skipped for %s: %s", flowRef, exc)
+        return rows
+    resolved = _apply_code_resolution(payload, rows)
+    return _project_rows(resolved, verbose=verbose, coded_dim_ids=_coded_dim_ids(payload))
+
+
+async def _enrich_single_result(
+    flowRef: str,
+    compact: dict[str, Any],
+    query_filters: dict[str, Any],
+    *,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Resolve all coded components from query_filters and add labels to the compact result.
+
+    Also resolves the top-level 'unit' field and unit values embedded in time-series points.
+    Compact mode (default) strips filter-dimension fields (sex/sexName, age/ageName, …) that
+    carry no extra information for a single-observation or time-series result.
+    Falls back to raw code on any resolution failure — never null.
+    """
+    if compact.get("status") not in ("resolved", "resolved_single_value"):
+        return compact
+    try:
+        payload = await _get_flow_structure(flowRef)
+    except Exception as exc:
+        logger.warning("Name enrichment skipped for %s: %s", flowRef, exc)
+        return compact
+
+    result = dict(compact)
+    coded_ids = _all_coded_component_ids(payload)
+
+    for filter_key, filter_val in query_filters.items():
+        comp_id = filter_key.strip().upper()
+        # Skip time period (not coded) and UNIT_MEASURE (handled separately via compact["unit"]).
+        if comp_id in {DIM_TIME_PERIOD, "UNIT_MEASURE"}:
+            continue
+        if comp_id not in coded_ids:
+            continue
+        val_str = str(filter_val or "").strip()
+        if not val_str or "+" in val_str:
+            continue
+        names = _resolve_codes_from_payload(payload, comp_id, {val_str})
+        label = names.get(val_str, val_str)
+        if comp_id == "REF_AREA":
+            result["refArea"] = val_str
+            result["refAreaName"] = label
+        elif comp_id == "INDICATOR":
+            result["indicator"] = val_str
+            result["indicatorName"] = label
+        else:
+            result[_camel_key(comp_id)] = val_str
+            result[_camel_name_key(comp_id)] = label
+
+    # Resolve unit at compact level (get_single_observation).
+    unit_code = compact.get("unit")
+    if unit_code:
+        unit_map = _resolve_codes_from_payload(payload, "UNIT_MEASURE", {unit_code})
+        result["unit"] = unit_map.get(unit_code, unit_code)
+
+    # Resolve unit values embedded in time-series points (get_time_series).
+    series = result.get("series")
+    if isinstance(series, list):
+        series_unit_codes = {
+            str(pt.get("unit")).strip()
+            for pt in series
+            if isinstance(pt, dict) and pt.get("unit") and str(pt.get("unit")).strip()
+        }
+        if series_unit_codes:
+            unit_map = _resolve_codes_from_payload(payload, "UNIT_MEASURE", series_unit_codes)
+            result["series"] = [
+                {**pt, "unit": unit_map.get(str(pt.get("unit", "")).strip(), pt.get("unit"))}
+                if isinstance(pt, dict) and pt.get("unit")
+                else pt
+                for pt in series
+            ]
+
+    return _project_single(result, verbose=verbose)
 
 
 def _compact_unresolved(result: dict[str, Any], *, shape: str) -> dict[str, Any]:
@@ -3265,6 +3696,33 @@ def _compact_indicator_table(result: dict[str, Any], max_rows: int) -> dict[str,
         return _compact_unresolved(result, shape="indicator_table")
 
     shaped = result.get("shaped") if isinstance(result.get("shaped"), dict) else {}
+
+    if shaped.get("status") == "shape_degraded":
+        # Observations exist but REF_AREA was absent from the SDMX response even after
+        # injection; fall back to long-form rows rather than returning nothing.
+        raw_rows = shaped.get("rows") or []
+        time_col = _time_column(raw_rows)
+        value_col = _value_column(raw_rows)
+        rows = []
+        for raw in raw_rows[:max_rows]:
+            if not isinstance(raw, dict):
+                continue
+            rows.append({
+                "refArea": None,
+                "period": raw.get(time_col) if time_col else None,
+                "value": raw.get(value_col) if value_col else None,
+                "unit": _row_unit(raw),
+                "rowCountAtLatestPeriod": 1,
+            })
+        return {
+            "status": "resolved",
+            "shape": "indicator_table",
+            "rows": rows,
+            "rowCount": len(rows),
+            "note": shaped.get("reason"),
+            "source": _compact_source(result),
+        }
+
     if shaped.get("status") != "resolved":
         return {
             "status": shaped.get("status") or "not_resolved_table",
@@ -3274,21 +3732,56 @@ def _compact_indicator_table(result: dict[str, Any], max_rows: int) -> dict[str,
             "rows": [],
         }
 
+    # Columns to absorb into the standard output keys rather than pass through as extra dims.
+    _ref_area_upper = {a.upper() for a in _dimension_column_aliases(DIM_REF_AREA)}
+    _always_absorbed = _ref_area_upper | {
+        "OBS_VALUE", "VALUE",
+        "TIME_PERIOD", "TIME",
+        "UNIT_MEASURE", "UNIT OF MEASURE", "UNIT",
+        "OBS_STATUS", "OBSERVATION STATUS",
+        "LOWER_BOUND", "UPPER_BOUND", "REF_PERIOD",
+    }
+
     rows = []
-    for item in (shaped.get("results") or [])[:max_rows]:
-        if not isinstance(item, dict):
-            continue
-        preview_rows = item.get("rows") or []
-        first_row = preview_rows[0] if preview_rows and isinstance(preview_rows[0], dict) else {}
-        rows.append(
-            {
+    for item in (shaped.get("results") or []):
+        if not isinstance(item, dict) or len(rows) >= max_rows:
+            break
+        item_obs = [r for r in (item.get("rows") or []) if isinstance(r, dict)]
+        item_value = item.get("value")
+
+        if item_value is not None or len(item_obs) <= 1:
+            # Single scalar — emit the compact collapsed row.
+            # Also pass through coded dimension columns (INDICATOR, SEX, AGE, …) so
+            # that downstream enrichment produces the same schema as multi-series rows.
+            first_row = item_obs[0] if item_obs else {}
+            time_col = _time_column(item_obs)
+            value_col = _value_column(item_obs)
+            absorbed_single = _always_absorbed | {(time_col or "").upper(), (value_col or "").upper()}
+            extra_dims = {k: v for k, v in first_row.items() if k.upper() not in absorbed_single}
+            rows.append({
                 "refArea": item.get("refArea"),
                 "period": item.get("latestPeriod"),
-                "value": item.get("value"),
+                "value": item_value,
                 "unit": _row_unit(first_row),
                 "rowCountAtLatestPeriod": item.get("rowCountAtLatestPeriod"),
-            }
-        )
+                **extra_dims,
+            })
+        else:
+            # Multiple series for this refArea — expand tidy/long, one row per observation.
+            time_col = _time_column(item_obs)
+            value_col = _value_column(item_obs)
+            absorbed = _always_absorbed | {(time_col or "").upper(), (value_col or "").upper()}
+            for obs in item_obs:
+                if len(rows) >= max_rows:
+                    break
+                extra_dims = {k: v for k, v in obs.items() if k.upper() not in absorbed}
+                rows.append({
+                    "refArea": item.get("refArea"),
+                    "period": obs.get(time_col) if time_col else item.get("latestPeriod"),
+                    "value": obs.get(value_col) if value_col else None,
+                    "unit": _row_unit(obs),
+                    **extra_dims,
+                })
     return {
         "status": "resolved",
         "shape": "indicator_table",
@@ -5069,7 +5562,8 @@ async def get_single_observation(
     location: Optional[str] = None,
     time: Optional[str] = "latest",
     extraFilters: dict[str, Any] | None = None,
-    labels: Optional[str] = "name",
+    labels: Optional[str] = None,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """
     Compact exact-value tool.
@@ -5078,6 +5572,7 @@ async def get_single_observation(
     Prefer code-level filters when available. Otherwise provide subject/location/time text and
     the configured query-dimension policy will resolve them.
     Returns only a compact value payload; it does not return raw CSV.
+    Set verbose=true to include all coded filter dimensions and provenance attributes.
     """
     query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
         flowRef=flowRef,
@@ -5094,12 +5589,13 @@ async def get_single_observation(
         endPeriod=end_period,
         lastNObservations=last_n,
         format="csv",
-        labels=labels,
+        labels="id",
         maxObs=100,
         resultShape="latest_single_value",
         allowUnboundedTime=allow_unbounded,
     )
-    return _compact_single_observation(result)
+    compact = _compact_single_observation(result)
+    return await _enrich_single_result(flowRef, compact, query_filters, verbose=verbose)
 
 
 @mcp.tool()
@@ -5111,8 +5607,9 @@ async def get_indicator_table(
     location: Optional[str] = None,
     time: Optional[str] = "latest",
     extraFilters: dict[str, Any] | None = None,
-    labels: Optional[str] = "name",
+    labels: Optional[str] = None,
     maxRows: int = 200,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """
     Compact latest-by-location table tool.
@@ -5120,6 +5617,7 @@ async def get_indicator_table(
     Use this when the user asks for multiple countries, a region/group table, a comparison,
     or a ranking for one indicator and one period/latest value.
     Returns compact rows rather than raw CSV.
+    Set verbose=true to include constant coded dimensions and provenance attributes in every row.
     """
     location_input: str | list[str] | None = locations if locations else location
     query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
@@ -5137,12 +5635,15 @@ async def get_indicator_table(
         endPeriod=end_period,
         lastNObservations=last_n,
         format="csv",
-        labels=labels,
+        labels="id",
         maxObs=maxRows,
         resultShape="latest_by_ref_area",
         allowUnboundedTime=allow_unbounded,
     )
-    return _compact_indicator_table(result, max_rows=max(1, maxRows))
+    compact = _compact_indicator_table(result, max_rows=max(1, maxRows))
+    if compact.get("status") == "resolved" and compact.get("rows"):
+        compact["rows"] = await _enrich_indicator_table_rows(flowRef, compact["rows"], verbose=verbose)
+    return compact
 
 
 @mcp.tool()
@@ -5153,8 +5654,9 @@ async def get_time_series(
     location: Optional[str] = None,
     time: Optional[str] = "all",
     extraFilters: dict[str, Any] | None = None,
-    labels: Optional[str] = "name",
+    labels: Optional[str] = None,
     maxObservations: int = 500,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     """
     Compact time-series tool.
@@ -5162,6 +5664,7 @@ async def get_time_series(
     Use this when the user asks for trends, change over time, a chart, or a series.
     Set time to a single period, a range like '2000:2024', or 'all'.
     Returns compact period/value rows rather than raw CSV.
+    Set verbose=true to include coded filter dimensions and provenance attributes.
     """
     query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
         flowRef=flowRef,
@@ -5178,12 +5681,29 @@ async def get_time_series(
         endPeriod=end_period,
         lastNObservations=last_n,
         format="csv",
-        labels=labels,
+        labels="id",
         maxObs=maxObservations,
         resultShape="compact_series",
         allowUnboundedTime=True if allow_unbounded else bool(start_period and end_period),
     )
-    return _compact_time_series(result, max_observations=max(1, maxObservations))
+    compact = _compact_time_series(result, max_observations=max(1, maxObservations))
+    return await _enrich_single_result(flowRef, compact, query_filters, verbose=verbose)
+
+
+@mcp.tool()
+async def ping() -> dict[str, Any]:
+    """
+    Returns server and build information.
+
+    Use this to verify which version of the server is running after a deploy,
+    or to confirm the server is reachable before making data queries.
+    """
+    return {
+        "status": "ok",
+        "server": MCP_NAME,
+        "build": BUILD_ID,
+        "sdmxBase": BASE or None,
+    }
 
 
 @mcp.tool()
