@@ -7,7 +7,7 @@ requires-python = ">=3.11.11"
 dependencies = [
     "cachetools>=7.1.4",
     "httpx>=0.28.1",
-    "fastmcp>=3.4.0",
+    "fastmcp>=3.4.2",
     "mcp[cli]>=1.27.2",
     "python-dotenv>=1.2.2",
 ]
