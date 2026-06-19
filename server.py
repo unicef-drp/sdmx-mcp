@@ -3686,6 +3686,13 @@ async def _enrich_single_result(
             continue
         if comp_id not in coded_ids:
             continue
+        # Resolver-produced filters may carry list values (single- or multi-code).
+        # Single-element lists are unwrapped; multi-element lists are skipped to avoid
+        # mis-labeling an OR-set as a single code.
+        if isinstance(filter_val, (list, tuple)):
+            if len(filter_val) != 1:
+                continue
+            filter_val = filter_val[0]
         val_str = str(filter_val or "").strip()
         if not val_str or "+" in val_str:
             continue
