@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.11.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -8,11 +8,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN groupadd --system --gid 10001 app \
+    && useradd  --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app
+
 COPY pyproject.toml uv.lock* ./
 RUN pip install --upgrade pip uv
 
 COPY . .
-RUN uv sync --frozen --no-dev --no-cache
+RUN uv sync --frozen --no-dev --no-cache --python /usr/local/bin/python3.11 \
+    && chown -R app:app /app
+
+USER app
 
 EXPOSE 8000
 
