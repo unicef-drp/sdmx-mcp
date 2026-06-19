@@ -282,6 +282,31 @@ class TestRegionalNameResolution(unittest.TestCase):
         self.assertEqual(result.get("indicatorName"), "DTP3 immunisation coverage")
 
 
+class TestSingleObservationListFilters(unittest.TestCase):
+    """The resolver path produces list-valued filters
+    (``{"INDICATOR": ["IM_DTP3"], "REF_AREA": ["UNICEF_WCA"]}``). Without
+    unwrapping, ``str(filter_val)`` becomes ``"['IM_DTP3']"`` and downstream
+    *Name fields are stringified Python lists instead of resolved labels.
+    """
+
+    def _call(self, filters):
+        with patch.object(server, "_get_json", AsyncMock(return_value=_dataflow_payload())), \
+             patch.object(server, "_get_text_with_status", AsyncMock(return_value=(200, IMMUNISATION_CSV))), \
+             patch.object(server, "_get_flow_structure", AsyncMock(return_value=IMMUNISATION_STRUCTURE)):
+            return _run(server.get_single_observation(
+                flowRef="UNICEF/IMMUNISATION/1.0",
+                filters=filters,
+                time="latest",
+            ))
+
+    def test_single_element_list_filters_are_unwrapped(self):
+        result = self._call({"REF_AREA": ["UNICEF_WCA"], "INDICATOR": ["IM_DTP3"]})
+        self.assertEqual(result.get("refArea"), "UNICEF_WCA")
+        self.assertEqual(result.get("refAreaName"), "West and Central Africa")
+        self.assertEqual(result.get("indicator"), "IM_DTP3")
+        self.assertEqual(result.get("indicatorName"), "DTP3 immunisation coverage")
+
+
 # ---------------------------------------------------------------------------
 # Test 4 — _resolve_codes_from_payload unit tests
 # ---------------------------------------------------------------------------
