@@ -13,6 +13,7 @@ from typing import Any, Optional, TypedDict
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
 
+import defusedxml.ElementTree as _safe_ET
 import httpx
 from cachetools import TTLCache
 from dotenv import load_dotenv
@@ -69,6 +70,23 @@ SCOPE_ACTIVE = any(
     ]
 )
 ENFORCE_SCOPE = os.getenv("SDMX_ENFORCE_SCOPE", "").strip().lower() in {"1", "true", "yes", "on"} if os.getenv("SDMX_ENFORCE_SCOPE") else SCOPE_ACTIVE
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Server-side hard ceiling for observations returned from any data query.
+# Caller-supplied maxObs is clamped down to this value to prevent unbounded
+# payloads (memory, egress, latency).
+MAX_OBS_HARD_CAP = _positive_int_env("SDMX_MAX_OBS_CAP", 100_000)
 
 _http_client: httpx.AsyncClient | None = None
 
@@ -788,6 +806,24 @@ def _is_draft_flow(df_id: str, name: str = "", description: str = "") -> bool:
     return "DRAFT" in text
 
 
+def _assert_flow_in_scope(flowRef: str) -> None:
+    """Raise ``ValueError`` when ``SDMX_ENFORCE_SCOPE`` is on and ``flowRef`` is out of scope.
+
+    Use this at every entry point that touches a specific flow (data queries
+    and metadata fetches) so callers cannot bypass scope by skipping discovery.
+    """
+    if not ENFORCE_SCOPE:
+        return
+    requested_agency, requested_flow_id, _ = _flow_identifiers(flowRef)
+    if _flow_in_scope(requested_flow_id, agency=requested_agency):
+        return
+    raise ValueError(
+        f"Flow '{flowRef}' is outside the configured SDMX scope. "
+        "Set SDMX_ENFORCE_SCOPE=false or adjust SDMX_AGENCY_ALLOWLIST / "
+        "SDMX_DATAFLOW_ID_ALLOW_PREFIXES / SDMX_DATAFLOW_ID_ALLOW_REGEX to permit this flow."
+    )
+
+
 def _flow_in_scope(df_id: str, agency: str = "", name: str = "", description: str = "") -> bool:
     flow_id = (df_id or "").strip()
     agency_id = (agency or "").strip()
@@ -1186,7 +1222,7 @@ def _parse_sdmx_error(text: str) -> str | None:
     if "<mes:Error" not in text and "<ErrorMessage" not in text:
         return None
     try:
-        root = ET.fromstring(text)
+        root = _safe_ET.fromstring(text)
     except ET.ParseError:
         return None
     for elem in root.iter():
@@ -1229,7 +1265,7 @@ def _hierarchical_edges_from_xml(text: str) -> dict[str, set[str]]:
     if not text.strip():
         return {}
     try:
-        root = ET.fromstring(text)
+        root = _safe_ET.fromstring(text)
     except ET.ParseError:
         return {}
 
@@ -1244,7 +1280,7 @@ def _hierarchical_catalog_from_xml(text: str) -> list[dict[str, Any]]:
     if not text.strip():
         return []
     try:
-        root = ET.fromstring(text)
+        root = _safe_ET.fromstring(text)
     except ET.ParseError:
         return []
 
@@ -2662,6 +2698,7 @@ async def _query_plan(
     resultShape: str | None,
     allowUnboundedTime: bool = False,
 ) -> dict[str, Any]:
+    _assert_flow_in_scope(flowRef)
     dimension_order: list[str] | None = None
     normalized_filters: dict[str, Any] | None = None
     applied_defaults: dict[str, Any] = {}
@@ -2872,7 +2909,7 @@ def _parse_hierarchical_codelist_detail(text: str) -> list[dict[str, Any]]:
     if not text.strip():
         return []
     try:
-        root = ET.fromstring(text)
+        root = _safe_ET.fromstring(text)
     except ET.ParseError:
         return []
 
@@ -3249,6 +3286,7 @@ async def _cached_dataflows() -> dict[str, Any]:
 
 
 async def _get_flow_structure(flowRef: str) -> dict[str, Any]:
+    _assert_flow_in_scope(flowRef)
     if flowRef not in _structure_cache:
         logger.info("Fetching structure for flow %s", flowRef)
         _structure_cache[flowRef] = await _get_json(_structure_url(flowRef))
@@ -3271,6 +3309,29 @@ async def _list_dimensions_for_flow(flow_ref: str) -> list[dict[str, Any]]:
     return _dimension_metadata(payload)
 
 
+def _truncate_csv_to_max_rows(text: str, max_rows: int) -> tuple[str, int, bool]:
+    """Cap a CSV body to ``max_rows`` data rows (header preserved).
+
+    Returns (possibly_truncated_text, original_data_row_count, was_truncated).
+    """
+    if max_rows <= 0 or not text:
+        return text, 0, False
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text, 0, False
+    header = lines[0]
+    data_lines = lines[1:]
+    # Trailing blank line preservation.
+    trailing_blank: list[str] = []
+    while data_lines and not data_lines[-1].strip():
+        trailing_blank.insert(0, data_lines.pop())
+    total = len(data_lines)
+    if total <= max_rows:
+        return text, total, False
+    kept = data_lines[:max_rows]
+    return "".join([header, *kept, *trailing_blank]), total, True
+
+
 async def _execute_query_data(
     *,
     flowRef: str,
@@ -3288,6 +3349,10 @@ async def _execute_query_data(
     logger.info("Executing query for flow %s key=%s", flowRef, key)
     requested_format = (format or "csv").strip() or "csv"
     fetch_format = "csv"
+    # Clamp caller-supplied maxObs to the server-side hard cap.
+    requested_max_obs = int(maxObs) if maxObs and int(maxObs) > 0 else 0
+    effective_max_obs = min(requested_max_obs, MAX_OBS_HARD_CAP) if requested_max_obs > 0 else MAX_OBS_HARD_CAP
+    cap_applied = requested_max_obs > MAX_OBS_HARD_CAP
     plan = await _query_plan(
         flowRef=flowRef,
         key=key,
@@ -3324,10 +3389,11 @@ async def _execute_query_data(
             lastNObservations=effective_last_n,
             filters=normalized_filters,
             appliedDefaults=applied_defaults,
-            maxObs=maxObs,
+            maxObs=effective_max_obs,
             status_code=status,
             raw_text=text,
         )
+    truncated_text, total_rows, was_truncated = _truncate_csv_to_max_rows(text, effective_max_obs)
     payload = _resolved_response(
         flow_details=flow_details,
         key=planned_key,
@@ -3340,14 +3406,22 @@ async def _execute_query_data(
         lastNObservations=effective_last_n,
         filters=normalized_filters,
         appliedDefaults=applied_defaults,
-        maxObs=maxObs,
-        raw_csv=text,
+        maxObs=effective_max_obs,
+        raw_csv=truncated_text,
     )
     if requested_format.lower() != "csv":
         payload["notes"]["requestedFormat"] = requested_format
         payload["notes"]["formatOverride"] = "SDMX data queries are forced to CSV for efficiency and simpler downstream parsing."
+    payload["notes"]["maxObsHardCap"] = MAX_OBS_HARD_CAP
+    if cap_applied:
+        payload["notes"]["requestedMaxObs"] = requested_max_obs
+        payload["notes"]["maxObsClamped"] = True
+    if was_truncated:
+        payload["notes"]["truncated"] = True
+        payload["notes"]["totalRows"] = total_rows
+        payload["notes"]["returnedRows"] = effective_max_obs
     if resultShape:
-        rows = _csv_rows(text)
+        rows = _csv_rows(truncated_text)
         if (resultShape or "").strip().lower() == "latest_by_ref_area":
             rows = _inject_constant_dim_from_filters(rows, DIM_REF_AREA, normalized_filters)
         payload["shaped"] = _shape_rows(rows, resultShape)

@@ -13,8 +13,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
-from xml.etree import ElementTree as ET
-
+import defusedxml.ElementTree as _safe_ET
 import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -399,7 +398,7 @@ async def _get_flow_structure_for_eval(flow_ref: str, user_agent: str) -> dict[s
 
 async def _fetch_codelist(client: httpx.AsyncClient, url: str, user_agent: str) -> dict[str, DimensionValue]:
     text = await _fetch_text(client, url, user_agent)
-    root = ET.fromstring(text)
+    root = _safe_ET.fromstring(text)
     codes: dict[str, DimensionValue] = {}
     for elem in root.iter():
         if _tag_name(elem) != "Code":
