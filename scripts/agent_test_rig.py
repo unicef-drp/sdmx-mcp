@@ -9,8 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
-from xml.etree import ElementTree as ET
-
+import defusedxml.ElementTree as _safe_ET
 import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,7 +63,7 @@ async def _fetch_text(client: httpx.AsyncClient, url: str) -> str:
 
 async def _fetch_codelist(client: httpx.AsyncClient, url: str) -> dict[str, str]:
     text = await _fetch_text(client, url)
-    root = ET.fromstring(text)
+    root = _safe_ET.fromstring(text)
     codes: dict[str, str] = {}
     for elem in root.iter():
         if _tag_name(elem) != "Code":
