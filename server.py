@@ -36,10 +36,21 @@ MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
 HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "sdmx-mcp/0.1").strip() or "sdmx-mcp/0.1"
 STRUCTURE_REFERENCES = os.getenv("SDMX_STRUCTURE_REFERENCES", "descendants").strip() or "descendants"
 # SDMX_BUILD_ID is set by the deploy pipeline (Dockerfile ARG GIT_SHA, populated
-# from github.sha in .github/workflows/fly-deploy.yml). Falls back to the static
-# version string when running outside the deploy image (local dev, tests, etc.).
-_SERVER_VERSION = "1.2.0"
-BUILD_ID = os.getenv("SDMX_BUILD_ID", "").strip() or _SERVER_VERSION
+# from github.sha in .github/workflows/fly-deploy.yml). Falls back to "local"
+# when running outside the deploy image (dev, tests, etc.).
+SERVER_VERSION = "1.2.0"
+
+
+def _short_commit(raw: str) -> str:
+    raw = raw.strip()
+    if not raw:
+        return "local"
+    if len(raw) == 40 and all(c in "0123456789abcdef" for c in raw.lower()):
+        return raw[:7]
+    return raw
+
+
+BUILD_COMMIT = _short_commit(os.getenv("SDMX_BUILD_ID", ""))
 
 
 def _env_csv(name: str) -> list[str]:
@@ -5783,7 +5794,8 @@ async def ping() -> dict[str, Any]:
     return {
         "status": "ok",
         "server": MCP_NAME,
-        "build": BUILD_ID,
+        "version": SERVER_VERSION,
+        "commit": BUILD_COMMIT,
         "sdmxBase": BASE or None,
     }
 
