@@ -351,14 +351,32 @@ class TestPingTool(unittest.TestCase):
         result = _run(server.ping())
         self.assertEqual(result["status"], "ok")
 
-    def test_ping_includes_build(self):
+    def test_ping_includes_version(self):
         result = _run(server.ping())
-        self.assertIn("build", result)
-        self.assertIsNotNone(result["build"])
+        self.assertEqual(result["version"], server.SERVER_VERSION)
+
+    def test_ping_includes_commit(self):
+        result = _run(server.ping())
+        self.assertIn("commit", result)
+        self.assertIsNotNone(result["commit"])
 
     def test_ping_includes_server_name(self):
         result = _run(server.ping())
         self.assertIn("server", result)
+
+
+class TestShortCommit(unittest.TestCase):
+    def test_full_sha_is_shortened_to_seven(self):
+        full = "c6794b646a8eb06363552d1dfc49b0503e9a116f"
+        self.assertEqual(server._short_commit(full), "c6794b6")
+
+    def test_empty_falls_back_to_local(self):
+        self.assertEqual(server._short_commit(""), "local")
+        self.assertEqual(server._short_commit("   "), "local")
+
+    def test_non_sha_string_passes_through(self):
+        self.assertEqual(server._short_commit("v1.2.3"), "v1.2.3")
+        self.assertEqual(server._short_commit("abcd1234"), "abcd1234")
 
 
 # ---------------------------------------------------------------------------
