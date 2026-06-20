@@ -35,8 +35,9 @@ BASE = os.getenv("SDMX_BASE_URL", "").strip().rstrip("/")
 MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
 HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "sdmx-mcp/0.1").strip() or "sdmx-mcp/0.1"
 STRUCTURE_REFERENCES = os.getenv("SDMX_STRUCTURE_REFERENCES", "descendants").strip() or "descendants"
-# Set SDMX_BUILD_ID in the deploy pipeline (e.g. to the git SHA) to make the
-# running version verifiable without a code deploy.
+# SDMX_BUILD_ID is set by the deploy pipeline (Dockerfile ARG GIT_SHA, populated
+# from github.sha in .github/workflows/fly-deploy.yml). Falls back to the static
+# version string when running outside the deploy image (local dev, tests, etc.).
 _SERVER_VERSION = "1.2.0"
 BUILD_ID = os.getenv("SDMX_BUILD_ID", "").strip() or _SERVER_VERSION
 
