@@ -379,6 +379,21 @@ class TestShortCommit(unittest.TestCase):
         self.assertEqual(server._short_commit("abcd1234"), "abcd1234")
 
 
+class TestServerVersion(unittest.TestCase):
+    """Pin SERVER_VERSION to pyproject.toml so the two never drift again."""
+
+    def test_server_version_matches_pyproject(self):
+        import tomllib
+        pyproject = server.REPO_ROOT / "pyproject.toml"
+        with pyproject.open("rb") as f:
+            expected = tomllib.load(f)["project"]["version"]
+        self.assertEqual(server.SERVER_VERSION, expected)
+
+    def test_server_version_is_non_empty(self):
+        self.assertTrue(server.SERVER_VERSION)
+        self.assertNotEqual(server.SERVER_VERSION, "unknown")
+
+
 # ---------------------------------------------------------------------------
 # Fixture helpers for new tests
 # ---------------------------------------------------------------------------
