@@ -729,5 +729,144 @@ class QueryDimensionPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(server._default_last_n_observations_enabled())
 
 
+class TestSpellingEquivalents(unittest.TestCase):
+    """BrE/AmE pairs collapse to the same match in _match_score."""
+
+    def test_immunization_matches_immunisation_corpus(self) -> None:
+        # AmE input, BrE corpus
+        self.assertGreater(server._match_score("Immunisation coverage", "immunization"), 0)
+        # And the reverse, just in case
+        self.assertGreater(server._match_score("Immunization coverage", "immunisation"), 0)
+
+    def test_practicing_open_defecation_matches_practising_phrase(self) -> None:
+        text = "Proportion of population practising open defecation"
+        self.assertGreater(server._match_score(text, "practicing open defecation"), 0)
+
+    def test_defense_matches_defence(self) -> None:
+        self.assertGreater(server._match_score("Ministry of Defence indicator", "defense"), 0)
+
+    def test_unrelated_terms_still_score_zero(self) -> None:
+        # Guardrail against false positives.
+        self.assertEqual(server._match_score("Maternal mortality ratio", "immunisation"), 0)
+
+
+class TestAmbiguousDimensionFallback(unittest.IsolatedAsyncioTestCase):
+    """When no exact match, the resolver raises AmbiguousDimensionError carrying
+    scored candidates instead of a hard ValueError."""
+
+    def _subject_policy(self) -> "server.QueryDimensionPolicyEntry":
+        return server.QueryDimensionPolicyEntry(
+            name="subject",
+            role="subject",
+            required_for_retrieval=True,
+            priority=2,
+            preferred_sources=[
+                server.QueryDimensionSource(type="codelist", id="UNICEF/CL_SUBJECT/1.0")
+            ],
+        )
+
+    async def test_fuzzy_input_raises_ambiguous_with_candidates(self) -> None:
+        payload = _payload_with_subject_geo_and_time()
+        policy = self._subject_policy()
+
+        with self.assertRaises(server.AmbiguousDimensionError) as ctx:
+            await server._resolve_coded_dimension_value(
+                "UNICEF,TEST_FLOW,1.0", payload, "mortality", policy
+            )
+
+        exc = ctx.exception
+        self.assertEqual(exc.role, "subject")
+        self.assertEqual(exc.dimension_id, "SUBJECT")
+        self.assertEqual(exc.token, "mortality")
+        # Both U5MR and NMR mention "mortality"; should be ranked, deduped by id.
+        ids = [c["id"] for c in exc.candidates]
+        self.assertIn("U5MR", ids)
+        self.assertIn("NMR", ids)
+        for cand in exc.candidates:
+            self.assertIn("score", cand)
+            self.assertGreater(cand["score"], 0)
+
+    async def test_zero_candidate_input_still_raises_hard_valueerror(self) -> None:
+        payload = _payload_with_subject_geo_and_time()
+        policy = self._subject_policy()
+
+        # Nothing in the CL_SUBJECT codelist contains "yoga" — no candidates,
+        # the resolver falls through to ValueError as before.
+        with self.assertRaises(ValueError) as ctx:
+            await server._resolve_coded_dimension_value(
+                "UNICEF,TEST_FLOW,1.0", payload, "yoga", policy
+            )
+        self.assertIn("Unable to resolve", str(ctx.exception))
+        # Critically: must not be the ambiguous subclass.
+        self.assertNotIsInstance(ctx.exception, server.AmbiguousDimensionError)
+
+
+class TestFuzzyCandidatesHelper(unittest.TestCase):
+    """_fuzzy_candidates_for_token gathers ranked, deduped candidates across
+    a policy's flat sources."""
+
+    def test_gathers_and_ranks_candidates(self) -> None:
+        payload = _payload_with_subject_geo_and_time()
+        policy = server.QueryDimensionPolicyEntry(
+            name="subject",
+            role="subject",
+            required_for_retrieval=True,
+            priority=2,
+            preferred_sources=[
+                server.QueryDimensionSource(type="codelist", id="UNICEF/CL_SUBJECT/1.0")
+            ],
+        )
+        dim_id, candidates = server._fuzzy_candidates_for_token(payload, policy, "mortality")
+        self.assertEqual(dim_id, "SUBJECT")
+        self.assertGreaterEqual(len(candidates), 1)
+        scores = [c["score"] for c in candidates]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_returns_empty_when_nothing_scores(self) -> None:
+        payload = _payload_with_subject_geo_and_time()
+        policy = server.QueryDimensionPolicyEntry(
+            name="subject",
+            role="subject",
+            required_for_retrieval=True,
+            priority=2,
+            preferred_sources=[
+                server.QueryDimensionSource(type="codelist", id="UNICEF/CL_SUBJECT/1.0")
+            ],
+        )
+        dim_id, candidates = server._fuzzy_candidates_for_token(payload, policy, "yoga")
+        # dim_id may still resolve since the source exists; candidates must be empty.
+        self.assertEqual(candidates, [])
+
+
+class TestCompactToolAmbiguousResponse(unittest.IsolatedAsyncioTestCase):
+    """The compact tool wrappers must convert AmbiguousDimensionError into a
+    structured soft-fail response instead of letting it propagate as a tool error."""
+
+    async def test_get_single_observation_returns_structured_candidates(self) -> None:
+        from unittest.mock import AsyncMock, patch as _patch
+        exc = server.AmbiguousDimensionError(
+            policy_name="subject",
+            role="subject",
+            dimension_id="INDICATOR",
+            token="mortality",
+            candidates=[
+                {"id": "U5MR", "name": "Under-five mortality rate", "score": 3},
+                {"id": "NMR", "name": "Neonatal mortality rate", "score": 2},
+            ],
+        )
+        with _patch("server._compact_query_args", new=AsyncMock(side_effect=exc)):
+            result = await server.get_single_observation(
+                flowRef="UNICEF/CME/1.0", subject="mortality"
+            )
+        self.assertEqual(result["status"], "ambiguous_subject")
+        self.assertEqual(result["shape"], "single_observation")
+        self.assertEqual(result["dimension"], "INDICATOR")
+        self.assertEqual(result["input"], "mortality")
+        self.assertEqual([c["id"] for c in result["candidates"]], ["U5MR", "NMR"])
+        # Guidance must reference the disambiguation pattern so the model knows the next step.
+        self.assertIn("filters=", result["assistant_guidance"])
+        self.assertIn("INDICATOR", result["assistant_guidance"])
+
+
 if __name__ == "__main__":
     unittest.main()
