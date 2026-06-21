@@ -13,14 +13,25 @@ jobs:
     concurrency: fly-deploy-${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Compute app version
+        id: ver
+        # Patch component = total commits on this branch. Major/minor come from
+        # pyproject.toml so we can still bump them deliberately when a release
+        # actually warrants it.
+        run: |
+          BASE=$(grep -E '^version[[:space:]]*=' pyproject.toml | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+).*/\1/')
+          COUNT=$(git rev-list --count HEAD)
+          echo "version=${BASE}.${COUNT}" >> "$GITHUB_OUTPUT"
       - name: Deploy main app
         if: github.ref_name == 'unicef'
-        run: flyctl deploy --remote-only --config fly.toml --build-arg GIT_SHA=${{ github.sha }}
+        run: flyctl deploy --remote-only --config fly.toml --build-arg GIT_SHA=${{ github.sha }} --build-arg APP_VERSION=${{ steps.ver.outputs.version }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - name: Deploy eval app
         if: github.ref_name == 'unicef' || github.ref_name == 'feat/unicef-agent-test-rig'
-        run: flyctl deploy --remote-only --config fly.eval.toml --build-arg GIT_SHA=${{ github.sha }}
+        run: flyctl deploy --remote-only --config fly.eval.toml --build-arg GIT_SHA=${{ github.sha }} --build-arg APP_VERSION=${{ steps.ver.outputs.version }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_EVAL_API_TOKEN }}

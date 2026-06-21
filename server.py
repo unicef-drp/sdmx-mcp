@@ -36,10 +36,11 @@ MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
 HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "sdmx-mcp/0.1").strip() or "sdmx-mcp/0.1"
 STRUCTURE_REFERENCES = os.getenv("SDMX_STRUCTURE_REFERENCES", "descendants").strip() or "descendants"
 def _read_pyproject_version() -> str:
-    """Read project.version from pyproject.toml so we have one source of truth.
+    """Read project.version from pyproject.toml — fallback for local dev.
 
-    pyproject.toml ships in the Docker image (COPY . .). Returns "unknown"
-    only if the file is missing or malformed.
+    The deploy pipeline overrides this via SDMX_APP_VERSION (see below); we keep
+    pyproject.toml as the in-source canonical so local runs and tests don't show
+    "unknown".
     """
     import tomllib
 
@@ -50,10 +51,20 @@ def _read_pyproject_version() -> str:
         return "unknown"
 
 
-# SDMX_BUILD_ID is set by the deploy pipeline (Dockerfile ARG GIT_SHA, populated
-# from github.sha in .github/workflows/fly-deploy.yml). Falls back to "local"
-# when running outside the deploy image (dev, tests, etc.).
-SERVER_VERSION = _read_pyproject_version()
+def _resolve_server_version() -> str:
+    """Env-injected version wins; pyproject.toml is the local-dev fallback.
+
+    SDMX_APP_VERSION is set by the deploy pipeline (Dockerfile ARG APP_VERSION,
+    computed in .github/workflows/fly-deploy.yml as
+    "<pyproject major.minor>.<git rev-list count>") so every push moves the
+    patch component without manual edits. SDMX_BUILD_ID likewise comes from
+    the pipeline (github.sha) and falls back to "local".
+    """
+    override = (os.getenv("SDMX_APP_VERSION") or "").strip()
+    return override or _read_pyproject_version()
+
+
+SERVER_VERSION = _resolve_server_version()
 
 
 def _short_commit(raw: str) -> str:

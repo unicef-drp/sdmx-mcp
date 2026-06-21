@@ -380,16 +380,36 @@ class TestShortCommit(unittest.TestCase):
 
 
 class TestServerVersion(unittest.TestCase):
-    """Pin SERVER_VERSION to pyproject.toml so the two never drift again."""
+    """Pin SERVER_VERSION's resolution rules.
 
-    def test_server_version_matches_pyproject(self):
+    Two paths:
+    - Local dev / tests: no SDMX_APP_VERSION set -> fall back to pyproject.toml.
+    - Deploy: pipeline injects SDMX_APP_VERSION (build-arg from CI) -> env wins.
+    """
+
+    def test_server_version_falls_back_to_pyproject_when_env_unset(self):
+        import os
+        from unittest.mock import patch as _patch
         import tomllib
         pyproject = server.REPO_ROOT / "pyproject.toml"
         with pyproject.open("rb") as f:
             expected = tomllib.load(f)["project"]["version"]
-        self.assertEqual(server.SERVER_VERSION, expected)
+        with _patch.dict(os.environ, {"SDMX_APP_VERSION": ""}, clear=False):
+            self.assertEqual(server._resolve_server_version(), expected)
 
-    def test_server_version_is_non_empty(self):
+    def test_env_overrides_pyproject(self):
+        import os
+        from unittest.mock import patch as _patch
+        with _patch.dict(os.environ, {"SDMX_APP_VERSION": "1.2.163"}, clear=False):
+            self.assertEqual(server._resolve_server_version(), "1.2.163")
+
+    def test_env_whitespace_treated_as_unset(self):
+        import os
+        from unittest.mock import patch as _patch
+        with _patch.dict(os.environ, {"SDMX_APP_VERSION": "   "}, clear=False):
+            self.assertNotEqual(server._resolve_server_version(), "   ")
+
+    def test_server_version_constant_is_non_empty(self):
         self.assertTrue(server.SERVER_VERSION)
         self.assertNotEqual(server.SERVER_VERSION, "unknown")
 
