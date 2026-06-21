@@ -749,10 +749,87 @@ def _coerce_text(value: Any) -> str:
     return ""
 
 
+# Bidirectional BrE/AmE equivalents applied at tokenization so every scorer
+# (subject matcher, search_dataflows, find_indicator_candidates, …) treats the
+# two spellings as the same term. UNICEF data uses BrE; most users won't know.
+_SPELLING_EQUIVALENTS: dict[str, str] = {
+    "analyse": "analyze", "analyze": "analyse",
+    "analysed": "analyzed", "analyzed": "analysed",
+    "behaviour": "behavior", "behavior": "behaviour",
+    "centre": "center", "center": "centre",
+    "colour": "color", "color": "colour",
+    "defence": "defense", "defense": "defence",
+    "favour": "favor", "favor": "favour",
+    "fertilisation": "fertilization", "fertilization": "fertilisation",
+    "harbour": "harbor", "harbor": "harbour",
+    "honour": "honor", "honor": "honour",
+    "immunisation": "immunization", "immunization": "immunisation",
+    "immunised": "immunized", "immunized": "immunised",
+    "labour": "labor", "labor": "labour",
+    "licence": "license", "license": "licence",
+    "modelled": "modeled", "modeled": "modelled",
+    "modelling": "modeling", "modeling": "modelling",
+    "neighbour": "neighbor", "neighbor": "neighbour",
+    "offence": "offense", "offense": "offence",
+    "organisation": "organization", "organization": "organisation",
+    "organisations": "organizations", "organizations": "organisations",
+    "organise": "organize", "organize": "organise",
+    "organised": "organized", "organized": "organised",
+    "practise": "practice", "practice": "practise",
+    "practising": "practicing", "practicing": "practising",
+    "recognise": "recognize", "recognize": "recognise",
+    "specialised": "specialized", "specialized": "specialised",
+    "utilisation": "utilization", "utilization": "utilisation",
+    "vapour": "vapor", "vapor": "vapour",
+}
+
+
+class AmbiguousDimensionError(Exception):
+    """Raised when a fuzzy subject/geography input has candidates but no exact match.
+
+    Carries the top scored candidates so the compact tools can return a
+    structured response the model (or user) can disambiguate from.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy_name: str,
+        role: str,
+        dimension_id: str,
+        token: str,
+        candidates: list[dict[str, Any]],
+    ) -> None:
+        self.policy_name = policy_name
+        self.role = role
+        self.dimension_id = dimension_id
+        self.token = token
+        self.candidates = candidates
+        super().__init__(
+            f"Ambiguous {policy_name} value '{token}'; {len(candidates)} candidates"
+        )
+
+
+def _expand_token_spellings(tokens: list[str]) -> list[str]:
+    """Append the AmE/BrE counterpart for any token in _SPELLING_EQUIVALENTS.
+
+    Returns a list (preserves order, may contain duplicates of unchanged tokens
+    when no equivalent exists). Callers expecting a set can wrap with set().
+    """
+    out: list[str] = []
+    for token in tokens:
+        out.append(token)
+        alt = _SPELLING_EQUIVALENTS.get(token)
+        if alt and alt != token:
+            out.append(alt)
+    return out
+
+
 def _query_tokens(query: str) -> list[str]:
     tokens = re.findall(r"[a-z0-9]+", (query or "").lower())
     stopwords = _discovery_policy_config().query_stopwords
-    return [token for token in tokens if len(token) >= 3 and token not in stopwords]
+    filtered = [token for token in tokens if len(token) >= 3 and token not in stopwords]
+    return _expand_token_spellings(filtered)
 
 
 def _match_score(text: str, query: str) -> int:
@@ -762,11 +839,20 @@ def _match_score(text: str, query: str) -> int:
     tokens = _query_tokens(q)
     if not tokens:
         return 0
-    text_tokens = set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+    raw_text_tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    text_tokens = set(_expand_token_spellings(raw_text_tokens))
     score = sum(1 for token in tokens if token in text_tokens)
     normalized_query = " ".join(tokens)
-    normalized_text = " ".join(re.findall(r"[a-z0-9]+", (text or "").lower()))
-    if normalized_query and normalized_query in normalized_text:
+    normalized_text = " ".join(raw_text_tokens)
+    # Try the query as-typed, plus each pairwise spelling substitution, so a
+    # phrase like "practicing open defecation" still matches a corpus phrase
+    # "practising open defecation".
+    query_variants = {normalized_query}
+    for token in set(tokens):
+        alt = _SPELLING_EQUIVALENTS.get(token)
+        if alt and alt != token:
+            query_variants.add(normalized_query.replace(token, alt))
+    if any(variant and variant in normalized_text for variant in query_variants):
         score += len(tokens)
     return score
 
@@ -3156,6 +3242,52 @@ def _dimension_for_hierarchical_source(
     return candidates[0] if candidates else None
 
 
+_FUZZY_CANDIDATE_LIMIT = 5
+_FUZZY_MIN_SCORE = 1
+
+
+def _fuzzy_candidates_for_token(
+    payload: dict[str, Any],
+    policy: QueryDimensionPolicyEntry,
+    token: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Gather scored candidate codes for a token across the policy's flat sources.
+
+    Returns ``(dimension_id, candidates)`` — ``candidates`` are deduped by code
+    id, sorted by score desc, capped to ``_FUZZY_CANDIDATE_LIMIT``. Empty when
+    nothing scores above ``_FUZZY_MIN_SCORE``. ``dimension_id`` is the first
+    flat source's dimension (or ``""`` when no source resolves).
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    dimension_id = ""
+    for source in policy.preferred_sources:
+        if source.type == "hierarchical_codelist":
+            continue
+        dim = _find_dimension_from_source(payload, source)
+        if not dim:
+            continue
+        dim_id = str(dim.get("id") or "")
+        codelist = _dimension_codelist(payload, dim_id)
+        if not codelist:
+            continue
+        if not dimension_id:
+            dimension_id = dim_id
+        for cand in _scored_code_matches(_codelist_codes(codelist), token):
+            code_id = str(cand.get("id") or "")
+            score = int(cand.get("_score") or 0)
+            if score < _FUZZY_MIN_SCORE:
+                continue
+            existing = by_id.get(code_id)
+            if existing is None or score > int(existing["score"]):
+                by_id[code_id] = {
+                    "id": code_id,
+                    "name": str(cand.get("name") or ""),
+                    "score": score,
+                }
+    ranked = sorted(by_id.values(), key=lambda c: int(c["score"]), reverse=True)
+    return dimension_id, ranked[:_FUZZY_CANDIDATE_LIMIT]
+
+
 async def _resolve_coded_dimension_value(
     flow_ref: str,
     payload: dict[str, Any],
@@ -3240,6 +3372,15 @@ async def _resolve_coded_dimension_value(
             break
 
         if not matched:
+            fuzzy_dim_id, candidates = _fuzzy_candidates_for_token(payload, policy, token)
+            if candidates:
+                raise AmbiguousDimensionError(
+                    policy_name=policy.name,
+                    role=policy.role,
+                    dimension_id=fuzzy_dim_id,
+                    token=token,
+                    candidates=candidates,
+                )
             raise ValueError(f"Unable to resolve {policy.name} value '{token}' using the configured policy.")
 
     dimension_id = str(resolved[0].get("dimension_id") or "")
@@ -3769,6 +3910,27 @@ def _compact_unresolved(result: dict[str, Any], *, shape: str) -> dict[str, Any]
         "value": None,
         "message": error.get("message") or result.get("assistant_guidance") or "The official SDMX query did not resolve.",
         "source": _compact_source(result),
+    }
+
+
+def _compact_ambiguous(exc: "AmbiguousDimensionError", *, shape: str) -> dict[str, Any]:
+    """Soft-fail payload for a fuzzy resolver miss with candidate suggestions.
+
+    Returned instead of raising so the model (or user) can disambiguate by
+    re-calling with an explicit ``filters={dimension: <code id>}``.
+    """
+    return {
+        "status": f"ambiguous_{exc.role}",
+        "shape": shape,
+        "value": None,
+        "dimension": exc.dimension_id,
+        "input": exc.token,
+        "candidates": exc.candidates,
+        "assistant_guidance": (
+            f"No exact match for {exc.role} input {exc.token!r}. The {len(exc.candidates)} "
+            f"closest matches are listed under 'candidates'. Re-call this tool with "
+            f"filters={{{exc.dimension_id!r}: '<candidate id>'}} to disambiguate."
+        ),
     }
 
 
@@ -5682,14 +5844,17 @@ async def get_single_observation(
     Returns only a compact value payload; it does not return raw CSV.
     Set verbose=true to include all coded filter dimensions and provenance attributes.
     """
-    query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
-        flowRef=flowRef,
-        filters=filters,
-        subject=subject,
-        location=location,
-        time=time,
-        extraFilters=extraFilters,
-    )
+    try:
+        query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
+            flowRef=flowRef,
+            filters=filters,
+            subject=subject,
+            location=location,
+            time=time,
+            extraFilters=extraFilters,
+        )
+    except AmbiguousDimensionError as exc:
+        return _compact_ambiguous(exc, shape="single_observation")
     result = await _execute_query_data(
         flowRef=flowRef,
         filters=query_filters,
@@ -5728,14 +5893,17 @@ async def get_indicator_table(
     Set verbose=true to include constant coded dimensions and provenance attributes in every row.
     """
     location_input: str | list[str] | None = locations if locations else location
-    query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
-        flowRef=flowRef,
-        filters=filters,
-        subject=subject,
-        location=location_input,
-        time=time,
-        extraFilters=extraFilters,
-    )
+    try:
+        query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
+            flowRef=flowRef,
+            filters=filters,
+            subject=subject,
+            location=location_input,
+            time=time,
+            extraFilters=extraFilters,
+        )
+    except AmbiguousDimensionError as exc:
+        return _compact_ambiguous(exc, shape="indicator_table")
     result = await _execute_query_data(
         flowRef=flowRef,
         filters=query_filters,
@@ -5774,14 +5942,17 @@ async def get_time_series(
     Returns compact period/value rows rather than raw CSV.
     Set verbose=true to include coded filter dimensions and provenance attributes.
     """
-    query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
-        flowRef=flowRef,
-        filters=filters,
-        subject=subject,
-        location=location,
-        time=time,
-        extraFilters=extraFilters,
-    )
+    try:
+        query_filters, start_period, end_period, last_n, allow_unbounded = await _compact_query_args(
+            flowRef=flowRef,
+            filters=filters,
+            subject=subject,
+            location=location,
+            time=time,
+            extraFilters=extraFilters,
+        )
+    except AmbiguousDimensionError as exc:
+        return _compact_ambiguous(exc, shape="time_series")
     result = await _execute_query_data(
         flowRef=flowRef,
         filters=query_filters,
