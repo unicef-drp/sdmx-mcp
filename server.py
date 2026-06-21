@@ -35,10 +35,25 @@ BASE = os.getenv("SDMX_BASE_URL", "").strip().rstrip("/")
 MCP_NAME = os.getenv("SDMX_MCP_NAME", "sdmx-mcp").strip() or "sdmx-mcp"
 HTTP_USER_AGENT = os.getenv("SDMX_USER_AGENT", "sdmx-mcp/0.1").strip() or "sdmx-mcp/0.1"
 STRUCTURE_REFERENCES = os.getenv("SDMX_STRUCTURE_REFERENCES", "descendants").strip() or "descendants"
+def _read_pyproject_version() -> str:
+    """Read project.version from pyproject.toml so we have one source of truth.
+
+    pyproject.toml ships in the Docker image (COPY . .). Returns "unknown"
+    only if the file is missing or malformed.
+    """
+    import tomllib
+
+    try:
+        with (REPO_ROOT / "pyproject.toml").open("rb") as f:
+            return str(tomllib.load(f)["project"]["version"])
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return "unknown"
+
+
 # SDMX_BUILD_ID is set by the deploy pipeline (Dockerfile ARG GIT_SHA, populated
 # from github.sha in .github/workflows/fly-deploy.yml). Falls back to "local"
 # when running outside the deploy image (dev, tests, etc.).
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = _read_pyproject_version()
 
 
 def _short_commit(raw: str) -> str:
