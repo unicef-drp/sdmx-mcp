@@ -36,7 +36,7 @@ jobs:
       RESPONSES: tmp/sdmx_eval/unicef_global_responses.jsonl
       GRADES: tmp/sdmx_eval/unicef_global_grades.jsonl
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.target_ref }}
 
