@@ -1,4 +1,4 @@
-FROM python:3.11.11-slim
+FROM python:3.14.6-slim
 
 ARG GIT_SHA=local
 ARG APP_VERSION=
