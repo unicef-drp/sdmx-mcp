@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency: fly-deploy-${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: superfly/flyctl-actions/setup-flyctl@master
