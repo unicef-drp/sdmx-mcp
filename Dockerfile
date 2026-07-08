@@ -20,7 +20,7 @@ COPY pyproject.toml uv.lock* ./
 RUN pip install --upgrade pip uv
 
 COPY . .
-RUN uv sync --frozen --no-dev --no-cache --python /usr/local/bin/python3.11 \
+RUN uv sync --frozen --no-dev --no-cache --python python3 \
     && chown -R app:app /app
 
 USER app
