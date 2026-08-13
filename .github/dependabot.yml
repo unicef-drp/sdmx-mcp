@@ -21,6 +21,11 @@ updates:
     labels:
       - "dependencies"
       - "docker"
+    ignore:
+      # Skip pre-release Python base-image tags (rc, alpha, beta).
+      # Remove or narrow once Python 3.15 is GA.
+      - dependency-name: "python"
+        versions: ["*rc*", "*alpha*", "*beta*"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
