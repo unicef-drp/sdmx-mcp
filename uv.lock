@@ -424,19 +424,19 @@ wheels = [
 
 [[package]]
 name = "fastmcp"
-version = "4.0.0b2"
+version = "4.0.0b3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastmcp-slim", extra = ["client", "server"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/08/b1/a9270d6ddcfc85c26d0d5de8174c4c55abe28d1143b2bc5a78bbdb72c40e/fastmcp-4.0.0b2.tar.gz", hash = "sha256:e0f272a2677da9e3683c55e3274ceccdf9026116abc3bc8c6a56aa0ae6a323ce", size = 42134183, upload-time = "2026-08-07T00:18:24.453Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/24/01/be88a40071d7bdce1b207c1acd2522167425393cbad33c40a778ce1f656d/fastmcp-4.0.0b3.tar.gz", hash = "sha256:1edea49ef12f6a47721ec69324bba31302eb0faccff939f2851026992fa62f93", size = 42163497, upload-time = "2026-08-14T17:48:01.224Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/96/2f/535f9d1d6d2e5ba0e64d2e56ab92eb71dc6cd37af21f65696e566a8a6ad4/fastmcp-4.0.0b2-py3-none-any.whl", hash = "sha256:367eaf66444116b95c148cade3300f42b12c667ce38463743574c8c948fb5baf", size = 8086, upload-time = "2026-08-07T00:18:20.106Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/0c/6cb98b816b0836fd8ad120761c5cb76e1c5a3a71dfd3b0549b37a3b52a54/fastmcp-4.0.0b3-py3-none-any.whl", hash = "sha256:4a68fb3877f160ca18ca5be4ee80c0d68c89f922b927734c36e6e99827d814fc", size = 8089, upload-time = "2026-08-14T17:47:58.59Z" },
 ]
 
 [[package]]
 name = "fastmcp-slim"
-version = "4.0.0b2"
+version = "4.0.0b3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mcp-types" },
@@ -447,9 +447,9 @@ dependencies = [
     { name = "rich" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b8/ec/c7d2f91ea6027fa92240ba25bb0d7601b9e1f5f5e69f079bb0ee203df403/fastmcp_slim-4.0.0b2.tar.gz", hash = "sha256:b222d52c4883695f2bafb973c6fd55694bbcc8eaaa64886ebb2168d0267add3c", size = 664066, upload-time = "2026-08-07T00:16:24.158Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c0/35/01d59a0a8c4a7a7125f1f3b01f22b7283fea1942b7e1c5cea171bea624cc/fastmcp_slim-4.0.0b3.tar.gz", hash = "sha256:0647126ce70ebf0890912954ffb5cd162fb63bb9169a81b078ae960c8c09830e", size = 674255, upload-time = "2026-08-14T17:47:36.064Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7b/45/3aabf3cc93cda2e3ad580f75eba771371b4434bb7364be2781e3e5823bdc/fastmcp_slim-4.0.0b2-py3-none-any.whl", hash = "sha256:b96c96372713a2d1d504cc2913549a0201b985add128ddd5a5520faff6bc28ff", size = 833078, upload-time = "2026-08-07T00:16:22.717Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/fa/63bc5d73f77bcf52ae05c184d18ad2ff9c5b35da0d9b55500e74a5377fef/fastmcp_slim-4.0.0b3-py3-none-any.whl", hash = "sha256:59ea0be9978b45cfe3ab47f3b7413b36a5b4b929dff723d48235899eada8bb42", size = 846345, upload-time = "2026-08-14T17:47:34.541Z" },
 ]
 
 [package.optional-dependencies]
@@ -1077,11 +1077,11 @@ wheels = [
 
 [[package]]
 name = "python-dotenv"
-version = "1.2.2"
+version = "1.2.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6a/53/ed9d74092561d4b01a2ef1349d52cdbc135e526c245f366b089cfca6de49/python_dotenv-1.2.3.tar.gz", hash = "sha256:a20a594dabeaa385725aa239d5244871c143ecb356add8a20fcf23773a6c3a35", size = 58945, upload-time = "2026-08-16T16:54:54.067Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/17/c5c6b53ddc18f297992099b3d9ec16c855c0ccc83263a21fe4d1c625ec6c/python_dotenv-1.2.3-py3-none-any.whl", hash = "sha256:904552145e8bfed22162c09dab1c2b9b54fefa7b23ba780f4f26ca0316b0f0d9", size = 22780, upload-time = "2026-08-16T16:54:52.473Z" },
 ]
 
 [[package]]
@@ -1464,11 +1464,11 @@ wheels = [
 
 [[package]]
 name = "uncalled-for"
-version = "0.3.1"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e1/68/35c1d87e608940badbcfeb630347aa0509897284684f61fab6423d02b253/uncalled_for-0.3.1.tar.gz", hash = "sha256:5e412ac6708f04b56bef5867b5dcf6690ebce4eb7316058d9c50787492bb4bca", size = 49693, upload-time = "2026-04-07T13:05:06.462Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/5a/92ce0b3ea5481915f55da994c2c2c5f7a3c09949afde196ee89f8ab961aa/uncalled_for-0.4.0.tar.gz", hash = "sha256:335b95bd2422332ec210d518f314a16e4c640921c39fc8bf2ad095bd3538f4af", size = 56979, upload-time = "2026-08-10T14:51:46.247Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/e1/7ec67882ad8fc9f86384bef6421fa252c9cbe5744f8df6ce77afc9eca1f5/uncalled_for-0.3.1-py3-none-any.whl", hash = "sha256:074cdc92da8356278f93d0ded6f2a66dd883dbecaf9bc89437646ee2289cc200", size = 11361, upload-time = "2026-04-07T13:05:05.341Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/40/97cec87c077eb3291fc7905e6633e08b7ca593c57d30238444bcb6bb3d53/uncalled_for-0.4.0-py3-none-any.whl", hash = "sha256:16c4bb3337532e4bd5569adc192285976f3ad5305402256d34c67a12b5c968bd", size = 15502, upload-time = "2026-08-10T14:51:45.068Z" },
 ]
 
 [[package]]
