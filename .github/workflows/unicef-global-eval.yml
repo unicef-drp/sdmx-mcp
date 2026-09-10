@@ -6,6 +6,14 @@ env:
 on:
   workflow_dispatch:
     inputs:
+      target_ref:
+        description: Branch or ref to evaluate
+        required: true
+        type: choice
+        default: "unicef"
+        options:
+          - unicef
+          - main
       case_limit:
         description: Number of manifest cases to send to the agent
         required: true
@@ -28,7 +36,9 @@ jobs:
       RESPONSES: tmp/sdmx_eval/unicef_global_responses.jsonl
       GRADES: tmp/sdmx_eval/unicef_global_grades.jsonl
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
 
       - uses: actions/setup-python@v7
         with:
