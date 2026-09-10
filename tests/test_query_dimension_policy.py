@@ -868,5 +868,128 @@ class TestCompactToolAmbiguousResponse(unittest.IsolatedAsyncioTestCase):
         self.assertIn("INDICATOR", result["assistant_guidance"])
 
 
+def _policy_subject_indicator_location_geo() -> "server.QueryDimensionPolicyConfig":
+    """Policy whose subject maps to INDICATOR and location to REF_AREA."""
+    return server.QueryDimensionPolicyConfig(
+        auto_apply_total=server.AutoApplyTotalPolicy(enabled=False),
+        default_query_dimensions=[
+            server.QueryDimensionPolicyEntry(
+                name="subject",
+                role="subject",
+                required_for_retrieval=True,
+                priority=1,
+                preferred_sources=[server.QueryDimensionSource(type="codelist", id="CL_INDICATOR")],
+            ),
+            server.QueryDimensionPolicyEntry(
+                name="time",
+                role="time",
+                required_for_retrieval=True,
+                priority=2,
+            ),
+            server.QueryDimensionPolicyEntry(
+                name="location",
+                role="geography",
+                required_for_retrieval=True,
+                priority=3,
+                preferred_sources=[server.QueryDimensionSource(type="codelist", id="CL_GEO")],
+            ),
+        ],
+    )
+
+
+class TestPinnedFilterSatisfiesPolicy(unittest.IsolatedAsyncioTestCase):
+    """Following the ambiguous-subject guidance must actually work.
+
+    _compact_ambiguous tells callers to re-call with filters={'INDICATOR': '<id>'}.
+    Doing so used to raise "subject must not be empty", because an omitted subject
+    was still pushed through policy resolution as an empty string. See issue #84.
+    """
+
+    async def _compact_args(self, **kwargs):
+        payload = _payload_with_total_dimensions()
+
+        async def _fake_resolve_coded(flow_ref, structure, raw_value, policy):
+            # Mirror the real resolver's empty-input guard (server.py), so a blank
+            # value reaching it fails here exactly as it does in production.
+            tokens = [part.strip() for part in str(raw_value).replace("+", ",").split(",") if part.strip()]
+            if not tokens:
+                raise ValueError(f"{policy.name} must not be empty.")
+            # Only location should ever reach the resolver in these tests.
+            return {
+                "role": policy.role,
+                "dimension_id": "REF_AREA",
+                "value": "KEN",
+                "values": None,
+            }
+
+        async def _fake_resolve_time(flow_ref, structure, raw_value, policy):
+            return {"role": "time", "startPeriod": None, "endPeriod": None, "useLatestObservation": True}
+
+        with patch(
+            "server._query_dimension_policy_config",
+            return_value=_policy_subject_indicator_location_geo(),
+        ), patch("server._get_flow_structure", return_value=payload), patch(
+            "server._resolve_coded_dimension_value", side_effect=_fake_resolve_coded
+        ), patch("server._resolve_time_value", side_effect=_fake_resolve_time):
+            return await server._compact_query_args(
+                flowRef="UNICEF/IMMUNISATION/1.0",
+                extraFilters=None,
+                **kwargs,
+            )
+
+    async def test_pinned_indicator_with_location_text_does_not_raise(self) -> None:
+        """The exact call the guidance tells callers to make."""
+        filters, _, _, _, _ = await self._compact_args(
+            filters={"INDICATOR": "IM_DTP3"},
+            subject=None,
+            location="Kenya",
+            time="latest",
+        )
+        self.assertEqual(filters["INDICATOR"], "IM_DTP3")
+        self.assertEqual(filters["REF_AREA"], "KEN")
+
+    async def test_pinned_indicator_is_not_overwritten_by_resolution(self) -> None:
+        filters, _, _, _, _ = await self._compact_args(
+            filters={"INDICATOR": "IM_DTP3"},
+            subject=None,
+            location="Kenya",
+            time="latest",
+        )
+        self.assertEqual(filters["INDICATOR"], "IM_DTP3")
+
+    async def test_blank_subject_is_treated_as_absent(self) -> None:
+        """Whitespace-only subject must not reach the coded resolver."""
+        filters, _, _, _, _ = await self._compact_args(
+            filters={"INDICATOR": "IM_DTP3"},
+            subject="   ",
+            location="Kenya",
+            time="latest",
+        )
+        self.assertEqual(filters["INDICATOR"], "IM_DTP3")
+
+    async def test_missing_required_input_without_pin_still_raises(self) -> None:
+        """Dropping the subject entirely is still an error when nothing pins it."""
+        with self.assertRaises(ValueError) as ctx:
+            await self._compact_args(
+                filters=None,
+                subject=None,
+                location="Kenya",
+                time="latest",
+            )
+        self.assertIn("subject", str(ctx.exception))
+
+    async def test_unrelated_pinned_filter_does_not_satisfy_subject(self) -> None:
+        """A filter on some other dimension must not mask a missing subject."""
+        with self.assertRaises(ValueError) as ctx:
+            await self._compact_args(
+                filters={"SEX": "_T"},
+                subject=None,
+                location="Kenya",
+                time="latest",
+            )
+        self.assertIn("subject", str(ctx.exception))
+
+
+
 if __name__ == "__main__":
     unittest.main()

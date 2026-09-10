@@ -3410,17 +3410,42 @@ async def _resolve_coded_dimension_value(
     }
 
 
+def _policy_dimension_ids(payload: dict[str, Any], policy: QueryDimensionPolicyEntry) -> set[str]:
+    """Dimension ids this policy resolves into for the given flow.
+
+    Used to tell whether an explicit ``filters`` entry has already pinned the
+    dimension a policy would otherwise resolve from free text.
+    """
+    ids: set[str] = set()
+    for source in policy.preferred_sources:
+        dim = (
+            _find_dimension_from_source(payload, source)
+            if source.type != "hierarchical_codelist"
+            else _dimension_for_hierarchical_source(payload, policy, source)
+        )
+        dim_id = str((dim or {}).get("id") or "").strip().upper()
+        if dim_id:
+            ids.add(dim_id)
+    return ids
+
+
 async def _resolve_query_dimension_inputs(
     flow_ref: str,
     provided_inputs: dict[str, str],
+    pinned_dimensions: set[str] | None = None,
 ) -> dict[str, Any]:
     logger.info("Resolving query dimension inputs for flow %s: %s", flow_ref, list(provided_inputs.keys()))
     payload = await _get_flow_structure(flow_ref)
+    pinned = {str(item).strip().upper() for item in (pinned_dimensions or set()) if str(item).strip()}
     resolved: dict[str, Any] = {}
     resolution_order: list[str] = []
     for policy in _ordered_query_dimensions():
         raw_value = _input_value_for_policy(provided_inputs, policy)
-        if raw_value is None:
+        if raw_value is None or not str(raw_value).strip():
+            # An explicit filter on this policy's dimension already answers it,
+            # which is what the ambiguous-subject guidance tells callers to send.
+            if pinned and pinned & _policy_dimension_ids(payload, policy):
+                continue
             if policy.required_for_retrieval:
                 raise ValueError(f"Missing required input for query dimension '{policy.name}' ({policy.role}).")
             continue
@@ -4159,7 +4184,11 @@ async def _compact_query_args(
         "location": str(location_value or "").strip(),
         "time": str(time or "latest").strip(),
     }
-    resolved = await _resolve_query_dimension_inputs(flowRef, provided_inputs)
+    resolved = await _resolve_query_dimension_inputs(
+        flowRef,
+        provided_inputs,
+        pinned_dimensions=set(merged_filters or {}),
+    )
     resolved_filters, time_resolution, _, _ = _query_args_from_resolved_inputs(resolved)
     query_filters = dict(resolved_filters)
     if merged_filters:
