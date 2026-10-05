@@ -62,7 +62,9 @@ def _api_key(provider: dict[str, Any]) -> str:
     return value
 
 
-def _mcp_servers(payload: dict[str, Any], provider: dict[str, Any]) -> list[dict[str, Any]]:
+def _mcp_servers(
+    payload: dict[str, Any], provider: dict[str, Any], mcp_beta: str = ""
+) -> list[dict[str, Any]]:
     mcp = payload.get("mcp")
     if not isinstance(mcp, dict):
         raise ValueError("Payload must include an mcp config object.")
@@ -74,8 +76,12 @@ def _mcp_servers(payload: dict[str, Any], provider: dict[str, Any]) -> list[dict
         "type": "url",
         "url": url,
         "name": str(mcp.get("server_label") or "sdmx-mcp").strip() or "sdmx-mcp",
-        "tool_configuration": {"enabled": True},
     }
+    # tool_configuration and mcp_toolset are mutually exclusive. The 2025-11-20
+    # and 2026-09-15 betas reject tool_configuration outright and take the
+    # toolset entry in `tools` instead; older betas only understand this field.
+    if mcp_beta.strip() in {"mcp-client-2025-04-04", ""}:
+        server_def["tool_configuration"] = {"enabled": True}
 
     auth_env = str(mcp.get("authorization_token_env") or provider.get("mcp_authorization_token_env") or "").strip()
     if auth_env:
@@ -236,6 +242,7 @@ def _normalize_result(
     raw_response: dict[str, Any],
     tool_trace: list[dict[str, Any]],
     provider: dict[str, Any],
+    model: str = "",
 ) -> dict[str, Any]:
     claims = parsed.get("claims")
     if not isinstance(claims, dict):
@@ -274,20 +281,21 @@ def main() -> None:
     anthropic_version = str(provider.get("anthropic_version") or DEFAULT_ANTHROPIC_VERSION).strip()
     mcp_beta = str(provider.get("anthropic_beta") or DEFAULT_MCP_BETA).strip()
 
-    mcp_servers = _mcp_servers(payload, provider)
+    mcp_servers = _mcp_servers(payload, provider, mcp_beta)
     body: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
         "system": _system_prompt(payload, provider),
         "messages": [{"role": "user", "content": _user_message(payload)}],
         "mcp_servers": mcp_servers,
-        # Second half of the connector. Without a matching mcp_toolset entry
-        # the request is rejected, and the server name must match exactly.
-        "tools": [
+    }
+    if mcp_beta.strip() not in {"mcp-client-2025-04-04", ""}:
+        # Second half of the connector on the current betas. The server name
+        # must match the mcp_servers entry exactly.
+        body["tools"] = [
             {"type": "mcp_toolset", "mcp_server_name": server["name"]}
             for server in mcp_servers
-        ],
-    }
+        ]
     if temperature is not None:
         body["temperature"] = temperature
 
@@ -300,7 +308,14 @@ def main() -> None:
 
     with httpx.Client(timeout=120.0) as client:
         response = client.post(API_URL, headers=headers, json=body)
-    response.raise_for_status()
+    if response.status_code >= 400:
+        # raise_for_status() discards the body, which is where the API says what
+        # was actually wrong -- an unknown beta, a malformed tool block, a model
+        # the workspace cannot reach. Without it every failure looks identical.
+        raise RuntimeError(
+            f"Anthropic API {response.status_code} for model={model!r} "
+            f"beta={mcp_beta!r}: {response.text[:1500]}"
+        )
     raw = response.json()
     content = raw.get("content")
     if not isinstance(content, list):
@@ -322,7 +337,7 @@ def main() -> None:
             "error": "Anthropic response did not contain a parseable JSON object.",
         }
     else:
-        result = _normalize_result(parsed, text, raw, tool_trace, provider)
+        result = _normalize_result(parsed, text, raw, tool_trace, provider, model)
 
     json.dump(result, sys.stdout)
 
