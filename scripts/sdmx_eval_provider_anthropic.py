@@ -9,10 +9,35 @@ import httpx
 
 
 API_URL = "https://api.anthropic.com/v1/messages"
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_MODEL = "claude-haiku-4-5"
 DEFAULT_MAX_TOKENS = 1200
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_MCP_BETA = "mcp-client-2025-04-04"
+# The MCP connector now needs both halves: mcp_servers AND a matching
+# mcp_toolset entry in tools. Sending mcp_servers alone is a validation error.
+DEFAULT_MCP_BETA = "mcp-client-2025-11-20"
+
+# Per-million-token rates, used for the cost column in grade-results.
+# Keep in step with the model actually being run, or the cost report is fiction.
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    "claude-haiku-4-5": {
+        "input_usd_per_million": 1.0,
+        "output_usd_per_million": 5.0,
+        "cache_creation_input_usd_per_million": 1.25,
+        "cache_read_input_usd_per_million": 0.10,
+    },
+    "claude-sonnet-5": {
+        "input_usd_per_million": 2.0,
+        "output_usd_per_million": 10.0,
+        "cache_creation_input_usd_per_million": 2.5,
+        "cache_read_input_usd_per_million": 0.20,
+    },
+    "claude-opus-5": {
+        "input_usd_per_million": 5.0,
+        "output_usd_per_million": 25.0,
+        "cache_creation_input_usd_per_million": 6.25,
+        "cache_read_input_usd_per_million": 0.50,
+    },
+}
 
 
 def _read_payload() -> dict[str, Any]:
@@ -167,8 +192,19 @@ def _usage_summary(raw_response: dict[str, Any]) -> dict[str, int]:
     return usage
 
 
-def _estimated_cost_usd(usage: dict[str, int], provider: dict[str, Any]) -> float | None:
+def _estimated_cost_usd(
+    usage: dict[str, int], provider: dict[str, Any], model: str = ""
+) -> float | None:
+    """Cost for this call, preferring config pricing, then the model table.
+
+    The model can be overridden per run via SDMX_EVAL_MODEL, which would leave
+    a config's hardcoded pricing describing a different model entirely. Falling
+    back to a table keyed on the model that actually ran keeps the cost column
+    honest; returning None is better than reporting a confident wrong number.
+    """
     pricing = provider.get("pricing")
+    if not isinstance(pricing, dict):
+        pricing = MODEL_PRICING.get(model.strip())
     if not isinstance(pricing, dict):
         return None
 
@@ -216,7 +252,7 @@ def _normalize_result(
         },
         "tool_trace": tool_trace,
         "usage": usage,
-        "estimated_cost_usd": _estimated_cost_usd(usage, provider),
+        "estimated_cost_usd": _estimated_cost_usd(usage, provider, model),
         "raw_response": raw_response,
     }
     return result
@@ -226,18 +262,31 @@ def main() -> None:
     payload = _read_payload()
     provider = _provider_config(payload)
     api_key = _api_key(provider)
-    model = str(provider.get("model") or DEFAULT_MODEL).strip()
+    # SDMX_EVAL_MODEL lets one config drive a multi-model comparison without
+    # maintaining a near-duplicate config per model.
+    model = str(
+        os.getenv("SDMX_EVAL_MODEL", "").strip()
+        or provider.get("model")
+        or DEFAULT_MODEL
+    ).strip()
     max_tokens = int(provider.get("max_tokens") or DEFAULT_MAX_TOKENS)
     temperature = provider.get("temperature")
     anthropic_version = str(provider.get("anthropic_version") or DEFAULT_ANTHROPIC_VERSION).strip()
     mcp_beta = str(provider.get("anthropic_beta") or DEFAULT_MCP_BETA).strip()
 
+    mcp_servers = _mcp_servers(payload, provider)
     body: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
         "system": _system_prompt(payload, provider),
         "messages": [{"role": "user", "content": _user_message(payload)}],
-        "mcp_servers": _mcp_servers(payload, provider),
+        "mcp_servers": mcp_servers,
+        # Second half of the connector. Without a matching mcp_toolset entry
+        # the request is rejected, and the server name must match exactly.
+        "tools": [
+            {"type": "mcp_toolset", "mcp_server_name": server["name"]}
+            for server in mcp_servers
+        ],
     }
     if temperature is not None:
         body["temperature"] = temperature
@@ -268,7 +317,7 @@ def main() -> None:
             "claims": {"value": None, "time_period": None, "flowRef": None, "filters": None},
             "tool_trace": tool_trace,
             "usage": _usage_summary(raw),
-            "estimated_cost_usd": _estimated_cost_usd(_usage_summary(raw), provider),
+            "estimated_cost_usd": _estimated_cost_usd(_usage_summary(raw), provider, model),
             "raw_response": raw,
             "error": "Anthropic response did not contain a parseable JSON object.",
         }
