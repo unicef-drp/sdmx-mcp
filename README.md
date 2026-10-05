@@ -381,6 +381,7 @@ Time inputs accepted by the query policy can be:
 - Returns: structured source-bound status with `status`, `sourceScope`, `provenance`, optional `error`, and `assistant_guidance`.
 
 23. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='csv', labels='name', maxObs=50000, filters=None, lastNObservations=None, resultShape=None)`
+- `labels='both'` returns code and label together in SDMX CSV, which reads well in demos.
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
   - defaults to `lastNObservations=1` when no explicit `startPeriod` and `endPeriod` are provided and `SDMX_DEFAULT_LAST_N_OBSERVATIONS=true`
@@ -745,9 +746,3 @@ Recommended discovery sequence:
 4. Data query 404 with SDMX message `No data for data query against the dataflow`
 - Query syntax is valid but the selected dimensional slice has no observations.
 - Use `find_indicator_candidates` and inspect the returned candidate flows, or configure stronger `flow_topic_hints` in `discovery_policy.json`.
-
-## Latest Robustness Updates
-
-- Unspecified dimensions are now kept as empty SDMX key segments (`.` wildcard) instead of being auto-filled.
-- `query_data` supports optional `labels` for SDMX CSV output (`labels=both` works well for readable demos).
-- Guided discovery can use configurable fallback topic hints from `discovery_policy.json`.
