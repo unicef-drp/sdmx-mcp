@@ -206,10 +206,9 @@ class RateLimiter:
 
     Concurrency alone is not enough. sdmx.data.unicef.org throttles sustained
     request streams, and the MCP surfaces a throttled response as
-    status=unresolved_from_official_flows with error=null -- indistinguishable
-    from a genuine no-data answer. Unpaced, a sweep misreads throttling as
-    fidelity failure; every such series in testing resolved on an unhurried
-    retry. Pace the sweep rather than arguing with a shared public service.
+    status=rate_limited with httpStatus=429. An unpaced 900-series run drew 429
+    on 399 of them. Pace the sweep rather than arguing with a shared public
+    service; throttled series are not fidelity failures.
     """
 
     def __init__(self, per_second: float) -> None:
@@ -417,11 +416,16 @@ async def compare_series(
         else:
             if payload.get("status") == "resolved":
                 break
-            err = payload.get("error") or {}
             detail = (
                 f"status={payload.get('status')} "
-                f"http={err.get('status')} {str(err.get('message'))[:120]}"
+                f"http={payload.get('httpStatus')} "
+                f"{str(payload.get('message'))[:120]}"
             ).strip()
+            # The server now says whether a failure is transport or real. Only
+            # retry the transport kind -- re-asking for data that genuinely is
+            # not there just slows the sweep and hides nothing.
+            if not payload.get("retryable"):
+                break
         if attempt < retries:
             await asyncio.sleep(backoff * (2**attempt))
 
