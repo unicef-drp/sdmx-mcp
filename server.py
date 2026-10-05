@@ -1549,13 +1549,21 @@ def _unresolved_response(
         filters=filters,
         appliedDefaults=appliedDefaults,
     )
+    status_name, retryable, default_message = _upstream_failure_kind(status_code)
     payload.update(
         {
-            "status": "unresolved_from_official_flows",
-            "assistant_guidance": "Do not supplement this with non-MCP facts. State that the configured SDMX flow query did not resolve and report the attempted flow, key, and query URL.",
+            "status": status_name,
+            "retryable": retryable,
+            "assistant_guidance": (
+                "The registry is rate limiting or unavailable; this is a transport failure, "
+                "not an absence of data. Say the query could not be completed and that it "
+                "should be retried, and do not state that no data exists."
+                if retryable
+                else "Do not supplement this with non-MCP facts. State that the configured SDMX flow query did not resolve and report the attempted flow, key, and query URL."
+            ),
             "error": {
                 "status": status_code,
-                "message": message or _parse_sdmx_error(raw_text) or "Query did not resolve from the configured SDMX service.",
+                "message": message or _parse_sdmx_error(raw_text) or default_message,
                 "raw": raw_text,
             },
             "notes": {"maxObs": maxObs, "format": format, "labels": labels},
@@ -3938,12 +3946,53 @@ async def _enrich_single_result(
     return _project_single(result, verbose=verbose)
 
 
+def _upstream_failure_kind(status_code: int | None) -> tuple[str, bool, str]:
+    """Classify an upstream HTTP failure as retryable transport or real non-resolution.
+
+    A 429 and an empty result are not the same answer, and callers were given no
+    way to tell them apart: both arrived as ``unresolved_from_official_flows``
+    with no status, so a throttled sweep looked like a registry with no data.
+    Returns (status name, retryable, default message).
+    """
+    if status_code == 429:
+        return (
+            "rate_limited",
+            True,
+            "The SDMX registry returned 429 Too Many Requests. The query was not "
+            "answered; this does not mean the data is absent. Slow down and retry.",
+        )
+    if status_code is not None and 500 <= status_code < 600:
+        return (
+            "upstream_unavailable",
+            True,
+            f"The SDMX registry returned {status_code}. The query was not answered; "
+            "this does not mean the data is absent. Retry later.",
+        )
+    if status_code in (408, 425):
+        return (
+            "upstream_unavailable",
+            True,
+            f"The SDMX registry returned {status_code} (timeout). Retry.",
+        )
+    return (
+        "unresolved_from_official_flows",
+        False,
+        "Query did not resolve from the configured SDMX service.",
+    )
+
+
 def _compact_unresolved(result: dict[str, Any], *, shape: str) -> dict[str, Any]:
     error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    status_code = error.get("status")
+    # Carry the upstream status and retryability through the compact projection.
+    # Dropping them is what made throttling indistinguishable from no-data.
+    _, retryable, _ = _upstream_failure_kind(status_code)
     return {
         "status": result.get("status") or "unresolved",
         "shape": shape,
         "value": None,
+        "httpStatus": status_code,
+        "retryable": bool(result.get("retryable", retryable)),
         "message": error.get("message") or result.get("assistant_guidance") or "The official SDMX query did not resolve.",
         "source": _compact_source(result),
     }
