@@ -9,7 +9,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -1020,6 +1020,111 @@ async def run_provider(
     }
 
 
+def _rounding_note(expected: Any, actual: Any) -> str | None:
+    """Describe a value that is the expected one rounded, else None.
+
+    An agent answering 96.21 for 96.20888714071654 read the right cell and
+    reported it to two decimals. Counting that as a wrong answer measures
+    formatting, not retrieval -- so it is surfaced as a note and the value is
+    treated as matching. A genuinely different number is still a mismatch.
+    """
+    try:
+        expected_dec = Decimal(str(expected).strip())
+        actual_str = str(actual).strip()
+        actual_dec = Decimal(actual_str)
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        return None
+    if expected_dec == actual_dec:
+        return None
+    exponent = actual_dec.as_tuple().exponent
+    if not isinstance(exponent, int):
+        return None
+    places = max(-exponent, 0)
+    if places > 12:
+        return None
+    if expected_dec.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP) == actual_dec:
+        return f"rounded to {places} dp (expected {expected_dec}, reported {actual_dec})"
+    return None
+
+
+def _filter_claim_matches(
+    claim_filters: dict[str, Any],
+    key: str,
+    expected_code: Any,
+    case_dimensions: dict[str, Any],
+) -> bool | None:
+    """Compare one reported filter to the expected code.
+
+    A natural-language prompt never asks the agent to echo SDMX codes, so it
+    reasonably reports REF_AREA as "San Marino" rather than "SMR", or SEX as
+    "Total" rather than "_T" -- and omits a dimension it never filtered on.
+    Scoring those as wrong failed 12 of 14 natural-language cases whose values
+    were all exactly right, which measures reporting style, not capability.
+
+    Returns True on a code or label match, None when the dimension was not
+    reported at all (unknown, not wrong), and False only on a real conflict --
+    the agent naming a different code or place than the one asked for.
+    """
+    if key not in claim_filters:
+        return None
+    claimed = str(claim_filters.get(key, "")).strip()
+    if not claimed:
+        return None
+    expected = str(expected_code).strip()
+    if claimed.casefold() == expected.casefold():
+        return True
+    label = ""
+    entry = case_dimensions.get(key)
+    if isinstance(entry, dict):
+        label = str(entry.get("name") or "").strip()
+    if label and claimed.casefold() == label.casefold():
+        return True
+    return False
+
+
+def _trace_hits_expected_series(response: dict[str, Any], case: dict[str, Any]) -> bool | None:
+    """Whether some MCP call in the trace targeted the expected series.
+
+    Grading only the reported value cannot distinguish a correct lookup from a
+    right number reached another way. This checks the agent actually asked for
+    the indicator and reference area under test.
+
+    Each dimension is satisfied by its code OR its label: the compact tools take
+    natural-language `subject`/`location`, so an agent legitimately sends
+    location="Costa Rica" and the code CRI never appears. Requiring the code
+    marked 14 of 40 correct lookups as misses.
+
+    None when there is no usable trace -- absence of evidence, not a failure.
+    """
+    provider_output = response.get("provider_output")
+    trace = (provider_output or {}).get("tool_trace") if isinstance(provider_output, dict) else None
+    if not isinstance(trace, list) or not trace:
+        return None
+
+    dimensions = case.get("dimensions") or {}
+    wanted: list[set[str]] = []
+    for key, code in (case.get("filters") or {}).items():
+        if str(key).upper() not in {"INDICATOR", "REF_AREA"}:
+            continue
+        accepted = {str(code).strip().casefold()}
+        entry = dimensions.get(key)
+        if isinstance(entry, dict):
+            label = str(entry.get("name") or "").strip().casefold()
+            if label:
+                accepted.add(label)
+        wanted.append({value for value in accepted if value})
+    if not wanted:
+        return None
+
+    for block in trace:
+        if not isinstance(block, dict) or block.get("type") != "mcp_tool_use":
+            continue
+        payload = json.dumps(block.get("input") or {}).casefold()
+        if all(any(value in payload for value in group) for group in wanted):
+            return True
+    return False
+
+
 def grade_results(
     manifest_path: Path,
     responses_path: Path,
@@ -1078,6 +1183,13 @@ def grade_results(
                 if actual_value is not None:
                     value_match = str(expected_value).strip() == str(actual_value).strip()
 
+            # Rounding is a reporting choice, not a retrieval error.
+            rounding_note = None
+            if value_match is not True and expected_value is not None:
+                rounding_note = _rounding_note(expected_value, claims.get("value"))
+                if rounding_note:
+                    value_match = True
+
             time_match = None
             if claims.get("time_period") is not None:
                 time_match = str(claims.get("time_period")).strip() == str(expected_time_period).strip()
@@ -1086,11 +1198,19 @@ def grade_results(
             if claims.get("flowRef") is not None:
                 flow_match = str(claims.get("flowRef")).strip() == str(case.get("flowRef")).strip()
 
-            filter_matches: dict[str, bool] = {}
+            filter_matches: dict[str, bool | None] = {}
             claim_filters = claims.get("filters")
             if isinstance(claim_filters, dict):
+                case_dimensions = case.get("dimensions") or {}
                 for key, expected_filter in dict(case.get("filters") or {}).items():
-                    filter_matches[str(key)] = str(claim_filters.get(key, "")).strip() == str(expected_filter).strip()
+                    filter_matches[str(key)] = _filter_claim_matches(
+                        claim_filters, str(key), expected_filter, case_dimensions
+                    )
+
+            # Did the agent actually query the series it reported? A value check
+            # alone cannot tell a correct lookup from a number that arrived some
+            # other way.
+            trace_match = _trace_hits_expected_series(response, case)
 
             expected_status = expected.get("status") if isinstance(expected, dict) else None
             case_type = str(case.get("caseType") or "positive")
@@ -1105,15 +1225,28 @@ def grade_results(
                 overall = "fail"
             elif case_type == "negative" and expected_behavior == "abstain_no_data":
                 claim_value = claims.get("value")
-                if claim_value in (None, ""):
+                # Abstaining is only correct if the agent actually looked.
+                if claim_value in (None, "") and trace_match is not False:
                     overall = "pass"
                 else:
                     overall = "fail"
             elif expected_status != "deterministic":
                 overall = "manual_review"
-            elif value_match is True and (time_match in (True, None)) and (flow_match in (True, None)) and all(filter_matches.values()):
+            elif (
+                value_match is True
+                and (time_match in (True, None))
+                and (flow_match in (True, None))
+                and trace_match is not False
+                and all(v is not False for v in filter_matches.values())
+            ):
                 overall = "pass"
-            elif value_match is False or time_match is False or flow_match is False or any(not item for item in filter_matches.values()):
+            elif (
+                value_match is False
+                or time_match is False
+                or flow_match is False
+                or trace_match is False
+                or any(item is False for item in filter_matches.values())
+            ):
                 overall = "fail"
             else:
                 overall = "manual_review"
@@ -1129,6 +1262,7 @@ def grade_results(
                 "case_id": case_id,
                 "provider_name": response.get("provider_name"),
                 "overall": overall,
+                "notes": rounding_note,
                 "checks": {
                     "tool_use_match": tool_use_match,
                     "required_tool_match": required_tool_match,
@@ -1137,6 +1271,7 @@ def grade_results(
                     "time_match": time_match,
                     "flow_match": flow_match,
                     "filter_matches": filter_matches,
+                    "trace_match": trace_match,
                 },
                 "expected": {
                     "caseType": case_type,
