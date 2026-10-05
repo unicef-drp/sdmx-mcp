@@ -191,12 +191,39 @@ def _jsonl_read(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _jsonl_case_ids(path: Path) -> set[str]:
-    return {
-        str(item["case_id"])
-        for item in _jsonl_read(path)
-        if isinstance(item.get("case_id"), str) and item.get("case_id")
-    }
+def _jsonl_case_ids(path: Path, *, only_successful: bool = False) -> set[str]:
+    """Case ids already present in a responses file.
+
+    With only_successful, errored records are excluded so they can be retried.
+    Treating a failure as done means one transient 429 poisons that case until
+    somebody deletes the file by hand -- and on a 500-case run that is routine,
+    not exceptional.
+    """
+    ids: set[str] = set()
+    for item in _jsonl_read(path):
+        case_id = item.get("case_id")
+        if not isinstance(case_id, str) or not case_id:
+            continue
+        if only_successful and str(item.get("status") or "") != "ok":
+            continue
+        ids.add(str(case_id))
+    return ids
+
+
+def _drop_failed_responses(path: Path) -> int:
+    """Rewrite a responses file keeping only successful records.
+
+    Without this, a retried case appends a second record for the same id and
+    grade-results reads whichever it happens to hit first.
+    """
+    rows = _jsonl_read(path)
+    keep = [r for r in rows if str(r.get("status") or "") == "ok"]
+    dropped = len(rows) - len(keep)
+    if dropped:
+        with path.open("w", encoding="utf-8") as handle:
+            for row in keep:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return dropped
 
 
 def _csv_rows(text: str) -> list[dict[str, Any]]:
@@ -919,6 +946,7 @@ async def run_provider(
     manifest_path: Path,
     responses_path: Path,
     case_limit: int | None = None,
+    retry_failed: bool = False,
 ) -> dict[str, Any]:
     _apply_registry_overrides(config)
     provider = config.get("provider")
@@ -939,7 +967,10 @@ async def run_provider(
                 base_env[key] = value
 
     manifest_rows = _jsonl_read(manifest_path)
-    completed = _jsonl_case_ids(responses_path)
+    retried = 0
+    if retry_failed and responses_path.exists():
+        retried = _drop_failed_responses(responses_path)
+    completed = _jsonl_case_ids(responses_path, only_successful=retry_failed)
     pending = [row for row in manifest_rows if row.get("case_id") not in completed]
     if case_limit is not None:
         pending = pending[:case_limit]
@@ -977,9 +1008,14 @@ async def run_provider(
             }
             handle.write(json.dumps(result, ensure_ascii=True) + "\n")
             written += 1
+    ok_count = len(_jsonl_case_ids(responses_path, only_successful=True))
     return {
         "provider_name": provider_name,
         "cases_written": written,
+        "cases_pending": len(pending),
+        "failed_retried": retried,
+        # Surfaced so a fully-failed run cannot read as "nothing to do".
+        "cases_succeeded_total": ok_count,
         "responses_path": str(responses_path),
     }
 
@@ -1142,7 +1178,10 @@ async def _async_main(args: argparse.Namespace) -> None:
         return
 
     if args.command == "run-provider":
-        result = await run_provider(config, manifest_path, responses_path, case_limit=args.case_limit)
+        result = await run_provider(
+            config, manifest_path, responses_path,
+            case_limit=args.case_limit, retry_failed=args.retry_failed,
+        )
         print(json.dumps(result, indent=2))
         return
 
@@ -1157,6 +1196,13 @@ async def _async_main(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generic SDMX eval harness for case generation, provider runs, and grading.")
     parser.add_argument("command", choices=["build-cases", "run-provider", "grade-results"])
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Re-run cases whose previous response errored, instead of treating "
+             "them as done. Errored records are dropped first so grade-results "
+             "cannot read a stale failure for a case that later succeeded.",
+    )
     parser.add_argument("--config", type=Path, required=True, help="Path to the eval config JSON file.")
     parser.add_argument("--manifest", type=Path, default=None, help="Manifest JSONL path.")
     parser.add_argument("--responses", type=Path, default=None, help="Provider responses JSONL path.")
