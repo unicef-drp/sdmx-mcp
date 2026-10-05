@@ -126,6 +126,11 @@ def _positive_int_env(name: str, default: int) -> int:
 # payloads (memory, egress, latency).
 MAX_OBS_HARD_CAP = _positive_int_env("SDMX_MAX_OBS_CAP", 100_000)
 
+# Flows listed per indicator candidate in find_indicator_candidates. 0 disables
+# trimming. These flows share one INDICATOR codelist, so the untrimmed list is
+# the same for every candidate and dominates the payload.
+INDICATOR_FLOW_LIMIT = _positive_int_env("SDMX_INDICATOR_FLOW_LIMIT", 3)
+
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -4545,6 +4550,25 @@ async def _find_indicator_candidates_impl(
         recommended = _pick_recommended_flow(candidates, q, indicator_text)
         item["recommendedFlowRef"] = recommended.get("flowRef") if isinstance(recommended, dict) else None
         item.pop("_score", None)
+
+        # These flows share one INDICATOR codelist, so membership is not
+        # evidence that a flow holds data for this code -- every indicator
+        # matches every flow, and the untrimmed list came back byte-identical
+        # for all candidates. Measured on one query it was 95% of a 57KB
+        # payload (~16k tokens), repeated ten times, carrying no information
+        # that distinguishes one candidate from another.
+        #
+        # Keep the best-scoring few and say how many were dropped. A caller
+        # that genuinely needs the full set can call search_dataflows.
+        total_flows = len(candidates)
+        if INDICATOR_FLOW_LIMIT and total_flows > INDICATOR_FLOW_LIMIT:
+            item["dataflows"] = candidates[:INDICATOR_FLOW_LIMIT]
+            item["dataflowsTotal"] = total_flows
+            item["dataflowsNote"] = (
+                f"Showing the {INDICATOR_FLOW_LIMIT} best-matching of {total_flows} flows whose "
+                "codelist includes this indicator. Codelist membership does not mean the flow "
+                "holds data for it; prefer recommendedFlowRef."
+            )
 
     return ranked
 

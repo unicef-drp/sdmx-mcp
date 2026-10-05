@@ -17,6 +17,15 @@ primary_region = 'fra'
   SDMX_EXCLUDE_DRAFT = 'true'
   SDMX_AGENCY_ALLOWLIST = 'UNICEF,UNPD'
   SDMX_REF_AREA_HIERARCHY_REF = 'UNICEF/UNICEF_REPORTING_REGIONS/latest'
+  # The eval measures agent behaviour inside one known flow, so pin the server
+  # to GLOBAL_DATAFLOW and enforce it. Without this the agent roams: a single
+  # find_indicator_candidates call returned 32 flows per candidate (~16k tokens)
+  # and recommended UNICEF/CME/1.0, which does not hold the eval data, so runs
+  # burned 285k tokens wandering between flows. Enforcement is server-side --
+  # out-of-scope flows are rejected, not merely discouraged by the prompt.
+  # Production (fly.toml) stays unscoped; real users do want cross-flow search.
+  SDMX_DATAFLOW_ID_ALLOW_REGEX = '^GLOBAL_DATAFLOW$'
+  SDMX_ENFORCE_SCOPE = 'true'
 
 [deploy]
   [deploy.release_command_vm]
