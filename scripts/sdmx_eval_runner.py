@@ -966,7 +966,16 @@ async def run_provider(
             if isinstance(key, str) and isinstance(value, str):
                 base_env[key] = value
 
+    if not manifest_path.exists():
+        raise SystemExit(
+            f"Manifest not found: {manifest_path}\n"
+            "Build it first, e.g.\n"
+            "  python3 scripts/sdmx_eval_build_cases_from_sweep.py "
+            f"--manifest {manifest_path} --count 500"
+        )
     manifest_rows = _jsonl_read(manifest_path)
+    if not manifest_rows:
+        raise SystemExit(f"Manifest is empty: {manifest_path}. Nothing to run.")
     retried = 0
     if retry_failed and responses_path.exists():
         retried = _drop_failed_responses(responses_path)
@@ -1123,6 +1132,20 @@ def _trace_hits_expected_series(response: dict[str, Any], case: dict[str, Any]) 
         if all(any(value in payload for value in group) for group in wanted):
             return True
     return False
+
+
+def _require_jsonl(path: Path, what: str) -> list[dict[str, Any]]:
+    """Read a JSONL input, refusing to continue when it is missing or empty.
+
+    A missing manifest previously produced `cases_written: 0` -- indistinguishable
+    from a completed run, so a typo in a path reads as success.
+    """
+    if not path.exists():
+        raise SystemExit(f"{what} not found: {path}")
+    rows = _jsonl_read(path)
+    if not rows:
+        raise SystemExit(f"{what} is empty: {path}")
+    return rows
 
 
 def grade_results(
