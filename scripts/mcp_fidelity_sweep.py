@@ -80,7 +80,18 @@ DEFAULT_FLOW = "UNICEF/GLOBAL_DATAFLOW/1.0"
 DEFAULT_START = 2015
 DEFAULT_END = 2024
 ANNUAL = re.compile(r"\d{4}")
-ISO3 = re.compile(r"[A-Z]{3}")
+
+# Default area shape. ISO3 works for registries whose geography codelist mixes
+# countries with differently-shaped aggregates -- UNICEF's CL_COUNTRY holds 235
+# ISO3 countries alongside 224 aggregates like FAO_GLOBAL and UNDEV_002, so the
+# shape separates them.
+#
+# It does NOT generalise. Under M49 both are three-digit numeric: 004 is
+# Afghanistan, 001 is World, 002 is Africa. No pattern can tell them apart, so
+# an M49 registry must select areas by membership instead -- a countries-only
+# codelist via --area-codelist, or an explicit --area-list. See AREA SELECTION
+# in the module docstring.
+DEFAULT_AREA_PATTERN = r"[A-Z]{3}"
 
 # Time dimensions are the observation axis, not part of the series key.
 TIME_DIMS = {"TIME_PERIOD", "TIME"}
@@ -96,6 +107,24 @@ class Scope:
     end: int = DEFAULT_END
     countries_only: bool = True
     annual_only: bool = True
+    area_pattern: str = DEFAULT_AREA_PATTERN
+    area_dim: str = "REF_AREA"
+
+    def area_ok(self, area: str, known: set[str]) -> bool:
+        """Whether an area code belongs in a country-level sweep.
+
+        Membership in `known` is the authoritative test; the pattern is an
+        extra filter for registries that mix aggregates into one codelist.
+        An empty pattern disables the shape check and relies on membership
+        alone, which is what M49 registries need.
+        """
+        if not self.countries_only:
+            return True
+        if known and area not in known:
+            return False
+        if not self.area_pattern:
+            return True
+        return bool(re.fullmatch(self.area_pattern, area))
 
 
 def _sdmx_base() -> str:
@@ -140,7 +169,7 @@ def fetch_ground_truth(scope: Scope, cache: Path, refresh: bool) -> Path:
     return cache
 
 
-def load_country_codes(codelist: str = "UNICEF/CL_COUNTRY/latest") -> set[str]:
+def load_country_codes(codelist: str = "UNICEF/CL_COUNTRY/latest", min_codes: int = 200) -> set[str]:
     """Fetch the country codelist.
 
     The path must stay slash-separated. The comma form the data endpoint uses
@@ -152,11 +181,30 @@ def load_country_codes(codelist: str = "UNICEF/CL_COUNTRY/latest") -> set[str]:
     response = httpx.get(url, timeout=120.0)
     response.raise_for_status()
     codes = {c["id"] for c in response.json()["data"]["codelists"][0]["codes"]}
-    if len(codes) < 200:
+    if len(codes) < min_codes:
         raise SystemExit(
-            f"Country codelist looks truncated ({len(codes)} codes from {url}). "
-            "Refusing to run: the area filter would silently drop real data."
+            f"Area codelist looks truncated ({len(codes)} codes from {url}, "
+            f"expected at least {min_codes}). Refusing to run: the area filter "
+            "would silently drop real data. Lower --min-area-codes if the "
+            "registry genuinely has fewer."
         )
+    return codes
+
+
+def load_area_list(path: str) -> set[str]:
+    """Read an explicit area allowlist, one code per line.
+
+    The escape hatch for registries where no pattern separates countries from
+    aggregates -- M49 being the common case, where 004 is Afghanistan and 002
+    is Africa. Blank lines and # comments are ignored.
+    """
+    codes: set[str] = set()
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        code = line.split("#", 1)[0].strip()
+        if code:
+            codes.add(code)
+    if not codes:
+        raise SystemExit(f"Area list {path} contains no codes.")
     return codes
 
 
@@ -180,9 +228,7 @@ def index_ground_truth(
         for row in csv.DictReader(handle):
             area = row.get("REF_AREA", "")
             period = row.get("TIME_PERIOD", "")
-            if scope.countries_only and (
-                not ISO3.fullmatch(area) or area not in countries
-            ):
+            if not scope.area_ok(area, countries):
                 skipped_area += 1
                 continue
             if scope.annual_only and not ANNUAL.fullmatch(period):
@@ -457,7 +503,7 @@ async def compare_indicator_bulk(
     for row in csv.DictReader(io.StringIO(body)):
         area = row.get("REF_AREA", "")
         period = row.get("TIME_PERIOD", "")
-        if scope.countries_only and (not ISO3.fullmatch(area) or area not in countries):
+        if not scope.area_ok(area, countries):
             continue
         if scope.annual_only and not ANNUAL.fullmatch(period):
             continue
@@ -590,12 +636,20 @@ async def run(args: argparse.Namespace) -> int:
         start=args.start,
         end=args.end,
         countries_only=not args.include_aggregates,
+        area_pattern=args.area_pattern,
+        area_dim=args.area_dim,
         annual_only=not args.include_subannual,
     )
 
     cache = Path(args.cache)
     fetch_ground_truth(scope, cache, args.refresh)
-    countries = load_country_codes() if scope.countries_only else set()
+    if not scope.countries_only:
+        countries: set[str] = set()
+    elif args.area_list:
+        countries = load_area_list(args.area_list)
+        print(f"[areas] {len(countries):,} codes from {args.area_list}")
+    else:
+        countries = load_country_codes(args.area_codelist, args.min_area_codes)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -758,6 +812,23 @@ def main() -> int:
         help="max MCP calls per second; the registry throttles above this",
     )
     parser.add_argument("--include-aggregates", action="store_true")
+    area_group = parser.add_argument_group(
+        "area selection",
+        "Defaults suit a registry whose geography codelist mixes ISO3 countries "
+        "with differently-shaped aggregates. M49 registries need --area-list or "
+        "a countries-only --area-codelist; see AREA SELECTION in --help header.",
+    )
+    area_group.add_argument("--area-codelist", default="UNICEF/CL_COUNTRY/latest")
+    area_group.add_argument(
+        "--area-pattern", default=DEFAULT_AREA_PATTERN,
+        help="regex an area code must match; empty string disables the shape check",
+    )
+    area_group.add_argument(
+        "--area-list", default="",
+        help="file of area codes, one per line; authoritative, replaces the codelist",
+    )
+    area_group.add_argument("--area-dim", default="REF_AREA")
+    area_group.add_argument("--min-area-codes", type=int, default=200)
     parser.add_argument("--include-subannual", action="store_true")
     args = parser.parse_args()
     return asyncio.run(run(args))
