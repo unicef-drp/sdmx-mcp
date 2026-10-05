@@ -15,6 +15,9 @@ This project lets an LLM client do a full guided data journey:
 - `server.py`: MCP tools and SDMX integration logic.
 - `query_dimension_policy.example.json`: example subject/location/time query-dimension policy.
 - `discovery_policy.example.json`: example discovery ranking policy for stopwords and topic-to-flow hints.
+- `scripts/mcp_fidelity_sweep.py`: exhaustive MCP-vs-API comparison. No LLM; proves the pipe is faithful.
+- `scripts/make_area_list.py`: builds an area allowlist from a registry codelist, for registries where no pattern separates countries from aggregates (M49).
+- `scripts/sdmx_eval_build_cases_from_sweep.py`: stratified agent-eval cases drawn from the sweep's verified ground truth.
 - `scripts/agent_test_rig.py`: direct tool-call harness that simulates an agent workflow.
 - `scripts/sdmx_eval_runner.py`: generic SDMX eval harness for case generation, provider execution, and grading.
 - `scripts/sdmx_eval_config.example.json`: example config for deterministic case generation and provider runs.
@@ -123,6 +126,32 @@ Configuration is split into two policy files:
 
 This separation is intentional. A registry owner can configure the SDMX semantics independently from search/ranking heuristics.
 The generic `main` branch includes `.example.json` versions only. Active policy files should be provided by downstream branches or deployment environment variables.
+
+### Scope and payload environment variables
+
+| variable | default | effect |
+|---|---|---|
+| `SDMX_ENFORCE_SCOPE` | `false` | Reject an out-of-scope `flowRef` server-side rather than merely discouraging it in a prompt. Enforced at every data and metadata entry point, so it cannot be bypassed by skipping discovery. |
+| `SDMX_DATAFLOW_ID_ALLOW_REGEX` | unset | Restrict the server to matching flows, e.g. `^GLOBAL_DATAFLOW$`. |
+| `SDMX_INDICATOR_FLOW_LIMIT` | `3` | Flows listed per candidate by `find_indicator_candidates`. `0` disables trimming. |
+
+Pinning an eval deployment to a single flow is the clearest use of the first two. Scoped to `GLOBAL_DATAFLOW`, one `find_indicator_candidates` call returns ~1,300 tokens instead of ~16,000, recommends the right flow, and an agent cannot wander into a flow that lacks the data.
+
+`SDMX_INDICATOR_FLOW_LIMIT` exists because these flows share one `INDICATOR` codelist, so **codelist membership matches every indicator against every flow**. The untrimmed `dataflows` array came back byte-identical for all candidates and made up 95% of a 57KB payload. The trimmed response adds `dataflowsTotal` and a note that membership is not evidence the flow holds data — prefer `recommendedFlowRef`.
+
+This is a payload-shape issue, not a metadata gap. Only 4 of ~42 UNICEF flows declare an `INDICATOR` content constraint, so better upstream metadata would make the list *accurate*; it would not stop it being emitted once per candidate.
+
+### Upstream failures vs absent data
+
+A throttled registry and a flow with no matching observations are different answers, and callers can tell them apart:
+
+| upstream | `status` | `retryable` |
+|---|---|---|
+| 429 | `rate_limited` | `true` |
+| 5xx, 408, 425 | `upstream_unavailable` | `true` |
+| 404, 400, other | `unresolved_from_official_flows` | `false` |
+
+Retryable responses carry `httpStatus` and a message that explicitly denies absence of data, so an agent reports "could not complete, retry" rather than "no data exists". Sustained request streams against a public registry will hit 429 — pace them.
 
 ### Query Dimension Policy
 
@@ -352,6 +381,7 @@ Time inputs accepted by the query policy can be:
 - Returns: structured source-bound status with `status`, `sourceScope`, `provenance`, optional `error`, and `assistant_guidance`.
 
 23. `query_data(flowRef, key=None, startPeriod=None, endPeriod=None, format='csv', labels='name', maxObs=50000, filters=None, lastNObservations=None, resultShape=None)`
+- `labels='both'` returns code and label together in SDMX CSV, which reads well in demos.
 - Purpose: run data query with bounded extraction guardrails.
 - Key behaviors:
   - defaults to `lastNObservations=1` when no explicit `startPeriod` and `endPeriod` are provided and `SDMX_DEFAULT_LAST_N_OBSERVATIONS=true`
@@ -396,6 +426,105 @@ Time inputs accepted by the query policy can be:
 #### DSD-driven label resolution
 
 All three compact tools resolve codes to human-readable labels from the flow's DSD rather than relying on the SDMX endpoint's `labels=name` parameter. This works correctly when components such as `UNIT_MEASURE` live in `attributeList` rather than `dimensionList`, applies the same resolution logic to every coded component, and falls back to the raw code string on any resolution failure (never `null`). Codelists are discovered from the DSD structure — no codelist IDs are hardcoded.
+
+## Fidelity Sweep
+
+`scripts/mcp_fidelity_sweep.py` answers one question exhaustively: **does the MCP return what a direct SDMX API call returns?**
+
+It deliberately does not call an LLM. That question is a property of deterministic software, and a model in the loop can only add false failures (it picks the wrong indicator) and false passes (it is right while the MCP drops a dimension). Agent capability is a separate, sampled experiment — see [Agent Eval](#agent-eval).
+
+Ground truth is one bulk CSV per flow, so the API side costs about one request rather than one per observation.
+
+```bash
+# full sweep, ~3 minutes
+python3 scripts/mcp_fidelity_sweep.py --rate 2
+
+# exercise the compact projection instead of the raw data path
+python3 scripts/mcp_fidelity_sweep.py --mode series --limit 2000 --rate 2 --resume
+```
+
+Two modes, because call count is the binding constraint — the registry throttles hard:
+
+| mode | calls | covers |
+|---|---|---|
+| `bulk` (default) | ~350 | raw data path, one `query_data` per indicator |
+| `series` | ~79,000 | the compact projection `get_time_series` applies |
+
+Output is a CSV with one row per observation: the flow's dimensions, year, `mcp_value`, `api_value`, both units, and a verdict of `match` / `MISMATCH` / `MISSING_IN_MCP` / `EXTRA_IN_MCP` / `ERROR`. Exit code is 1 on any mismatch, so CI can gate on it. `--resume` checkpoints.
+
+Result against UNICEF's `GLOBAL_DATAFLOW` for countries, annual 2015–2024: **466,360 / 466,360 observations match (100.0000%)** across 350 indicators and 235 countries.
+
+### Area selection
+
+A country-level sweep must exclude regional aggregates, and **no rule does that reliably across registries**:
+
+| rule | against UNICEF `CL_COUNTRY` (459 codes, 235 countries) |
+|---|---|
+| ISO3 shape (default) | exact here. Useless under **M49**, where `004` is Afghanistan and `002` is Africa |
+| leaf of hierarchy | wrong here — 441 of 459 are leaves, the hierarchy being only 18 parents deep |
+| has a parent | inverted between registries: here aggregates carry parents, under M49 countries do |
+
+Membership is authoritative; the pattern is an optional extra filter.
+
+```bash
+# M49: select by membership, disable the shape check
+--area-codelist AGENCY/CL_COUNTRY_ONLY/latest --area-pattern ''
+--area-list m49_countries.txt --area-pattern ''
+```
+
+`scripts/make_area_list.py` builds such a list from any registry's codelist and prints what it selected versus dropped — check both columns, because the failure is silent. An aggregate in the selected column inflates a country-level claim; a country in the dropped column disappears from it.
+
+```bash
+python3 scripts/make_area_list.py --codelist UNICEF/CL_COUNTRY/latest \
+    --pattern '[A-Z]{3}' --out areas.txt
+```
+
+## Agent Eval
+
+Where the fidelity sweep tests the pipe, this tests whether an agent can *use* it — find the right indicator among hundreds, pick the right disaggregation, and decline when the data is absent.
+
+`scripts/sdmx_eval_build_cases_from_sweep.py` builds a stratified manifest from the sweep's verified ground truth, so the answer key needs no extra registry traffic. Each case carries `promptStyle`, and the grade should be read per stratum — blending them hides both halves.
+
+| style | tests |
+|---|---|
+| `prescriptive` | codes supplied — a baseline, not a capability measure |
+| `natural` | indicator and country by name, agent resolves the codes |
+| `ambiguous` | colloquial phrasing with one defensible answer |
+| `disaggregated` | a sex-specific slice where picking the total is wrong |
+| `negative` | a cell with no data — the agent must abstain |
+
+```bash
+python3 scripts/sdmx_eval_build_cases_from_sweep.py \
+  --ground-truth tmp/fidelity/ground_truth.csv \
+  --manifest tmp/sdmx_eval/cases.jsonl --count 500
+
+python3 scripts/sdmx_eval_runner.py run-provider \
+  --config "$CONFIG" --manifest tmp/sdmx_eval/cases.jsonl \
+  --responses tmp/sdmx_eval/responses.jsonl --retry-failed
+
+python3 scripts/sdmx_eval_runner.py grade-results \
+  --config "$CONFIG" --manifest tmp/sdmx_eval/cases.jsonl \
+  --responses tmp/sdmx_eval/responses.jsonl --grades tmp/sdmx_eval/grades.jsonl
+```
+
+`--retry-failed` re-runs only errored cases, dropping the stale records first. Without it an errored case counts as done, so one transient 429 poisons it until the file is deleted by hand.
+
+**Grading scores retrieval, not reporting style.** A filter matches on code or label (`San Marino` and `SMR` both pass), an omitted dimension is unknown rather than wrong, and rounding sets a `notes` field instead of failing. A `trace_match` check confirms the agent actually queried the expected series — a right number reached some other way is not a pass, and a negative case must have looked before abstaining.
+
+**`--hints` is registry-specific and cannot be defaulted.** It maps a colloquial phrase to the single code it should resolve to. A phrase matching several indicators tests whether the agent guesses the same one you did, which manufactures failures — map only phrases with one defensible answer, or omit the file to skip the stratum.
+
+### Registry portability
+
+Nothing in either rig is UNICEF-specific; the defaults just name the registry they were written against.
+
+```bash
+python3 scripts/sdmx_eval_build_cases_from_sweep.py \
+    --flow AGENCY/SOME_FLOW/1.0 \
+    --area-dim REF_AREA --indicator-dim INDICATOR \
+    --area-codelist AGENCY/CL_AREA/latest \
+    --indicator-codelist AGENCY/CL_INDICATOR/latest \
+    --hints my_registry_hints.json
+```
 
 ## Agent Test Rig
 
@@ -616,9 +745,3 @@ Recommended discovery sequence:
 4. Data query 404 with SDMX message `No data for data query against the dataflow`
 - Query syntax is valid but the selected dimensional slice has no observations.
 - Use `find_indicator_candidates` and inspect the returned candidate flows, or configure stronger `flow_topic_hints` in `discovery_policy.json`.
-
-## Latest Robustness Updates
-
-- Unspecified dimensions are now kept as empty SDMX key segments (`.` wildcard) instead of being auto-filled.
-- `query_data` supports optional `labels` for SDMX CSV output (`labels=both` works well for readable demos).
-- Guided discovery can use configurable fallback topic hints from `discovery_policy.json`.
