@@ -9,7 +9,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -191,12 +191,39 @@ def _jsonl_read(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _jsonl_case_ids(path: Path) -> set[str]:
-    return {
-        str(item["case_id"])
-        for item in _jsonl_read(path)
-        if isinstance(item.get("case_id"), str) and item.get("case_id")
-    }
+def _jsonl_case_ids(path: Path, *, only_successful: bool = False) -> set[str]:
+    """Case ids already present in a responses file.
+
+    With only_successful, errored records are excluded so they can be retried.
+    Treating a failure as done means one transient 429 poisons that case until
+    somebody deletes the file by hand -- and on a 500-case run that is routine,
+    not exceptional.
+    """
+    ids: set[str] = set()
+    for item in _jsonl_read(path):
+        case_id = item.get("case_id")
+        if not isinstance(case_id, str) or not case_id:
+            continue
+        if only_successful and str(item.get("status") or "") != "ok":
+            continue
+        ids.add(str(case_id))
+    return ids
+
+
+def _drop_failed_responses(path: Path) -> int:
+    """Rewrite a responses file keeping only successful records.
+
+    Without this, a retried case appends a second record for the same id and
+    grade-results reads whichever it happens to hit first.
+    """
+    rows = _jsonl_read(path)
+    keep = [r for r in rows if str(r.get("status") or "") == "ok"]
+    dropped = len(rows) - len(keep)
+    if dropped:
+        with path.open("w", encoding="utf-8") as handle:
+            for row in keep:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return dropped
 
 
 def _csv_rows(text: str) -> list[dict[str, Any]]:
@@ -919,6 +946,7 @@ async def run_provider(
     manifest_path: Path,
     responses_path: Path,
     case_limit: int | None = None,
+    retry_failed: bool = False,
 ) -> dict[str, Any]:
     _apply_registry_overrides(config)
     provider = config.get("provider")
@@ -938,8 +966,20 @@ async def run_provider(
             if isinstance(key, str) and isinstance(value, str):
                 base_env[key] = value
 
+    if not manifest_path.exists():
+        raise SystemExit(
+            f"Manifest not found: {manifest_path}\n"
+            "Build it first, e.g.\n"
+            "  python3 scripts/sdmx_eval_build_cases_from_sweep.py "
+            f"--manifest {manifest_path} --count 500"
+        )
     manifest_rows = _jsonl_read(manifest_path)
-    completed = _jsonl_case_ids(responses_path)
+    if not manifest_rows:
+        raise SystemExit(f"Manifest is empty: {manifest_path}. Nothing to run.")
+    retried = 0
+    if retry_failed and responses_path.exists():
+        retried = _drop_failed_responses(responses_path)
+    completed = _jsonl_case_ids(responses_path, only_successful=retry_failed)
     pending = [row for row in manifest_rows if row.get("case_id") not in completed]
     if case_limit is not None:
         pending = pending[:case_limit]
@@ -977,11 +1017,135 @@ async def run_provider(
             }
             handle.write(json.dumps(result, ensure_ascii=True) + "\n")
             written += 1
+    ok_count = len(_jsonl_case_ids(responses_path, only_successful=True))
     return {
         "provider_name": provider_name,
         "cases_written": written,
+        "cases_pending": len(pending),
+        "failed_retried": retried,
+        # Surfaced so a fully-failed run cannot read as "nothing to do".
+        "cases_succeeded_total": ok_count,
         "responses_path": str(responses_path),
     }
+
+
+def _rounding_note(expected: Any, actual: Any) -> str | None:
+    """Describe a value that is the expected one rounded, else None.
+
+    An agent answering 96.21 for 96.20888714071654 read the right cell and
+    reported it to two decimals. Counting that as a wrong answer measures
+    formatting, not retrieval -- so it is surfaced as a note and the value is
+    treated as matching. A genuinely different number is still a mismatch.
+    """
+    try:
+        expected_dec = Decimal(str(expected).strip())
+        actual_str = str(actual).strip()
+        actual_dec = Decimal(actual_str)
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        return None
+    if expected_dec == actual_dec:
+        return None
+    exponent = actual_dec.as_tuple().exponent
+    if not isinstance(exponent, int):
+        return None
+    places = max(-exponent, 0)
+    if places > 12:
+        return None
+    if expected_dec.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP) == actual_dec:
+        return f"rounded to {places} dp (expected {expected_dec}, reported {actual_dec})"
+    return None
+
+
+def _filter_claim_matches(
+    claim_filters: dict[str, Any],
+    key: str,
+    expected_code: Any,
+    case_dimensions: dict[str, Any],
+) -> bool | None:
+    """Compare one reported filter to the expected code.
+
+    A natural-language prompt never asks the agent to echo SDMX codes, so it
+    reasonably reports REF_AREA as "San Marino" rather than "SMR", or SEX as
+    "Total" rather than "_T" -- and omits a dimension it never filtered on.
+    Scoring those as wrong failed 12 of 14 natural-language cases whose values
+    were all exactly right, which measures reporting style, not capability.
+
+    Returns True on a code or label match, None when the dimension was not
+    reported at all (unknown, not wrong), and False only on a real conflict --
+    the agent naming a different code or place than the one asked for.
+    """
+    if key not in claim_filters:
+        return None
+    claimed = str(claim_filters.get(key, "")).strip()
+    if not claimed:
+        return None
+    expected = str(expected_code).strip()
+    if claimed.casefold() == expected.casefold():
+        return True
+    label = ""
+    entry = case_dimensions.get(key)
+    if isinstance(entry, dict):
+        label = str(entry.get("name") or "").strip()
+    if label and claimed.casefold() == label.casefold():
+        return True
+    return False
+
+
+def _trace_hits_expected_series(response: dict[str, Any], case: dict[str, Any]) -> bool | None:
+    """Whether some MCP call in the trace targeted the expected series.
+
+    Grading only the reported value cannot distinguish a correct lookup from a
+    right number reached another way. This checks the agent actually asked for
+    the indicator and reference area under test.
+
+    Each dimension is satisfied by its code OR its label: the compact tools take
+    natural-language `subject`/`location`, so an agent legitimately sends
+    location="Costa Rica" and the code CRI never appears. Requiring the code
+    marked 14 of 40 correct lookups as misses.
+
+    None when there is no usable trace -- absence of evidence, not a failure.
+    """
+    provider_output = response.get("provider_output")
+    trace = (provider_output or {}).get("tool_trace") if isinstance(provider_output, dict) else None
+    if not isinstance(trace, list) or not trace:
+        return None
+
+    dimensions = case.get("dimensions") or {}
+    wanted: list[set[str]] = []
+    for key, code in (case.get("filters") or {}).items():
+        if str(key).upper() not in {"INDICATOR", "REF_AREA"}:
+            continue
+        accepted = {str(code).strip().casefold()}
+        entry = dimensions.get(key)
+        if isinstance(entry, dict):
+            label = str(entry.get("name") or "").strip().casefold()
+            if label:
+                accepted.add(label)
+        wanted.append({value for value in accepted if value})
+    if not wanted:
+        return None
+
+    for block in trace:
+        if not isinstance(block, dict) or block.get("type") != "mcp_tool_use":
+            continue
+        payload = json.dumps(block.get("input") or {}).casefold()
+        if all(any(value in payload for value in group) for group in wanted):
+            return True
+    return False
+
+
+def _require_jsonl(path: Path, what: str) -> list[dict[str, Any]]:
+    """Read a JSONL input, refusing to continue when it is missing or empty.
+
+    A missing manifest previously produced `cases_written: 0` -- indistinguishable
+    from a completed run, so a typo in a path reads as success.
+    """
+    if not path.exists():
+        raise SystemExit(f"{what} not found: {path}")
+    rows = _jsonl_read(path)
+    if not rows:
+        raise SystemExit(f"{what} is empty: {path}")
+    return rows
 
 
 def grade_results(
@@ -1042,6 +1206,13 @@ def grade_results(
                 if actual_value is not None:
                     value_match = str(expected_value).strip() == str(actual_value).strip()
 
+            # Rounding is a reporting choice, not a retrieval error.
+            rounding_note = None
+            if value_match is not True and expected_value is not None:
+                rounding_note = _rounding_note(expected_value, claims.get("value"))
+                if rounding_note:
+                    value_match = True
+
             time_match = None
             if claims.get("time_period") is not None:
                 time_match = str(claims.get("time_period")).strip() == str(expected_time_period).strip()
@@ -1050,11 +1221,19 @@ def grade_results(
             if claims.get("flowRef") is not None:
                 flow_match = str(claims.get("flowRef")).strip() == str(case.get("flowRef")).strip()
 
-            filter_matches: dict[str, bool] = {}
+            filter_matches: dict[str, bool | None] = {}
             claim_filters = claims.get("filters")
             if isinstance(claim_filters, dict):
+                case_dimensions = case.get("dimensions") or {}
                 for key, expected_filter in dict(case.get("filters") or {}).items():
-                    filter_matches[str(key)] = str(claim_filters.get(key, "")).strip() == str(expected_filter).strip()
+                    filter_matches[str(key)] = _filter_claim_matches(
+                        claim_filters, str(key), expected_filter, case_dimensions
+                    )
+
+            # Did the agent actually query the series it reported? A value check
+            # alone cannot tell a correct lookup from a number that arrived some
+            # other way.
+            trace_match = _trace_hits_expected_series(response, case)
 
             expected_status = expected.get("status") if isinstance(expected, dict) else None
             case_type = str(case.get("caseType") or "positive")
@@ -1069,15 +1248,28 @@ def grade_results(
                 overall = "fail"
             elif case_type == "negative" and expected_behavior == "abstain_no_data":
                 claim_value = claims.get("value")
-                if claim_value in (None, ""):
+                # Abstaining is only correct if the agent actually looked.
+                if claim_value in (None, "") and trace_match is not False:
                     overall = "pass"
                 else:
                     overall = "fail"
             elif expected_status != "deterministic":
                 overall = "manual_review"
-            elif value_match is True and (time_match in (True, None)) and (flow_match in (True, None)) and all(filter_matches.values()):
+            elif (
+                value_match is True
+                and (time_match in (True, None))
+                and (flow_match in (True, None))
+                and trace_match is not False
+                and all(v is not False for v in filter_matches.values())
+            ):
                 overall = "pass"
-            elif value_match is False or time_match is False or flow_match is False or any(not item for item in filter_matches.values()):
+            elif (
+                value_match is False
+                or time_match is False
+                or flow_match is False
+                or trace_match is False
+                or any(item is False for item in filter_matches.values())
+            ):
                 overall = "fail"
             else:
                 overall = "manual_review"
@@ -1093,6 +1285,7 @@ def grade_results(
                 "case_id": case_id,
                 "provider_name": response.get("provider_name"),
                 "overall": overall,
+                "notes": rounding_note,
                 "checks": {
                     "tool_use_match": tool_use_match,
                     "required_tool_match": required_tool_match,
@@ -1101,6 +1294,7 @@ def grade_results(
                     "time_match": time_match,
                     "flow_match": flow_match,
                     "filter_matches": filter_matches,
+                    "trace_match": trace_match,
                 },
                 "expected": {
                     "caseType": case_type,
@@ -1142,7 +1336,10 @@ async def _async_main(args: argparse.Namespace) -> None:
         return
 
     if args.command == "run-provider":
-        result = await run_provider(config, manifest_path, responses_path, case_limit=args.case_limit)
+        result = await run_provider(
+            config, manifest_path, responses_path,
+            case_limit=args.case_limit, retry_failed=args.retry_failed,
+        )
         print(json.dumps(result, indent=2))
         return
 
@@ -1157,6 +1354,13 @@ async def _async_main(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generic SDMX eval harness for case generation, provider runs, and grading.")
     parser.add_argument("command", choices=["build-cases", "run-provider", "grade-results"])
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Re-run cases whose previous response errored, instead of treating "
+             "them as done. Errored records are dropped first so grade-results "
+             "cannot read a stale failure for a case that later succeeded.",
+    )
     parser.add_argument("--config", type=Path, required=True, help="Path to the eval config JSON file.")
     parser.add_argument("--manifest", type=Path, default=None, help="Manifest JSONL path.")
     parser.add_argument("--responses", type=Path, default=None, help="Provider responses JSONL path.")
