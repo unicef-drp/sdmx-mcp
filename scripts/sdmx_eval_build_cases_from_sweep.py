@@ -118,17 +118,28 @@ ANSWER_CONTRACT = (
 # colloquial phrasings a domain expert would use, mapped to the one code each
 # should resolve to. Ship your own; an empty map simply skips the stratum.
 AMBIGUOUS_HINTS: dict[str, str] = {
-    "CME_MRY0T4": "child mortality before age five",
-    "CME_MRM0": "newborn deaths in the first month of life",
-    "CME_MRY0": "deaths among infants under one year old",
+    # Each phrase must have exactly one defensible answer -- see the sibling
+    # check in validate_hints(), which is enforced, not advisory.
+    #
+    # The first version of this map said "newborn deaths" for CME_MRM0. That is
+    # the neonatal mortality RATE; "newborn deaths" plainly denotes a count,
+    # which is CME_TMM0. The agent read the English correctly and was marked
+    # wrong 10 times for it. Every mortality phrase now says "rate" explicitly,
+    # because every CME_MR* code has a CME_TM* count twin.
+    "CME_MRY0T4": "the under-five mortality rate",
+    "CME_MRM0": "the neonatal mortality rate",
+    "CME_MRY0": "the infant mortality rate",
     "IM_DTP3": "DTP3 immunisation coverage",
-    "NT_ANT_HAZ_NE2": "child stunting",
-    "NT_ANT_WHZ_NE2": "child wasting",
     "DM_POP_TOT": "the total population",
     "DM_LIFE_EXP": "life expectancy at birth",
     "MNCH_SAB": "births attended by skilled health personnel",
     "WS_PPL_W-SM": "safely managed drinking water access",
     "WS_PPL_S-SM": "safely managed sanitation access",
+    # Stunting and wasting are deliberately absent. NT_ANT_HAZ_NE2 has four
+    # siblings (_MOD modelled estimates, _MOD_NUMTH, _ONLY, _T_NE3) and no
+    # natural phrasing separates them, so "child stunting" tests whether the
+    # agent guesses the same variant we did. Fewer defensible hints beat more
+    # hints that manufacture failures.
 }
 
 
@@ -207,6 +218,50 @@ def load_observations(
             key = (area, row.get(reg.indicator_dim, ""), row.get("SEX", "") or "_T")
             obs[key][period] = row.get("OBS_VALUE", "")
     return obs
+
+
+def validate_hints(hints: dict[str, str], names: dict[str, str]) -> list[str]:
+    """Reject hint phrases that cannot distinguish their code from a sibling.
+
+    An ambiguous case is only fair when a competent analyst lands on one
+    specific series. Two sibling shapes break that and both have bitten: a
+    rate/count twin (CME_MRM0 "Neonatal mortality rate" vs CME_TMM0 "Neonatal
+    deaths") and a suffixed variant (NT_ANT_HAZ_NE2 vs NT_ANT_HAZ_NE2_MOD
+    "Modeled Estimates").
+
+    Having a sibling is not itself disqualifying -- "the neonatal mortality
+    rate" separates MRM0 from TMM0 perfectly well. What disqualifies a hint is
+    a phrase carrying no word that is in its own code's name and absent from
+    the sibling's, because then nothing in the wording picks between them. That
+    is the case for NT_ANT_HAZ_NE2, whose _MOD sibling's name is a superset.
+
+    Returns warnings; the caller drops those hints rather than generating cases
+    that grade a coin flip.
+    """
+    warnings: list[str] = []
+    for code in sorted(hints):
+        phrase_words = set(re.findall(r"[a-z]+", hints[code].lower()))
+        own_words = set(re.findall(r"[a-z]+", names.get(code, "").lower()))
+        siblings = [
+            other
+            for other in names
+            if other != code
+            and (
+                other.startswith(code + "_")
+                or other.replace("_TM", "_MR") == code
+                or other.replace("_MR", "_TM") == code
+            )
+        ]
+        for sibling in siblings:
+            sibling_words = set(re.findall(r"[a-z]+", names.get(sibling, "").lower()))
+            distinguishing = (own_words - sibling_words) & phrase_words
+            if not distinguishing:
+                warnings.append(
+                    f"{code} ({hints[code]!r}) cannot be distinguished from "
+                    f"{sibling} ({names.get(sibling, '')[:40]!r}) -- dropping it"
+                )
+                break
+    return warnings
 
 
 def _ambiguous_phrase(indicator: str, name: str = "") -> str | None:
@@ -331,6 +386,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     print("[names] fetching codelists")
     area_names = _codelist_names(reg.area_codelist)
     indicator_names = _codelist_names(reg.indicator_codelist)
+
+    for warning in validate_hints(AMBIGUOUS_HINTS, indicator_names):
+        print(f"[hints] WARNING {warning}")
+        AMBIGUOUS_HINTS.pop(warning.split(" ", 1)[0], None)
     names = {
         "area": area_names,
         "indicator": indicator_names,
@@ -353,6 +412,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         k for k in totals if _ambiguous_phrase(k[1], indicator_names.get(k[1], ""))
     ]
 
+    only = {s.strip() for s in args.only_style.split(",") if s.strip()}
     share = {
         "prescriptive": 0.20,
         "natural": 0.35,
@@ -422,6 +482,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             continue
         add(_case("negative", key[0], key[1], key[2], rng.choice(missing), None, names, reg))
 
+    if only:
+        cases = [c for c in cases if c["promptStyle"] in only]
     rng.shuffle(cases)
     out = Path(args.manifest)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -447,6 +509,10 @@ def main() -> int:
     parser.add_argument("--start", type=int, default=2015)
     parser.add_argument("--end", type=int, default=2024)
     parser.add_argument("--seed", type=int, default=20261005)
+    parser.add_argument(
+        "--only-style", default="",
+        help="comma-separated promptStyle values to keep, for re-running one stratum",
+    )
     reg_group = parser.add_argument_group(
         "registry portability",
         "Defaults target the UNICEF registry. Override these for any other "
