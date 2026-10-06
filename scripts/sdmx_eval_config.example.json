@@ -18,7 +18,9 @@
   },
   "negative_case_options": {
     "ratio": 0.4,
-    "strategies": ["swap_dimension_value"],
+    "strategies": [
+      "swap_dimension_value"
+    ],
     "max_attempts_per_case": 20
   },
   "dataflows": [
@@ -40,7 +42,9 @@
     {
       "id": "SEX",
       "mode": "fixed",
-      "values": ["T"]
+      "values": [
+        "T"
+      ]
     }
   ],
   "wildcard_dimensions": [],
@@ -59,6 +63,7 @@
       "python3",
       "scripts/sdmx_eval_provider_anthropic.py"
     ],
-    "env": {}
+    "env": {},
+    "system_prompt": " Report the value exactly as the MCP returned it. Do not rescale, convert units, round, or reformat it, and do not adjust a value because it looks implausible: \".2138\" is reported as .2138, never 21.38. If a value seems wrong, report it unchanged and say so."
   }
 }

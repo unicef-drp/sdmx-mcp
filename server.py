@@ -3986,6 +3986,38 @@ def _upstream_failure_kind(status_code: int | None) -> tuple[str, bool, str]:
     )
 
 
+_LEADING_DOT = re.compile(r"^([+-]?)\.(\d+)$")
+
+
+def _normalize_obs_value(value: Any) -> Any:
+    """Write a bare-decimal observation with its leading zero.
+
+    The registry serialises some values as ".2138" rather than "0.2138". That
+    is the same number, but an agent given ".213805064558983" for a sanitation
+    indicator reported 21.38 -- multiplying by 100 because 0.21% looked
+    implausible and 21.38% did not. It did the same on a second case and,
+    tellingly, not on a third where the rescaled figure would have looked odd,
+    so the behaviour is inconsistent rather than systematic. Two of roughly
+    five such values in a 500-case run were silently changed.
+
+    Asking a model not to do this is a request it can ignore. Writing the
+    number unambiguously is a rule that cannot be. Only the representation
+    changes: value, precision and sign are preserved exactly, and anything that
+    is not a bare decimal is returned untouched.
+
+    Applied to the compact tools' value fields, which is what an agent reads.
+    raw_csv stays byte-faithful to the registry, so query_data remains a
+    passthrough and the fidelity sweep still compares like with like.
+    """
+    if not isinstance(value, str):
+        return value
+    match = _LEADING_DOT.match(value.strip())
+    if not match:
+        return value
+    sign, digits = match.groups()
+    return f"{sign}0.{digits}"
+
+
 def _compact_unresolved(result: dict[str, Any], *, shape: str) -> dict[str, Any]:
     error = result.get("error") if isinstance(result.get("error"), dict) else {}
     status_code = error.get("status")
@@ -4044,7 +4076,7 @@ def _compact_single_observation(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": "resolved",
         "shape": "single_observation",
-        "value": shaped.get("value"),
+        "value": _normalize_obs_value(shaped.get("value")),
         "period": shaped.get("latestPeriod"),
         "unit": _row_unit(observation),
         "source": source,
@@ -4121,7 +4153,7 @@ def _compact_indicator_table(result: dict[str, Any], max_rows: int) -> dict[str,
             rows.append({
                 "refArea": item.get("refArea"),
                 "period": item.get("latestPeriod"),
-                "value": item_value,
+                "value": _normalize_obs_value(item_value),
                 "unit": _row_unit(first_row),
                 "rowCountAtLatestPeriod": item.get("rowCountAtLatestPeriod"),
                 **extra_dims,
@@ -4138,7 +4170,7 @@ def _compact_indicator_table(result: dict[str, Any], max_rows: int) -> dict[str,
                 rows.append({
                     "refArea": item.get("refArea"),
                     "period": obs.get(time_col) if time_col else item.get("latestPeriod"),
-                    "value": obs.get(value_col) if value_col else None,
+                    "value": _normalize_obs_value(obs.get(value_col) if value_col else None),
                     "unit": _row_unit(obs),
                     **extra_dims,
                 })
@@ -4189,7 +4221,9 @@ def _compact_time_series(result: dict[str, Any], max_observations: int) -> dict[
         series.append(
             {
                 "period": row.get(time_column) if isinstance(time_column, str) else None,
-                "value": row.get(value_column) if isinstance(value_column, str) else None,
+                "value": _normalize_obs_value(
+                    row.get(value_column) if isinstance(value_column, str) else None
+                ),
                 "unit": _row_unit(row),
             }
         )
