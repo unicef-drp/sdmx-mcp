@@ -153,6 +153,29 @@ A throttled registry and a flow with no matching observations are different answ
 
 Retryable responses carry `httpStatus` and a message that explicitly denies absence of data, so an agent reports "could not complete, retry" rather than "no data exists". Sustained request streams against a public registry will hit 429 — pace them.
 
+> [!WARNING]
+> **A model will not act on `retryable` by itself.** In testing, agents received
+> `status: "rate_limited"`, `retryable: true` and the message *"this does not mean
+> the data is absent"*, and answered `value: null` regardless — collapsing a
+> transport failure back into "no data". For a user that is the worst outcome: a
+> transient 429 surfacing as a confident "no data for Liechtenstein".
+>
+> This is not fixable server-side; the distinction is already made and correctly
+> labelled. Any client built on this MCP should do **both**:
+>
+> 1. **Retry in the client**, with backoff, before the model sees the result.
+>    `scripts/sdmx_eval_provider_anthropic.py` does this via `throttle_retries`
+>    and `throttle_backoff_seconds`. Where tool calls run inside a hosted
+>    connector the individual call cannot be retried, so reissue the request.
+> 2. **Say it in the system prompt** — never report null for a retryable status —
+>    as a second line of defence for when a retry budget is exhausted.
+>
+> Note this also affects anyone else querying the same public registry: your
+> traffic and theirs share the limit, so a quiet deployment can still be
+> throttled by someone else's bulk job.
+
+
+
 ### Query Dimension Policy
 
 The query-dimension policy defines the retrieval dimensions and their resolution order. The default policy defines:

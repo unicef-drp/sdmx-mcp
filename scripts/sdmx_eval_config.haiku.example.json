@@ -71,6 +71,6 @@
       "cache_creation_input_usd_per_million": 1.25,
       "cache_read_input_usd_per_million": 0.1
     },
-    "system_prompt": " Report the value exactly as the MCP returned it. Do not rescale, convert units, round, or reformat it, and do not adjust a value because it looks implausible: \".2138\" is reported as .2138, never 21.38. If a value seems wrong, report it unchanged and say so."
+    "system_prompt": " Report the value exactly as the MCP returned it. Do not rescale, convert units, round, or reformat it, and do not adjust a value because it looks implausible: \".2138\" is reported as .2138, never 21.38. If a value seems wrong, report it unchanged and say so. If a tool result has status \"rate_limited\" or \"upstream_unavailable\", or retryable true, the query was not answered and the data may well exist: never report a null value for it. Say the registry could not be reached and that the query should be retried."
   }
 }

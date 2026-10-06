@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any
 
 import httpx
@@ -136,6 +137,40 @@ def _extract_text(content: list[dict[str, Any]]) -> str:
             if isinstance(text, str) and text.strip():
                 parts.append(text.strip())
     return "\n".join(parts).strip()
+
+
+def _trace_was_throttled(trace: list[dict[str, Any]]) -> bool:
+    """Whether any MCP tool result reported a retryable upstream failure.
+
+    The server distinguishes a throttled registry from absent data: a 429 comes
+    back as status "rate_limited" with retryable true and a message saying the
+    query was not answered. Observed behaviour is that the model answers
+    "value: null" anyway -- it reads "this does not mean the data is absent"
+    and abstains as though the data were absent. For a caller that is the worst
+    outcome, a transient 429 surfacing as a confident "no data".
+
+    The tool call runs inside Anthropic's MCP connector, so an individual call
+    cannot be retried from here; the whole request is reissued instead.
+    """
+    for block in trace:
+        if not isinstance(block, dict) or block.get("type") != "mcp_tool_result":
+            continue
+        for item in block.get("content") or []:
+            text = item.get("text") if isinstance(item, dict) else None
+            if not isinstance(text, str):
+                continue
+            try:
+                payload = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("retryable") is True or payload.get("status") in {
+                "rate_limited",
+                "upstream_unavailable",
+            }:
+                return True
+    return False
 
 
 def _extract_tool_trace(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -306,8 +341,26 @@ def main() -> None:
         "content-type": "application/json",
     }
 
+    max_retries = int(provider.get("throttle_retries", 3))
+    backoff = float(provider.get("throttle_backoff_seconds", 5.0))
     with httpx.Client(timeout=120.0) as client:
-        response = client.post(API_URL, headers=headers, json=body)
+        for attempt in range(max_retries + 1):
+            response = client.post(API_URL, headers=headers, json=body)
+            if response.status_code >= 400:
+                break
+            peek = response.json()
+            if not _trace_was_throttled(_extract_tool_trace(peek.get("content") or [])):
+                break
+            if attempt < max_retries:
+                # Reissuing costs a full request, but a throttled run silently
+                # records "no data" for cells that have data, which is worse
+                # than paying twice.
+                print(
+                    f"[provider] registry throttled; reissuing "
+                    f"({attempt + 1}/{max_retries}) after {backoff * (2 ** attempt):.0f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(backoff * (2**attempt))
     if response.status_code >= 400:
         # raise_for_status() discards the body, which is where the API says what
         # was actually wrong -- an unknown beta, a malformed tool block, a model
