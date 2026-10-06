@@ -8,6 +8,7 @@ import json
 import math
 import os
 import sys
+import unicodedata
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -1091,19 +1092,49 @@ def _filter_claim_matches(
     return False
 
 
+# Tools that actually retrieve observations. Discovery tools take free text, so
+# a question like "life expectancy at birth" would otherwise match the expected
+# indicator's label and count as evidence the series was queried -- a tampered
+# trace whose every data call used a different code still passed on that alone.
+DATA_TOOLS = {
+    "get_single_observation",
+    "get_indicator_table",
+    "get_time_series",
+    "query_data",
+    "resolve_and_query_data",
+}
+
+
+def _fold(text: str) -> str:
+    """Casefold and strip diacritics for comparison."""
+    return (
+        unicodedata.normalize("NFKD", text)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .casefold()
+    )
+
+
 def _trace_hits_expected_series(response: dict[str, Any], case: dict[str, Any]) -> bool | None:
-    """Whether some MCP call in the trace targeted the expected series.
+    """Whether some MCP call in the trace targeted the expected indicator.
 
-    Grading only the reported value cannot distinguish a correct lookup from a
-    right number reached another way. This checks the agent actually asked for
-    the indicator and reference area under test.
+    Grading only the reported value cannot tell a correct lookup from a right
+    number arrived at some other way, so this corroborates the route.
 
-    Each dimension is satisfied by its code OR its label: the compact tools take
-    natural-language `subject`/`location`, so an agent legitimately sends
-    location="Costa Rica" and the code CRI never appears. Requiring the code
-    marked 14 of 40 correct lookups as misses.
+    The INDICATOR is the discriminating dimension and the agent must name it as
+    a code, so that is what is required. The reference area is checked only to
+    strengthen the result, never to fail it: callers legitimately write it as a
+    code, a label, an ISO2 alpha-2 ("PE" for Peru), or an exonym, and no list of
+    aliases is ever complete. Failing on area alone marked five correct lookups
+    as misses across the 500-case run.
 
-    None when there is no usable trace -- absence of evidence, not a failure.
+    Comparison is diacritic-insensitive and the payload is serialised with
+    ensure_ascii=False. The default escapes non-ASCII, so a trace containing
+    "Côte d'Ivoire" rendered as "C\\u00f4te d'Ivoire" and never matched the
+    label being searched for -- every country with an accent failed.
+
+    None when there is no usable trace: absence of evidence, not evidence of
+    absence.
     """
     provider_output = response.get("provider_output")
     trace = (provider_output or {}).get("tool_trace") if isinstance(provider_output, dict) else None
@@ -1111,41 +1142,29 @@ def _trace_hits_expected_series(response: dict[str, Any], case: dict[str, Any]) 
         return None
 
     dimensions = case.get("dimensions") or {}
-    wanted: list[set[str]] = []
+    indicator = ""
     for key, code in (case.get("filters") or {}).items():
-        if str(key).upper() not in {"INDICATOR", "REF_AREA"}:
-            continue
-        accepted = {str(code).strip().casefold()}
-        entry = dimensions.get(key)
-        if isinstance(entry, dict):
-            label = str(entry.get("name") or "").strip().casefold()
-            if label:
-                accepted.add(label)
-        wanted.append({value for value in accepted if value})
-    if not wanted:
+        if str(key).upper() == "INDICATOR":
+            indicator = str(code).strip()
+    if not indicator:
         return None
+
+    accepted = {_fold(indicator)}
+    entry = dimensions.get("INDICATOR")
+    if isinstance(entry, dict):
+        label = str(entry.get("name") or "").strip()
+        if label:
+            accepted.add(_fold(label))
 
     for block in trace:
         if not isinstance(block, dict) or block.get("type") != "mcp_tool_use":
             continue
-        payload = json.dumps(block.get("input") or {}).casefold()
-        if all(any(value in payload for value in group) for group in wanted):
+        if str(block.get("name") or "") not in DATA_TOOLS:
+            continue
+        payload = _fold(json.dumps(block.get("input") or {}, ensure_ascii=False))
+        if any(value and value in payload for value in accepted):
             return True
     return False
-
-
-def _require_jsonl(path: Path, what: str) -> list[dict[str, Any]]:
-    """Read a JSONL input, refusing to continue when it is missing or empty.
-
-    A missing manifest previously produced `cases_written: 0` -- indistinguishable
-    from a completed run, so a typo in a path reads as success.
-    """
-    if not path.exists():
-        raise SystemExit(f"{what} not found: {path}")
-    rows = _jsonl_read(path)
-    if not rows:
-        raise SystemExit(f"{what} is empty: {path}")
-    return rows
 
 
 def grade_results(
