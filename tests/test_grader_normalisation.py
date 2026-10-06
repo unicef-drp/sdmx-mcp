@@ -70,7 +70,12 @@ class TestRoundingNote(unittest.TestCase):
 
 class TestTraceHitsExpectedSeries(unittest.TestCase):
     def _response(self, payload: dict) -> dict:
-        return {"provider_output": {"tool_trace": [{"type": "mcp_tool_use", "name": "t", "input": payload}]}}
+        # Must be a data-retrieving tool: discovery calls take free text and
+        # would otherwise let a question mentioning the indicator count as a
+        # query for it.
+        return {"provider_output": {"tool_trace": [
+            {"type": "mcp_tool_use", "name": "get_single_observation", "input": payload}
+        ]}}
 
     def _case(self) -> dict:
         return {"filters": {"REF_AREA": "SMR", "INDICATOR": "DM_DPR_OLD", "SEX": "_T"}, "dimensions": DIMS}
@@ -84,11 +89,15 @@ class TestTraceHitsExpectedSeries(unittest.TestCase):
         r = self._response({"location": "San Marino", "subject": "Old-age dependency ratio"})
         self.assertIs(runner._trace_hits_expected_series(r, self._case()), True)
 
-    def test_wrong_place_does_not_match(self) -> None:
+    def test_wrong_place_still_counts_when_the_indicator_is_right(self) -> None:
+        """The area is corroborating only -- it is written as a code, a label,
+        an ISO2 alias or an exonym, and no alias list is complete. Failing on
+        it alone marked five correct lookups as misses."""
         r = self._response({"location": "Italy", "subject": "DM_DPR_OLD"})
-        self.assertIs(runner._trace_hits_expected_series(r, self._case()), False)
+        self.assertIs(runner._trace_hits_expected_series(r, self._case()), True)
 
     def test_missing_indicator_does_not_match(self) -> None:
+        """The indicator is the discriminating dimension and is required."""
         r = self._response({"location": "San Marino"})
         self.assertIs(runner._trace_hits_expected_series(r, self._case()), False)
 
@@ -98,3 +107,60 @@ class TestTraceHitsExpectedSeries(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTraceMatchRobustness(unittest.TestCase):
+    """Route verification must survive accents and aliases without going blind.
+
+    Five correct lookups in the 500-case run were graded as misses because
+    json.dumps escapes non-ASCII by default: a trace holding "Côte d'Ivoire"
+    serialised as "C\\u00f4te d'Ivoire" and never matched the label. A sixth
+    used ISO2 "PE" for Peru, which no alias list would have covered.
+    """
+
+    def _resp(self, calls):
+        return {"provider_output": {"tool_trace": [
+            {"type": "mcp_tool_use", "name": n, "input": i} for n, i in calls
+        ]}}
+
+    def _case(self, area="CIV", area_name="Côte d'Ivoire"):
+        return {
+            "filters": {"REF_AREA": area, "INDICATOR": "CME_MRY0T4", "SEX": "_T"},
+            "dimensions": {
+                "REF_AREA": {"id": area, "name": area_name},
+                "INDICATOR": {"id": "CME_MRY0T4", "name": "Under-five mortality rate"},
+            },
+        }
+
+    def test_accented_area_no_longer_blocks_a_match(self) -> None:
+        r = self._resp([("get_single_observation",
+                         {"subject": "CME_MRY0T4", "location": "Côte d'Ivoire"})])
+        self.assertIs(runner._trace_hits_expected_series(r, self._case()), True)
+
+    def test_iso2_area_alias_does_not_fail_the_route(self) -> None:
+        """The area is corroborating; the indicator is what must match."""
+        r = self._resp([("get_single_observation",
+                         {"subject": "CME_MRY0T4", "location": "PE"})])
+        self.assertIs(runner._trace_hits_expected_series(r, self._case("PER", "Peru")), True)
+
+    def test_discovery_text_alone_is_not_evidence(self) -> None:
+        """A free-text question mentioning the indicator is not a data query.
+
+        A tampered trace whose every data call used a different code passed on
+        this alone until discovery tools were excluded.
+        """
+        r = self._resp([
+            ("plan_topic_query", {"question": "under-five mortality rate"}),
+            ("get_single_observation", {"subject": "SOME_OTHER_CODE", "location": "Peru"}),
+        ])
+        self.assertIs(runner._trace_hits_expected_series(r, self._case()), False)
+
+    def test_wrong_indicator_in_data_call_fails(self) -> None:
+        r = self._resp([("get_single_observation",
+                         {"subject": "WRONG_CODE", "location": "Côte d'Ivoire"})])
+        self.assertIs(runner._trace_hits_expected_series(r, self._case()), False)
+
+    def test_indicator_label_in_a_data_call_counts(self) -> None:
+        r = self._resp([("get_time_series",
+                         {"subject": "Under-five mortality rate", "location": "Côte d'Ivoire"})])
+        self.assertIs(runner._trace_hits_expected_series(r, self._case()), True)
