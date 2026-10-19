@@ -281,3 +281,43 @@ class TestRunCaseLoop(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTerseClaimRecovery(unittest.TestCase):
+    """A correct answer stated only in the terse line must still grade.
+
+    One model answered 93 of 500 cases with the right value in answer_text and
+    an empty claims object. The grader keys off claims, so all 93 graded as
+    unsettled despite being exactly right. Recovery reads back what the model
+    already said, and must never go further than that.
+    """
+
+    def test_value_and_period_are_read_from_the_terse_line(self) -> None:
+        got = gateway._recover_terse_claims("value: 28.7076466874586; period: 2020", {})
+        self.assertEqual(got["value"], "28.7076466874586")
+        self.assertEqual(got["time_period"], "2020")
+        self.assertTrue(got["recovered_from_answer_text"])
+
+    def test_a_claim_the_model_supplied_is_never_overwritten(self) -> None:
+        got = gateway._recover_terse_claims("value: 99; period: 1999",
+                                            {"value": "42", "time_period": "2020"})
+        self.assertEqual(got["value"], "42")
+        self.assertEqual(got["time_period"], "2020")
+        self.assertNotIn("recovered_from_answer_text", got)
+
+    def test_explicit_null_stays_an_abstention(self) -> None:
+        # Negative cases are scored on abstaining, so inventing a value here
+        # would turn correct abstentions into wrong answers.
+        got = gateway._recover_terse_claims("value: null", {})
+        self.assertIsNone(got.get("value"))
+        self.assertFalse(got.get("recovered_from_answer_text", False))
+
+    def test_prose_without_the_terse_line_recovers_nothing(self) -> None:
+        got = gateway._recover_terse_claims("I could not determine the value.", {})
+        self.assertIsNone(got.get("value"))
+
+    def test_recovery_is_flagged_in_the_result(self) -> None:
+        self.assertTrue(gateway._recover_terse_claims("value: 5", {})["recovered_from_answer_text"])
+        self.assertFalse(
+            gateway._recover_terse_claims("value: 5", {"value": "5"})
+            .get("recovered_from_answer_text", False))

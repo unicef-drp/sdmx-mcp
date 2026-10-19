@@ -204,6 +204,41 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+_TERSE_VALUE = re.compile(r"value:\s*([^;\n]+)", re.IGNORECASE)
+_TERSE_PERIOD = re.compile(r"period:\s*([^;\n]+)", re.IGNORECASE)
+
+
+def _recover_terse_claims(answer_text: str, claims: dict[str, Any]) -> dict[str, Any]:
+    """Read value and period out of the terse answer when `claims` omitted them.
+
+    The contract asks for two things: the terse "value: <v>; period: <p>" line
+    and the structured claims object. Some models supply only the line. The
+    grader keys off claims, so a correct answer then grades as unsettled --
+    measured at 93 of 500 for one model, every one of them exactly right.
+
+    This reads back what the model already stated in the format it was asked
+    for; it never substitutes a tool result or infers a value the model did not
+    give. A claims value the model did supply is always left alone, and an
+    explicit "value: null" is preserved as an abstention rather than being
+    treated as a missing field to fill.
+    """
+    recovered = dict(claims)
+    if recovered.get("value") is None:
+        match = _TERSE_VALUE.search(answer_text or "")
+        if match:
+            token = match.group(1).strip().rstrip(".;")
+            if token and token.lower() != "null":
+                recovered["value"] = token
+                recovered["recovered_from_answer_text"] = True
+    if recovered.get("time_period") is None:
+        match = _TERSE_PERIOD.search(answer_text or "")
+        if match:
+            token = match.group(1).strip().rstrip(".;")
+            if token and token.lower() != "null":
+                recovered["time_period"] = token
+    return recovered
+
+
 def _tool_result_text(result: dict[str, Any]) -> str:
     """Flatten an MCP tool result to the string the model will read."""
     parts: list[str] = []
@@ -351,14 +386,19 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(claims, dict):
         claims = {}
 
+    answer_text = (parsed or {}).get("answer_text") or final_text
+    claims = _recover_terse_claims(answer_text, claims)
     result = {
         "status": "ok" if parsed else "provider_error",
-        "answer_text": (parsed or {}).get("answer_text") or final_text,
+        "answer_text": answer_text,
         "claims": {
             "value": claims.get("value"),
             "time_period": claims.get("time_period"),
             "flowRef": claims.get("flowRef"),
             "filters": claims.get("filters") if isinstance(claims.get("filters"), dict) else None,
+            # Set when value came from the terse answer line rather than the
+            # model's own claims object, so a grade can be traced to its source.
+            "recovered_from_answer_text": claims.get("recovered_from_answer_text", False),
         },
         "tool_trace": tool_trace,
         "usage": usage,
