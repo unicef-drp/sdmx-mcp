@@ -45,7 +45,7 @@ import httpx
 
 GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/chat/completions"
 DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
-DEFAULT_MAX_TOKENS = 1200
+DEFAULT_MAX_TOKENS = 4000
 DEFAULT_MAX_STEPS = 12
 DEFAULT_TIMEOUT = 120.0
 
@@ -317,6 +317,12 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
         ]
 
         final_text = ""
+        truncated = False
+        # A model can keep calling tools until the step ceiling and never write
+        # an answer. That is a third harness limit, distinct from truncation
+        # and from a malformed answer, and it needs its own name or it reads as
+        # the model being wrong.
+        steps_exhausted = True
         for _ in range(max_steps):
             response = client.post(GATEWAY_URL, headers=headers, json={
                 "model": model,
@@ -339,6 +345,10 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
             cost += float((use.get("cost") or 0) or 0)
 
             choice = (body.get("choices") or [{}])[0]
+            # "length" means the model ran out of budget mid-thought. That is a
+            # harness setting, not a wrong answer, and conflating the two makes
+            # a reasoning model look inaccurate when it was simply cut off.
+            finish_reason = str(choice.get("finish_reason") or "")
             message = choice.get("message") or {}
             calls = message.get("tool_calls") or []
             messages.append({
@@ -349,6 +359,8 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
 
             if not calls:
                 final_text = message.get("content") or ""
+                truncated = finish_reason == "length"
+                steps_exhausted = False
                 break
 
             for call in calls:
@@ -408,7 +420,23 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
         "estimated_cost_usd": round(cost, 8) if cost else None,
     }
     if not parsed:
-        result["error"] = "Model response did not contain a parseable JSON object."
+        if truncated:
+            reason = (
+                "Model hit the max_tokens ceiling before producing an answer; raise "
+                f"provider.max_tokens (currently {max_tokens}). Reasoning models spend "
+                "budget before emitting any text."
+            )
+        elif steps_exhausted:
+            tool_calls = sum(1 for e in tool_trace if e.get("type") == "mcp_tool_use")
+            reason = (
+                f"Model made {tool_calls} tool calls and reached the step ceiling "
+                f"(provider.max_steps = {max_steps}) without writing an answer."
+            )
+        else:
+            reason = "Model response did not contain a parseable JSON object."
+        result["error"] = reason
+        result["truncated"] = truncated
+        result["steps_exhausted"] = steps_exhausted
     return result
 
 

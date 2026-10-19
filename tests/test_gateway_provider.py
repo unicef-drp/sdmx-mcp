@@ -321,3 +321,58 @@ class TestTerseClaimRecovery(unittest.TestCase):
         self.assertFalse(
             gateway._recover_terse_claims("value: 5", {"value": "5"})
             .get("recovered_from_answer_text", False))
+
+
+class TestHarnessLimitsAreNamed(unittest.TestCase):
+    """A harness ceiling must never be reported as a wrong answer.
+
+    Measured: with max_tokens at 1200, a reasoning model failed 29 of 63 cases
+    having spent its whole budget before writing anything, and the result said
+    only "did not contain a parseable JSON object" -- indistinguishable from a
+    model that answered badly. That reads as 46% inaccuracy when the real cause
+    is a setting. The step ceiling has the same failure mode.
+    """
+
+    def setUp(self) -> None:
+        self._real_client = gateway.httpx.Client
+        self._real_session = gateway.McpSession
+        os.environ["TEST_GW_KEY"] = "test-key"
+
+    def tearDown(self) -> None:
+        gateway.httpx.Client = self._real_client
+        gateway.McpSession = self._real_session
+        os.environ.pop("TEST_GW_KEY", None)
+
+    def _run(self, replies, tool_results, **extra):
+        client = _FakeGatewayClient(replies)
+        gateway.httpx.Client = lambda *a, **k: client
+        gateway.McpSession = lambda *a, **k: _FakeMcpSession(tool_results)
+        provider = {"api_key_env": "TEST_GW_KEY", "model": "m"}
+        provider.update(extra)
+        return gateway.run_case({"provider": provider,
+                                 "mcp": {"url": "https://example.invalid/mcp"},
+                                 "case": {"prompt": "q"}})
+
+    def test_max_tokens_truncation_says_so(self) -> None:
+        reply = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                 "usage": {"prompt_tokens": 10, "completion_tokens": 1200}}
+        result = self._run([reply], [], max_tokens=1200)
+        self.assertEqual(result["status"], "provider_error")
+        self.assertTrue(result["truncated"])
+        self.assertIn("max_tokens", result["error"])
+
+    def test_step_ceiling_says_so_and_counts_the_calls(self) -> None:
+        calls = [_assistant_tool_call("get_single_observation", {}) for _ in range(3)]
+        results = [_text_result({"value": 1}) for _ in range(3)]
+        result = self._run(calls, results, max_steps=3)
+        self.assertEqual(result["status"], "provider_error")
+        self.assertTrue(result["steps_exhausted"])
+        self.assertIn("step ceiling", result["error"])
+        self.assertIn("3 tool calls", result["error"])
+
+    def test_a_genuinely_unparseable_answer_is_still_reported_as_one(self) -> None:
+        result = self._run([_assistant_answer("The value is about 90 percent.")], [])
+        self.assertEqual(result["status"], "provider_error")
+        self.assertFalse(result["truncated"])
+        self.assertFalse(result["steps_exhausted"])
+        self.assertIn("parseable", result["error"])
