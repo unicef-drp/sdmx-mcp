@@ -131,6 +131,20 @@ MAX_OBS_HARD_CAP = _positive_int_env("SDMX_MAX_OBS_CAP", 100_000)
 # the same for every candidate and dominates the payload.
 INDICATOR_FLOW_LIMIT = _positive_int_env("SDMX_INDICATOR_FLOW_LIMIT", 3)
 
+# Areas used to probe for an indicator's unit of measure. UNIT_MEASURE is an
+# observation-level attribute, not a dimension, so the only way to learn it is
+# to read an observation -- and an unrestricted probe pulls every area. Naming
+# a few well-populated areas cut one measured probe from 1.48MB/5152 rows to
+# 27KB/90 rows with identical unit coverage. Left empty the probe is
+# unrestricted, which is correct everywhere but heavier, so this stays a
+# deployment choice rather than a hardcoded country list.
+UNIT_PROBE_AREAS: tuple[str, ...] = tuple(
+    part.strip() for part in os.getenv("SDMX_UNIT_PROBE_AREAS", "").split(",") if part.strip()
+)
+# How many discovery candidates to annotate. Units come from one bulk query
+# regardless of count, but a very long key is worth avoiding.
+UNIT_ANNOTATE_LIMIT = _positive_int_env("SDMX_UNIT_ANNOTATE_LIMIT", 25)
+
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -180,6 +194,10 @@ _codelist_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24)  # 24h
 _hierarchical_codelist_cache = TTLCache(maxsize=32, ttl=60 * 60 * 24)  # 24h
 _hierarchical_codelist_detail_cache = TTLCache(maxsize=32, ttl=60 * 60 * 24)  # 24h
 _hierarchical_catalog_cache = TTLCache(maxsize=8, ttl=60 * 60 * 24)  # 24h
+# An indicator's unit of measure is effectively immutable, so this can be held
+# a long time. Misses are cached too, or an indicator with no data anywhere
+# would be re-probed on every single discovery call.
+_indicator_unit_cache: TTLCache = TTLCache(maxsize=8192, ttl=60 * 60 * 24)  # 24h
 
 # Limit concurrent structure fetches to avoid overwhelming SDMX servers.
 _STRUCTURE_FETCH_SEMAPHORE = asyncio.Semaphore(5)
@@ -4468,6 +4486,158 @@ async def list_agencies(limit: int = 50) -> list[dict[str, Any]]:
     return results
 
 
+def _label_column_for(fieldnames: list[str], code_column: str) -> str | None:
+    """The label column paired with a code column in a `labels=both` CSV.
+
+    SDMX-CSV with labels=both emits the code column immediately followed by its
+    human label under the concept's own name -- "UNIT_MEASURE" then "Unit of
+    measure", "INDICATOR" then "Indicator". The label header therefore differs
+    per registry and per concept, so it is found by position rather than by
+    guessing names. The codes themselves are not readable: D_PER_1000_B says
+    far less to an agent than "Deaths per 1,000 live births".
+    """
+    try:
+        index = fieldnames.index(code_column)
+    except ValueError:
+        return None
+    if index + 1 >= len(fieldnames):
+        return None
+    candidate = fieldnames[index + 1]
+    # A label column is never itself a known code column.
+    if candidate.isupper() and "_" in candidate:
+        return None
+    return candidate
+
+
+def _parse_unit_rows(text: str) -> dict[str, dict[str, str]]:
+    """Read {indicator: {unit, unitCode, unitMultiplier}} out of a CSV probe.
+
+    The first row seen for an indicator wins: the unit does not vary by area,
+    so one row is enough and the rest of the probe need not be held.
+    """
+    reader = csv.DictReader(text.splitlines())
+    fieldnames = list(reader.fieldnames or [])
+    if not fieldnames:
+        return {}
+    unit_label_col = _label_column_for(fieldnames, "UNIT_MEASURE")
+    multiplier_label_col = _label_column_for(fieldnames, "UNIT_MULTIPLIER")
+
+    out: dict[str, dict[str, str]] = {}
+    for row in reader:
+        indicator = str(row.get(DIM_INDICATOR) or "").strip()
+        if not indicator or indicator in out:
+            continue
+        unit_code = str(row.get("UNIT_MEASURE") or "").strip()
+        unit_label = str(row.get(unit_label_col) or "").strip() if unit_label_col else ""
+        if not unit_code and not unit_label:
+            continue
+        entry = {"unit": unit_label or unit_code}
+        if unit_code and unit_label:
+            entry["unitCode"] = unit_code
+        multiplier_code = str(row.get("UNIT_MULTIPLIER") or "").strip()
+        multiplier_label = str(row.get(multiplier_label_col) or "").strip() if multiplier_label_col else ""
+        # 10^0 is no scaling at all, so reporting it would invite an agent to
+        # apply a multiplier that does not exist. A population written 56.084
+        # with multiplier "Thousands" is the case worth carrying.
+        if multiplier_code not in ("", "0") and (multiplier_label or multiplier_code):
+            entry["unitMultiplier"] = multiplier_label or multiplier_code
+        out[indicator] = entry
+    return out
+
+
+async def _probe_indicator_units(flow_ref: str, indicators: list[str]) -> dict[str, dict[str, str]]:
+    """One bulk data probe for several indicators' units."""
+    if not indicators:
+        return {}
+    try:
+        path = await _data_path_for_query(flow_ref)
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        logger.debug("Unit probe could not resolve flow path for %s: %s", flow_ref, exc)
+        return {}
+
+    try:
+        structure = await _get_flow_structure(flow_ref)
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        logger.debug("Unit probe could not read structure for %s: %s", flow_ref, exc)
+        return {}
+    dimension_ids = [
+        str(dim.get("id") or "")
+        for dim in _dimension_metadata(structure)
+        if str(dim.get("id") or "") and str(dim.get("role") or "") != ROLE_TIME
+    ]
+    if DIM_INDICATOR not in dimension_ids:
+        return {}
+
+    # Place the indicator codes at the indicator dimension's own position and
+    # leave the rest wild, so this works for any DSD rather than assuming
+    # REF_AREA.INDICATOR.SEX.
+    segments: list[str] = []
+    for dim in dimension_ids:
+        if dim == DIM_INDICATOR:
+            segments.append("+".join(indicators))
+        elif dim == DIM_REF_AREA and UNIT_PROBE_AREAS:
+            segments.append("+".join(UNIT_PROBE_AREAS))
+        else:
+            segments.append("")
+    key = ".".join(segments)
+
+    url = f"{_sdmx_base()}/data/{path}/{key}?lastNObservations=1&format=csv&labels=both"
+    try:
+        status, text = await _get_text_with_status(url)
+    except httpx.HTTPError as exc:
+        logger.debug("Unit probe failed for %s: %s", flow_ref, exc)
+        return {}
+    if status >= 400 or not text.strip():
+        return {}
+    return _parse_unit_rows(text)
+
+
+async def _indicator_units(flow_ref: str, indicators: list[str]) -> dict[str, dict[str, str]]:
+    """Units for the given indicators, cached, with a narrow then wide probe.
+
+    Correctness must not depend on the probe-area list: an indicator that has
+    no data in those areas is probed again without the restriction, so a
+    deployment can tune the areas for speed without risking a wrong or missing
+    unit.
+    """
+    wanted = [code for code in dict.fromkeys(indicators) if code]
+    if not wanted:
+        return {}
+
+    resolved: dict[str, dict[str, str]] = {}
+    missing: list[str] = []
+    for code in wanted:
+        cache_key = (flow_ref, code)
+        if cache_key in _indicator_unit_cache:
+            cached = _indicator_unit_cache[cache_key]
+            if cached:
+                resolved[code] = cached
+        else:
+            missing.append(code)
+    if not missing:
+        return resolved
+
+    found = await _probe_indicator_units(flow_ref, missing)
+    if UNIT_PROBE_AREAS:
+        still_missing = [code for code in missing if code not in found]
+        if still_missing:
+            saved_areas = UNIT_PROBE_AREAS
+            try:
+                globals()["UNIT_PROBE_AREAS"] = ()
+                found.update(await _probe_indicator_units(flow_ref, still_missing))
+            finally:
+                globals()["UNIT_PROBE_AREAS"] = saved_areas
+
+    for code in missing:
+        entry = found.get(code) or {}
+        # Cache the miss as well, so an indicator with no observations is not
+        # re-probed on every discovery call.
+        _indicator_unit_cache[(flow_ref, code)] = entry
+        if entry:
+            resolved[code] = entry
+    return resolved
+
+
 async def _find_indicator_candidates_impl(
     *,
     query: str,
@@ -4475,6 +4645,7 @@ async def _find_indicator_candidates_impl(
     limit: int = 10,
     flowQuery: str | None = None,
     flowLimit: int = 200,
+    includeUnits: bool = True,
 ) -> list[dict[str, Any]]:
     q = (query or "").strip()
     if not q:
@@ -4485,7 +4656,9 @@ async def _find_indicator_candidates_impl(
         codes = _indicator_codes_from_payload(payload)
         if not codes:
             raise ValueError(f"No '{DIM_INDICATOR}' dimension or codelist found for flow '{flowRef}'.")
-        return _ranked_code_matches(codes, q, limit=limit)
+        ranked_for_flow = _ranked_code_matches(codes, q, limit=limit)
+        await _annotate_units(flowRef, ranked_for_flow, include_units=includeUnits)
+        return ranked_for_flow
 
     payload = await _cached_dataflows()
     flows = _extract_scoped_dataflows(payload)
@@ -4604,7 +4777,49 @@ async def _find_indicator_candidates_impl(
                 "holds data for it; prefer recommendedFlowRef."
             )
 
+    if includeUnits:
+        # Group by the flow each candidate would actually be read from, so each
+        # flow is probed once rather than once per candidate.
+        by_flow: dict[str, list[dict[str, Any]]] = {}
+        for item in ranked:
+            recommended = item.get("recommendedFlowRef")
+            if isinstance(recommended, str) and recommended:
+                by_flow.setdefault(recommended, []).append(item)
+        await asyncio.gather(*[
+            _annotate_units(flow, items, include_units=True)
+            for flow, items in by_flow.items()
+        ])
+
     return ranked
+
+
+async def _annotate_units(
+    flow_ref: str, items: list[dict[str, Any]], *, include_units: bool
+) -> None:
+    """Attach unit of measure to discovery candidates, in place.
+
+    The unit is the strongest signal for separating sibling indicators that a
+    label alone leaves close -- a mortality rate from a death count, a
+    percentage from a number affected. Discovery previously returned id, name
+    and description only, so the agent had to pick an indicator, query it, and
+    only then learn from the observation that it had chosen a count.
+
+    A failure here must never fail discovery: the candidates are still useful
+    without a unit, so the annotation is best-effort and silent.
+    """
+    if not include_units or not items or not flow_ref:
+        return
+    targets = items[:UNIT_ANNOTATE_LIMIT]
+    codes = [str(item.get("id") or "") for item in targets]
+    try:
+        units = await _indicator_units(flow_ref, codes)
+    except Exception as exc:  # noqa: BLE001 -- an annotation is not worth failing over
+        logger.debug("Unit annotation skipped for %s: %s", flow_ref, exc)
+        return
+    for item in targets:
+        entry = units.get(str(item.get("id") or ""))
+        if entry:
+            item.update(entry)
 
 
 async def _plan_topic_query_impl(
@@ -5354,6 +5569,7 @@ async def find_indicator_candidates(
     limit: int = 10,
     flowQuery: str | None = None,
     flowLimit: int = 200,
+    includeUnits: bool = True,
 ) -> list[dict[str, Any]]:
     """
     Rank indicator codes by matching query text against codelist labels/descriptions.
@@ -5363,6 +5579,11 @@ async def find_indicator_candidates(
     is not already resolved. For requests such as "stunting in Latin America" or
     "vaccination coverage in West Africa", call this before search_dataflows so the
     subject dimension is resolved before flow selection.
+
+    Each candidate carries 'unit' (and 'unitMultiplier' where the registry sets one)
+    when it can be resolved. Use it to choose between siblings whose labels are close:
+    a mortality rate reads 'Deaths per 1,000 live births' while the matching count
+    reads 'Number of deaths'. Pass includeUnits=false to skip the lookup.
     """
     return await _find_indicator_candidates_impl(
         query=query,
@@ -5370,6 +5591,7 @@ async def find_indicator_candidates(
         limit=limit,
         flowQuery=flowQuery,
         flowLimit=flowLimit,
+        includeUnits=includeUnits,
     )
 
 
@@ -5380,6 +5602,7 @@ async def search_indicators(
     limit: int = 10,
     flowQuery: str | None = None,
     flowLimit: int = 200,
+    includeUnits: bool = True,
 ) -> list[dict[str, Any]]:
     """
     Alias for find_indicator_candidates with identical behavior and parameters.
@@ -5390,6 +5613,7 @@ async def search_indicators(
         limit=limit,
         flowQuery=flowQuery,
         flowLimit=flowLimit,
+        includeUnits=includeUnits,
     )
 
 
