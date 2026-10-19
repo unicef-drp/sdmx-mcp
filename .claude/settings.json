@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git commit -m ' *)",
+      "Bash(uv sync *)",
+      "Bash(.venv/bin/python -c \"import server; print\\('server import OK'\\)\")",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -m pytest tests/ -x -q)",
+      "Bash(.venv/bin/uv lock *)",
+      "Bash(uv --version)",
+      "Bash(uv lock *)",
+      "Bash(.venv/bin/python -c \"import server; print\\('import OK; cap=', server.MAX_OBS_HARD_CAP, 'enforce=', server.ENFORCE_SCOPE\\)\")",
+      "Bash(git ls-remote *)",
+      "Bash(command -v gh)",
+      "Bash(git checkout *)",
+      "Bash(.venv/bin/python -m pytest tests/test_name_resolution.py -x -q)",
+      "Bash(git stash *)",
+      "Bash(.venv/bin/python -m pytest tests/test_name_resolution.py::TestSingleObservationListFilters -q)",
+      "Bash(gh run *)",
+      "Bash(curl -sS -o /dev/null -w \"endpoint: HTTP %{http_code} in %{time_total}s\\\\n\" https://sdmx-mcp.fly.dev/mcp)",
+      "Bash(curl -sS -X POST -H 'Accept: application/json, text/event-stream' -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ping\",\"arguments\":{}}}' http://localhost:8002/mcp)",
+      "Bash(docker rm *)",
+      "Bash(docker rmi *)"
+    ]
+  }
+}

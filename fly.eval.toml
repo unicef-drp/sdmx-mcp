@@ -16,6 +16,7 @@ primary_region = 'fra'
   SDMX_DEFAULT_LAST_N_OBSERVATIONS = 'true'
   SDMX_EXCLUDE_DRAFT = 'true'
   SDMX_AGENCY_ALLOWLIST = 'UNICEF,UNPD'
+  SDMX_UNIT_PROBE_AREAS = 'ETH,IND,NGA,BRA,USA'
   SDMX_REF_AREA_HIERARCHY_REF = 'UNICEF/UNICEF_REPORTING_REGIONS/latest'
   # The eval measures agent behaviour inside one known flow, so pin the server
   # to GLOBAL_DATAFLOW and enforce it. Without this the agent roams: a single
