@@ -22,6 +22,7 @@ This project lets an LLM client do a full guided data journey:
 - `scripts/sdmx_eval_runner.py`: generic SDMX eval harness for case generation, provider execution, and grading.
 - `scripts/sdmx_eval_config.example.json`: example config for deterministic case generation and provider runs.
 - `scripts/sdmx_eval_provider_anthropic.py`: Anthropic Messages API adapter using Anthropic's MCP connector.
+- `scripts/sdmx_eval_provider_gateway.py`: Vercel AI Gateway adapter; runs the MCP tool loop locally so any gateway model can be scored on the same manifest.
 - `scripts/sdmx_eval_provider_template.py`: stdin/stdout adapter template for wiring any LLM+MCP stack into the eval harness.
 - `scripts/list_theme_prefixes.py`: helper to inspect dataflow ID prefixes.
 - `theme_prefixes_domain.csv`: optional example prefix-to-domain mapping for grouping. Set `SDMX_THEME_PREFIX_CSV` to use it.
@@ -714,6 +715,53 @@ The grader relies primarily on those structured claims, not on free-form prose a
 - an MCP server reachable over HTTP(S)
 
 The adapter asks Claude to return a single JSON object so grading can stay deterministic. If you need auth on the MCP endpoint, set `mcp.authorization_token_env` in the config and the adapter will forward that bearer token to Anthropic's MCP connector request.
+
+### Gateway Adapter (multi-model)
+
+`scripts/sdmx_eval_provider_gateway.py` runs the same eval against any model
+reachable through [Vercel AI Gateway](https://vercel.com/docs/ai-gateway), so
+one manifest can be scored across providers. It expects:
+- `AI_GATEWAY_API_KEY` in the environment (create the key in the Vercel
+  dashboard under AI Gateway)
+- `mcp.url` in the eval config
+- a model id in `provider/model` form, e.g. `openai/gpt-6-astra`,
+  `google/gemini-3-pro`, `anthropic/claude-haiku-4-5`
+
+Start from `scripts/sdmx_eval_config.unicef_global.gateway.example.json`:
+
+```bash
+export AI_GATEWAY_API_KEY=...
+python3 scripts/sdmx_eval_runner.py run \
+  --config scripts/sdmx_eval_config.unicef_global.gateway.example.json \
+  --manifest tmp/eval/manifest.jsonl \
+  --responses tmp/eval/responses.gpt.jsonl
+```
+
+`SDMX_EVAL_MODEL` overrides the configured model, so one config drives a whole
+comparison:
+
+```bash
+for model in openai/gpt-6-astra google/gemini-3-pro anthropic/claude-haiku-4-5; do
+  SDMX_EVAL_MODEL="$model" python3 scripts/sdmx_eval_runner.py run \
+    --config scripts/sdmx_eval_config.unicef_global.gateway.example.json \
+    --manifest tmp/eval/manifest.jsonl \
+    --responses "tmp/eval/responses.${model//\//-}.jsonl"
+done
+```
+
+**One caveat when comparing against Anthropic-adapter results.** The Anthropic
+adapter uses Anthropic's *hosted* MCP connector: tool calls execute on
+Anthropic's side. A gateway is a plain Chat Completions endpoint with no such
+facility, so this adapter runs the MCP client loop locally — it lists the
+server's tools, converts their schemas to OpenAI function definitions, executes
+each requested call over Streamable HTTP, and feeds the result back. The
+system prompt, contract wording, manifest, ground truth and grader are held
+identical, but the tool transport is not. A score gap between the two adapters
+is not purely a model difference.
+
+Cost is read from the gateway's own per-request `usage.cost` rather than from a
+local price table, since the gateway bills at list price with no markup.
+
 
 ## Connector Setup
 
