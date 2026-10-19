@@ -145,6 +145,14 @@ UNIT_PROBE_AREAS: tuple[str, ...] = tuple(
 # regardless of count, but a very long key is worth avoiding.
 UNIT_ANNOTATE_LIMIT = _positive_int_env("SDMX_UNIT_ANNOTATE_LIMIT", 25)
 
+# Deployment-wide off switch for the unit probe. Annotation costs one extra
+# data request per flow per cache period, which an operator on a rate-limited
+# registry may not want to spend, and it is the control arm for measuring
+# whether units actually change an agent's indicator choice.
+DISCOVERY_UNITS = (
+    os.getenv("SDMX_DISCOVERY_UNITS", "").strip().lower() not in {"0", "false", "no", "off"}
+)
+
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -4777,7 +4785,7 @@ async def _find_indicator_candidates_impl(
                 "holds data for it; prefer recommendedFlowRef."
             )
 
-    if includeUnits:
+    if includeUnits and DISCOVERY_UNITS:
         # Group by the flow each candidate would actually be read from, so each
         # flow is probed once rather than once per candidate.
         by_flow: dict[str, list[dict[str, Any]]] = {}
@@ -4807,7 +4815,7 @@ async def _annotate_units(
     A failure here must never fail discovery: the candidates are still useful
     without a unit, so the annotation is best-effort and silent.
     """
-    if not include_units or not items or not flow_ref:
+    if not DISCOVERY_UNITS or not include_units or not items or not flow_ref:
         return
     targets = items[:UNIT_ANNOTATE_LIMIT]
     codes = [str(item.get("id") or "") for item in targets]
