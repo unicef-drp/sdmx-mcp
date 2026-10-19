@@ -725,7 +725,7 @@ one manifest can be scored across providers. It expects:
   dashboard under AI Gateway)
 - `mcp.url` in the eval config
 - a model id in `provider/model` form, e.g. `openai/gpt-6-astra`,
-  `google/gemini-3-pro`, `anthropic/claude-haiku-4-5`
+  `google/gemini-3-pro`, `anthropic/claude-haiku-4.5`
 
 Start from `scripts/sdmx_eval_config.unicef_global.gateway.example.json`:
 
@@ -741,7 +741,7 @@ python3 scripts/sdmx_eval_runner.py run \
 comparison:
 
 ```bash
-for model in openai/gpt-6-astra google/gemini-3-pro anthropic/claude-haiku-4-5; do
+for model in openai/gpt-6-astra google/gemini-3-pro anthropic/claude-haiku-4.5; do
   SDMX_EVAL_MODEL="$model" python3 scripts/sdmx_eval_runner.py run \
     --config scripts/sdmx_eval_config.unicef_global.gateway.example.json \
     --manifest tmp/eval/manifest.jsonl \

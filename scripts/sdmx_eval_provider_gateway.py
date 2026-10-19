@@ -28,7 +28,7 @@ Usage -- as a provider `command` in an eval config:
     }
 
 Model ids are `provider/model`, e.g. openai/gpt-6-astra,
-anthropic/claude-haiku-4-5, google/gemini-3-pro. SDMX_EVAL_MODEL overrides the
+anthropic/claude-haiku-4.5, google/gemini-3-pro. SDMX_EVAL_MODEL overrides the
 configured model, so one config drives a whole comparison.
 """
 
@@ -44,7 +44,7 @@ from typing import Any
 import httpx
 
 GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/chat/completions"
-DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
+DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
 DEFAULT_MAX_TOKENS = 1200
 DEFAULT_MAX_STEPS = 12
 DEFAULT_TIMEOUT = 120.0
