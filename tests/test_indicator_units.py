@@ -187,3 +187,48 @@ class TestAnnotateUnitsIsBestEffort(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDiscoveryUnitsOffSwitch(unittest.TestCase):
+    """A deployment can turn unit annotation off.
+
+    Worth having for two reasons: the probe costs one extra data request per
+    flow per cache period, which an operator on a rate-limited registry may not
+    want to spend; and it is the control arm for measuring whether units change
+    an agent's indicator choice at all. A measured A/B found no significant
+    gain, and a weak model abstained *more* often with units present, so this
+    is a real tuning knob rather than a formality.
+    """
+
+    def setUp(self) -> None:
+        server._indicator_unit_cache.clear()
+        self._saved = server.DISCOVERY_UNITS
+
+    def tearDown(self) -> None:
+        server.DISCOVERY_UNITS = self._saved
+        server._indicator_unit_cache.clear()
+
+    def test_disabled_does_no_lookup_even_when_asked(self) -> None:
+        called = False
+
+        async def fake(flow_ref, indicators):
+            nonlocal called
+            called = True
+            return {"X": {"unit": "%"}}
+
+        server.DISCOVERY_UNITS = False
+        items = [{"id": "X"}]
+        with mock.patch.object(server, "_indicator_units", fake):
+            asyncio.run(server._annotate_units("F", items, include_units=True))
+        self.assertFalse(called, "the probe ran with annotation disabled")
+        self.assertNotIn("unit", items[0])
+
+    def test_enabled_annotates(self) -> None:
+        async def fake(flow_ref, indicators):
+            return {"X": {"unit": "Number of deaths"}}
+
+        server.DISCOVERY_UNITS = True
+        items = [{"id": "X"}]
+        with mock.patch.object(server, "_indicator_units", fake):
+            asyncio.run(server._annotate_units("F", items, include_units=True))
+        self.assertEqual(items[0]["unit"], "Number of deaths")

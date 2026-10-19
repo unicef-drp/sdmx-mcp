@@ -293,7 +293,27 @@ failing discovery. Pass `includeUnits=false` to skip it.
 Set `SDMX_UNIT_PROBE_AREAS` to a few well-populated area codes to keep the probe
 small (measured: 27KB/90 rows versus 1.48MB/5152 rows unrestricted, same
 coverage). Any indicator those areas do not cover is re-probed unrestricted, so
-correctness does not depend on the list.
+correctness does not depend on the list. `SDMX_DISCOVERY_UNITS=false` disables
+annotation entirely.
+
+**What measurement shows.** A controlled A/B on 75 ambiguous-phrasing cases —
+two servers identical but for `SDMX_DISCOVERY_UNITS`, same cases, same models —
+found no statistically significant effect either way:
+
+| model | units off | units on | exact McNemar |
+|---|---|---|---|
+| claude-haiku-4.5-class | 74/75 | 75/75 | p = 1.00 |
+| a weaker cheap model | 54/75 | **49/75** | p = 0.36 |
+
+The weaker model got *worse*, and 11 of its 12 regressions were abstentions —
+it answered `value: null` on cases it had previously answered correctly. The
+extra field appears to give a model with weak tool-use something more to
+second-guess.
+
+So units are justified on the grounds that they expose real metadata the agent
+could otherwise only obtain by querying, not on a demonstrated accuracy gain.
+If you deploy for a model that abstains readily, measure before assuming this
+helps, and use `SDMX_DISCOVERY_UNITS=false` if it does not.
 
 ### Discovery Ranking Policy
 
