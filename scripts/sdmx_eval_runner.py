@@ -360,6 +360,21 @@ def _expected_value(rows: list[dict[str, Any]], value_column: str | None) -> dic
     return {"status": "multi_row", "value": None, "distinct_values": unique}
 
 
+def _normalize_flow_ref(value: Any) -> str:
+    """Reduce a flowRef to one comparable form.
+
+    SDMX writes the same flow two ways: "UNICEF/GLOBAL_DATAFLOW/1.0" is the
+    canonical reference and "UNICEF,GLOBAL_DATAFLOW,1.0" is the form the REST
+    path uses. Both name the same flow, and a model that reports whichever it
+    saw in a query URL is not wrong. Comparing the strings literally marks
+    those answers as a routing failure even when the value is exactly right.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.replace(",", "/").strip("/")
+
+
 def _normalize_decimal(value: Any) -> Decimal | None:
     if value is None:
         return None
@@ -1258,7 +1273,7 @@ def grade_results(
 
             flow_match = None
             if claims.get("flowRef") is not None:
-                flow_match = str(claims.get("flowRef")).strip() == str(case.get("flowRef")).strip()
+                flow_match = _normalize_flow_ref(claims.get("flowRef")) == _normalize_flow_ref(case.get("flowRef"))
 
             filter_matches: dict[str, bool | None] = {}
             claim_filters = claims.get("filters")
