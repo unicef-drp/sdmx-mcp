@@ -12,6 +12,8 @@ import json
 import os
 import sys
 import unittest
+
+import httpx
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location(
@@ -412,15 +414,97 @@ class TestJsonMode(unittest.TestCase):
                           "case": {"prompt": "q"}})
         return client.sent[0]
 
-    def test_json_mode_sets_response_format(self) -> None:
-        self.assertEqual(self._sent(json_mode=True)["response_format"],
-                         {"type": "json_object"})
-
     def test_default_omits_response_format(self) -> None:
-        # Runs collected before this existed must stay reproducible.
         self.assertNotIn("response_format", self._sent())
 
-    def test_json_mode_does_not_disturb_tools_or_messages(self) -> None:
+    def test_json_mode_is_ignored_while_tools_are_attached(self) -> None:
+        # The eval always attaches tools, so this is the real-world path.
+        # Constraining the reply to one JSON object made three of seven
+        # open-weight models stop calling tools entirely.
         sent = self._sent(json_mode=True)
+        self.assertNotIn("response_format", sent)
         self.assertIn("tools", sent)
-        self.assertEqual(sent["messages"][-1]["content"], "q")
+
+    def test_json_mode_applies_when_there_are_no_tools(self) -> None:
+        self.assertTrue(gateway._json_mode_for(True, []))
+
+    def test_json_mode_suppressed_with_any_tool(self) -> None:
+        self.assertFalse(gateway._json_mode_for(True, [{"type": "function"}]))
+
+    def test_off_stays_off_either_way(self) -> None:
+        self.assertFalse(gateway._json_mode_for(False, []))
+        self.assertFalse(gateway._json_mode_for(False, [{"type": "function"}]))
+
+
+class _FlakyClient:
+    """Returns a scripted sequence of statuses for the same request."""
+
+    def __init__(self, statuses, body=None):
+        self.statuses = list(statuses)
+        self.body = body or {"choices": [{"message": {"content": "{}"}}], "usage": {}}
+        self.attempts = 0
+
+    def post(self, url, headers=None, json=None):  # noqa: A002
+        self.attempts += 1
+        status = self.statuses.pop(0)
+        response = _FakeResponse(self.body)
+        response.status_code = status
+        return response
+
+
+class TestGatewayRetry(unittest.TestCase):
+    """Infrastructure noise must not land in a model's score.
+
+    A bare 503 from an open-weight provider failed a case mid-run. The request
+    was never served, so reissuing it is not a second opinion -- and leaving it
+    to fail charges the model for the provider's hiccup, which is random across
+    models and would bias a comparison.
+    """
+
+    def test_a_transient_503_is_reissued_and_succeeds(self) -> None:
+        client = _FlakyClient([503, 200])
+        out = gateway._post_with_retry(client, headers={}, payload={}, retries=3, backoff=0)
+        self.assertEqual(out.status_code, 200)
+        self.assertEqual(client.attempts, 2)
+
+    def test_rate_limiting_is_reissued(self) -> None:
+        client = _FlakyClient([429, 429, 200])
+        out = gateway._post_with_retry(client, headers={}, payload={}, retries=3, backoff=0)
+        self.assertEqual(out.status_code, 200)
+        self.assertEqual(client.attempts, 3)
+
+    def test_a_real_rejection_is_not_retried(self) -> None:
+        # An unknown model or malformed request returns the same answer however
+        # many times it is asked, so retrying only spends money.
+        client = _FlakyClient([400, 200])
+        out = gateway._post_with_retry(client, headers={}, payload={}, retries=3, backoff=0)
+        self.assertEqual(out.status_code, 400)
+        self.assertEqual(client.attempts, 1)
+
+    def test_403_is_not_retried(self) -> None:
+        client = _FlakyClient([403, 200])
+        self.assertEqual(
+            gateway._post_with_retry(client, headers={}, payload={}, retries=3, backoff=0).status_code,
+            403)
+        self.assertEqual(client.attempts, 1)
+
+    def test_retries_are_bounded_and_the_last_status_is_returned(self) -> None:
+        client = _FlakyClient([503, 503, 503])
+        out = gateway._post_with_retry(client, headers={}, payload={}, retries=2, backoff=0)
+        self.assertEqual(out.status_code, 503)
+        self.assertEqual(client.attempts, 3)
+
+    def test_a_transport_error_is_reissued(self) -> None:
+        calls = {"n": 0}
+        body = {"choices": [{"message": {"content": "{}"}}], "usage": {}}
+
+        class Transport:
+            def post(self, url, headers=None, json=None):  # noqa: A002
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise httpx.ConnectError("reset")
+                return _FakeResponse(body)
+
+        out = gateway._post_with_retry(Transport(), headers={}, payload={}, retries=2, backoff=0)
+        self.assertEqual(out.status_code, 200)
+        self.assertEqual(calls["n"], 2)

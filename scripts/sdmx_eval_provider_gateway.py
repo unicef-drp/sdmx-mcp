@@ -208,6 +208,60 @@ _TERSE_VALUE = re.compile(r"value:\s*([^;\n]+)", re.IGNORECASE)
 _TERSE_PERIOD = re.compile(r"period:\s*([^;\n]+)", re.IGNORECASE)
 
 
+# Gateway statuses worth retrying: the request was never served, so reissuing
+# it is not a second opinion. 429 is rate limiting, 5xx and 408 are the
+# provider being briefly unavailable -- observed as a bare 503 from an
+# open-weight provider mid-run, which failed that case and would have scored
+# against the model.
+_RETRYABLE_GATEWAY_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
+
+
+def _post_with_retry(
+    client: httpx.Client,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    retries: int,
+    backoff: float,
+) -> httpx.Response:
+    """POST to the gateway, reissuing only transient failures.
+
+    A 4xx that is not 429 is a real rejection -- an unknown model, a malformed
+    request -- and retrying it just spends money to receive the same answer,
+    so only the statuses above are reissued. Infrastructure noise must not land
+    in a model's score: it is random across models and would silently bias a
+    comparison.
+    """
+    last: httpx.Response | None = None
+    for attempt in range(retries + 1):
+        try:
+            response = client.post(GATEWAY_URL, headers=headers, json=payload)
+        except httpx.HTTPError:
+            # A transport error never reached the model either.
+            if attempt == retries:
+                raise
+            time.sleep(backoff * (2**attempt))
+            continue
+        if response.status_code not in _RETRYABLE_GATEWAY_STATUS or attempt == retries:
+            return response
+        last = response
+        time.sleep(backoff * (2**attempt))
+    assert last is not None
+    return last
+
+
+def _json_mode_for(json_mode: bool, tools: list[dict[str, Any]]) -> bool:
+    """Whether to constrain the reply to a JSON object on this request.
+
+    Never while tools are attached: a reply restricted to one JSON object
+    cannot also carry tool_calls, and several models respond by abandoning
+    tool use rather than by deferring the JSON. Since this eval always attaches
+    tools, the setting is effectively inert -- kept only so a tools-free caller
+    can still ask for structured output.
+    """
+    return bool(json_mode) and not tools
+
+
 def _recover_terse_claims(answer_text: str, claims: dict[str, Any]) -> dict[str, Any]:
     """Read value and period out of the terse answer when `claims` omitted them.
 
@@ -284,14 +338,20 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
                 or provider.get("model") or DEFAULT_MODEL).strip()
     max_tokens = int(provider.get("max_tokens") or DEFAULT_MAX_TOKENS)
     max_steps = int(provider.get("max_steps") or DEFAULT_MAX_STEPS)
-    # Ask for JSON through the API rather than only in prose. Without it,
-    # gemini-2.5-flash-lite answered with the correct value wrapped in an
-    # explanation of why it would not use the requested format -- 23 of 27
-    # cases unusable. That measures instruction-following, not whether the
-    # model can read an SDMX registry. Off by default so runs collected before
-    # this stay reproducible; the shipped config turns it on.
+    # response_format and tools conflict badly. Asking for a JSON object made
+    # three of seven open-weight models stop calling tools altogether --
+    # deepseek-v4.1-flash 0 calls against 4, glm-5.3-flash 0 against 17,
+    # qwen-3-235b 0 against 5 -- because a reply constrained to one JSON object
+    # leaves no room to emit tool_calls first. They answered "value: null"
+    # immediately and would have scored near zero, which reads as a model that
+    # cannot use the MCP rather than a harness that forbade it.
+    #
+    # It was added for gemini-2.5-flash-lite, which it did not rescue anyway
+    # (that model invents dataflow names, a separate problem), so it is off by
+    # default and ignored whenever tools are attached -- see _json_mode_for.
     json_mode = bool(provider.get("json_mode"))
     retries = int(provider.get("throttle_retries", 3))
+    gateway_retries = int(provider.get("gateway_retries", 3))
     backoff = float(provider.get("throttle_backoff_seconds", 5.0))
 
     # Held identical to the Anthropic adapter's wording. A comparison run has
@@ -337,9 +397,12 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
                 "messages": messages,
                 "tools": tools,
             }
-            if json_mode:
+            if _json_mode_for(json_mode, tools):
                 request["response_format"] = {"type": "json_object"}
-            response = client.post(GATEWAY_URL, headers=headers, json=request)
+            response = _post_with_retry(
+                client, headers=headers, payload=request,
+                retries=gateway_retries, backoff=backoff,
+            )
             if response.status_code >= 400:
                 # The body says what was rejected -- an unknown model id, a
                 # budget stop, a malformed tool block. Losing it makes every

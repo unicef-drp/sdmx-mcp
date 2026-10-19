@@ -78,6 +78,6 @@
     "env": {},
     "max_steps": 16,
     "concurrency": 6,
-    "json_mode": true
+    "json_mode": false
   }
 }
