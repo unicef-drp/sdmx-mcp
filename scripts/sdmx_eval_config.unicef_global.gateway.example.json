@@ -76,6 +76,7 @@
       "scripts/sdmx_eval_provider_gateway.py"
     ],
     "env": {},
-    "max_steps": 12
+    "max_steps": 12,
+    "concurrency": 6
   }
 }
