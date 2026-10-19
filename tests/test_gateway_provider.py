@@ -6,6 +6,7 @@ tool result, deciding a call was throttled, keeping the transcript in the shape
 the next request needs -- is now code in this repo that can be wrong.
 """
 
+import copy
 import importlib.util
 import json
 import os
@@ -121,7 +122,10 @@ class _FakeGatewayClient:
         self.sent: list[dict] = []
 
     def post(self, url, headers=None, json=None):  # noqa: A002 - httpx's name
-        self.sent.append(json)
+        # Snapshot the payload. The adapter passes its live `messages` list and
+        # keeps appending to it, so holding a reference would let assertions
+        # read state from later turns -- a real client serialises at send time.
+        self.sent.append(copy.deepcopy(json))
         return _FakeResponse(self._replies.pop(0))
 
     def close(self) -> None:
@@ -376,3 +380,47 @@ class TestHarnessLimitsAreNamed(unittest.TestCase):
         self.assertFalse(result["truncated"])
         self.assertFalse(result["steps_exhausted"])
         self.assertIn("parseable", result["error"])
+
+
+class TestJsonMode(unittest.TestCase):
+    """Request JSON through the API, not only in prose.
+
+    gemini-2.5-flash-lite returned the correct value inside an explanation of
+    why it would not use the requested terse format -- 23 of 27 cases unusable.
+    That is instruction-following, not SDMX accuracy, so the adapter can ask
+    for JSON through response_format instead.
+    """
+
+    def setUp(self) -> None:
+        self._real_client = gateway.httpx.Client
+        self._real_session = gateway.McpSession
+        os.environ["TEST_GW_KEY"] = "test-key"
+
+    def tearDown(self) -> None:
+        gateway.httpx.Client = self._real_client
+        gateway.McpSession = self._real_session
+        os.environ.pop("TEST_GW_KEY", None)
+
+    def _sent(self, **provider_extra):
+        client = _FakeGatewayClient([_assistant_answer('{"answer_text":"x","claims":{}}')])
+        gateway.httpx.Client = lambda *a, **k: client
+        gateway.McpSession = lambda *a, **k: _FakeMcpSession([])
+        provider = {"api_key_env": "TEST_GW_KEY", "model": "m"}
+        provider.update(provider_extra)
+        gateway.run_case({"provider": provider,
+                          "mcp": {"url": "https://example.invalid/mcp"},
+                          "case": {"prompt": "q"}})
+        return client.sent[0]
+
+    def test_json_mode_sets_response_format(self) -> None:
+        self.assertEqual(self._sent(json_mode=True)["response_format"],
+                         {"type": "json_object"})
+
+    def test_default_omits_response_format(self) -> None:
+        # Runs collected before this existed must stay reproducible.
+        self.assertNotIn("response_format", self._sent())
+
+    def test_json_mode_does_not_disturb_tools_or_messages(self) -> None:
+        sent = self._sent(json_mode=True)
+        self.assertIn("tools", sent)
+        self.assertEqual(sent["messages"][-1]["content"], "q")

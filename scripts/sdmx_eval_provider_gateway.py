@@ -284,6 +284,13 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
                 or provider.get("model") or DEFAULT_MODEL).strip()
     max_tokens = int(provider.get("max_tokens") or DEFAULT_MAX_TOKENS)
     max_steps = int(provider.get("max_steps") or DEFAULT_MAX_STEPS)
+    # Ask for JSON through the API rather than only in prose. Without it,
+    # gemini-2.5-flash-lite answered with the correct value wrapped in an
+    # explanation of why it would not use the requested format -- 23 of 27
+    # cases unusable. That measures instruction-following, not whether the
+    # model can read an SDMX registry. Off by default so runs collected before
+    # this stay reproducible; the shipped config turns it on.
+    json_mode = bool(provider.get("json_mode"))
     retries = int(provider.get("throttle_retries", 3))
     backoff = float(provider.get("throttle_backoff_seconds", 5.0))
 
@@ -324,12 +331,15 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
         # the model being wrong.
         steps_exhausted = True
         for _ in range(max_steps):
-            response = client.post(GATEWAY_URL, headers=headers, json={
+            request: dict[str, Any] = {
                 "model": model,
                 "max_tokens": max_tokens,
                 "messages": messages,
                 "tools": tools,
-            })
+            }
+            if json_mode:
+                request["response_format"] = {"type": "json_object"}
+            response = client.post(GATEWAY_URL, headers=headers, json=request)
             if response.status_code >= 400:
                 # The body says what was rejected -- an unknown model id, a
                 # budget stop, a malformed tool block. Losing it makes every
