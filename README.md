@@ -716,6 +716,38 @@ The grader relies primarily on those structured claims, not on free-form prose a
 
 The adapter asks Claude to return a single JSON object so grading can stay deterministic. If you need auth on the MCP endpoint, set `mcp.authorization_token_env` in the config and the adapter will forward that bearer token to Anthropic's MCP connector request.
 
+### Refresh ground truth before grading
+
+A manifest's expected values are a snapshot of the registry at the moment the
+sweep ran, and a live statistical registry revises data in weeks, not years.
+Measured: a manifest built on 5 October 2026 and graded on the 20th scored
+every model at 94% on the prescriptive stratum, because UNICEF had restated the
+`PV_CHLD_*` child-poverty family in that window (source "DHS VII" to
+"DHS 2018 (IPUMS)", one series from 18.5535945892334 to 23.67173993) and
+withdrawn four series entirely. Models were penalised twice: once for reporting
+the current value, once for correctly answering `null` where data no longer
+existed.
+
+Refreshing costs nothing — registry reads, no model calls — so run it
+immediately before grading rather than trusting the manifest's snapshot:
+
+```bash
+python3 scripts/sdmx_eval_refresh_ground_truth.py \
+  --manifest tmp/eval/manifest.jsonl \
+  --out tmp/eval/manifest.fresh.jsonl
+```
+
+Then grade against the refreshed manifest. Responses already collected can be
+re-graded without re-running a single model, so this fixes staleness
+retroactively.
+
+It is deliberately conservative: a value is rewritten only when exactly one
+observation pins it. A period returning several observations, or a fetch that
+errors, leaves the case exactly as it was rather than inventing ground truth —
+a transport failure must never read as "the data is gone". The summary reports
+how many cases were changed, left alone, and how many negative cases have since
+gained data (those are no longer negative cases and need regenerating).
+
 ### Gateway Adapter (multi-model)
 
 `scripts/sdmx_eval_provider_gateway.py` runs the same eval against any model
