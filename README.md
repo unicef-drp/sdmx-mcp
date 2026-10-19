@@ -272,6 +272,31 @@ Optional policy fields for each query dimension:
 
 Discovery mode is the user-facing entry path only. Final query construction still honors policy `priority`.
 
+### Units on discovery results
+
+`find_indicator_candidates` / `search_indicators` annotate each candidate with
+`unit` (and `unitMultiplier` where the registry sets one):
+
+```
+CME_MRM0   Neonatal mortality rate   unit='Deaths per 1,000 live births'
+CME_TMM0   Neonatal deaths           unit='Number of deaths'
+```
+
+This is the strongest signal for separating sibling indicators whose labels sit
+close together — a rate from a count, a percentage from a number affected.
+Without it an agent has to choose an indicator, query it, and only then discover
+from the observation that it picked the wrong one.
+
+`UNIT_MEASURE` is an observation-level attribute in SDMX, not a dimension, so it
+cannot be read from structure. It is resolved with one bulk data probe per flow,
+cached for 24h, and is best-effort: a failed probe omits the unit rather than
+failing discovery. Pass `includeUnits=false` to skip it.
+
+Set `SDMX_UNIT_PROBE_AREAS` to a few well-populated area codes to keep the probe
+small (measured: 27KB/90 rows versus 1.48MB/5152 rows unrestricted, same
+coverage). Any indicator those areas do not cover is re-probed unrestricted, so
+correctness does not depend on the list.
+
 ### Discovery Ranking Policy
 
 The discovery ranking policy controls generic text-scoring behavior. By default the server auto-loads `discovery_policy.json`.
