@@ -304,17 +304,36 @@ def _tool_result_text(result: dict[str, Any]) -> str:
     return json.dumps(result.get("structuredContent") or result)[:8000]
 
 
+# Plain-text failures that are worth reissuing. The structured path is a JSON
+# body carrying `retryable`, but a tool can also fail before it builds one --
+# an exception rendered by the MCP layer arrives as a bare string, and one
+# whose exception had an empty message arrives as "Error calling tool 'x': "
+# with nothing after the colon. Those were never retried, so the model saw a
+# dead tool and could only report failure.
+_TRANSIENT_TEXT = re.compile(
+    r"(timed out|timeout|temporarily unavailable|transport failure"
+    r"|connection (?:reset|refused|error)"
+    r"|Error calling tool '[^']+':\s*$)",
+    re.IGNORECASE,
+)
+
+
 def _was_throttled(text: str) -> bool:
     """Whether an MCP result reported a retryable upstream failure.
 
     The server distinguishes a throttled registry from absent data. Models have
     been observed answering with a null value regardless, so the client retries
     before the answer is taken -- same reasoning as the Anthropic adapter.
+
+    Absent data is never retryable: a genuine `unresolved_from_official_flows`
+    must pass straight through, or a negative case becomes a retry loop.
     """
+    stripped = (text or "").strip()
     try:
-        payload = json.loads(text)
+        payload = json.loads(stripped)
     except (json.JSONDecodeError, TypeError):
-        return False
+        # Not JSON: the tool failed before it could build a result.
+        return bool(_TRANSIENT_TEXT.search(stripped))
     if not isinstance(payload, dict):
         return False
     return payload.get("retryable") is True or payload.get("status") in {

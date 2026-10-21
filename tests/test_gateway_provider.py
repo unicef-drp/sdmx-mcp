@@ -508,3 +508,45 @@ class TestGatewayRetry(unittest.TestCase):
         out = gateway._post_with_retry(Transport(), headers={}, payload={}, retries=2, backoff=0)
         self.assertEqual(out.status_code, 200)
         self.assertEqual(calls["n"], 2)
+
+
+class TestPlainTextTransientFailures(unittest.TestCase):
+    """A tool that fails before building a result still deserves a retry.
+
+    The structured path is a JSON body carrying `retryable`. But a tool can
+    fail earlier, and the MCP layer renders the exception as a bare string --
+    including, when the exception's message was empty, "Error calling tool
+    'x': " with nothing after the colon. Those were never retried, so the model
+    saw a dead tool and could only report failure, which graded as its error.
+    """
+
+    def test_an_empty_message_tool_error_is_retried(self) -> None:
+        self.assertTrue(gateway._was_throttled("Error calling tool 'get_single_observation': "))
+
+    def test_a_timeout_string_is_retried(self) -> None:
+        self.assertTrue(gateway._was_throttled("Upstream request timed out, please retry"))
+
+    def test_a_transport_failure_string_is_retried(self) -> None:
+        self.assertTrue(gateway._was_throttled("Upstream transport failure (ReadTimeout)."))
+
+    def test_connection_reset_is_retried(self) -> None:
+        self.assertTrue(gateway._was_throttled("connection reset by peer"))
+
+    def test_absent_data_is_never_retried(self) -> None:
+        # The critical boundary: retrying a genuine no-data result would turn
+        # every negative case into a retry loop and could flip a correct
+        # abstention into a wrong answer.
+        payload = json.dumps({"status": "unresolved_from_official_flows", "retryable": False})
+        self.assertFalse(gateway._was_throttled(payload))
+
+    def test_a_resolved_value_is_never_retried(self) -> None:
+        self.assertFalse(gateway._was_throttled(json.dumps({"status": "resolved", "value": "88"})))
+
+    def test_an_ordinary_tool_error_with_a_real_message_is_not_retried(self) -> None:
+        # A malformed call returns the same answer however often it is asked;
+        # retrying wastes money and hides the model's mistake.
+        self.assertFalse(gateway._was_throttled(
+            "Error calling tool 'get_single_observation': Unknown dimension(s) in filters: SUBJECT"))
+
+    def test_plain_prose_is_not_retried(self) -> None:
+        self.assertFalse(gateway._was_throttled("value: 4.2"))
