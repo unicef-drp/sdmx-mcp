@@ -377,9 +377,47 @@ async def _get_json(url: str) -> dict[str, Any]:
     return r.json()
 
 
+# Transport failures that mean "the request never completed", mapped onto the
+# HTTP status the rest of the server already classifies. httpx raises these
+# with an EMPTY str(), so letting one propagate produced a tool error reading
+# "Error calling tool 'get_single_observation': " with nothing after the
+# colon -- undiagnosable for the agent and for us. Measured at 172 occurrences
+# across 1,500 cases once the client ran 14 queries concurrently; a timeout is
+# an upstream failure and is retryable, which this server already has a shape
+# for.
+_TRANSPORT_STATUS: tuple[tuple[type[Exception], int], ...] = (
+    (httpx.ConnectTimeout, 504),
+    (httpx.ReadTimeout, 504),
+    (httpx.WriteTimeout, 504),
+    (httpx.PoolTimeout, 504),
+    (httpx.ConnectError, 503),
+    (httpx.ReadError, 502),
+    (httpx.WriteError, 502),
+    (httpx.RemoteProtocolError, 502),
+)
+
+
+def _transport_failure_status(exc: Exception) -> int | None:
+    """The HTTP status a transport error stands in for, or None if unknown."""
+    for kind, status in _TRANSPORT_STATUS:
+        if isinstance(exc, kind):
+            return status
+    return None
+
+
 async def _get_text_with_status(url: str) -> tuple[int, str]:
     logger.debug("GET text %s", url)
-    r = await _client().get(url)
+    try:
+        r = await _client().get(url)
+    except httpx.HTTPError as exc:
+        status = _transport_failure_status(exc)
+        if status is None:
+            raise
+        # Never surface an empty message: name the failure so the agent can
+        # tell a dead connection from absent data.
+        detail = str(exc).strip() or type(exc).__name__
+        logger.warning("Upstream transport failure for %s: %s", url, detail)
+        return status, f"Upstream transport failure ({detail})."
     return r.status_code, r.text
 
 
