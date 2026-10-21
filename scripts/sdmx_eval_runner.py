@@ -360,6 +360,21 @@ def _expected_value(rows: list[dict[str, Any]], value_column: str | None) -> dic
     return {"status": "multi_row", "value": None, "distinct_values": unique}
 
 
+def _normalize_flow_ref(value: Any) -> str:
+    """Reduce a flowRef to one comparable form.
+
+    SDMX writes the same flow two ways: "UNICEF/GLOBAL_DATAFLOW/1.0" is the
+    canonical reference and "UNICEF,GLOBAL_DATAFLOW,1.0" is the form the REST
+    path uses. Both name the same flow, and a model that reports whichever it
+    saw in a query URL is not wrong. Comparing the strings literally marks
+    those answers as a routing failure even when the value is exactly right.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.replace(",", "/").strip("/")
+
+
 def _normalize_decimal(value: Any) -> Decimal | None:
     if value is None:
         return None
@@ -987,37 +1002,57 @@ async def run_provider(
 
     responses_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
-    with responses_path.open("a", encoding="utf-8") as handle:
-        for case in pending:
-            payload = {
-                "provider_name": provider_name,
-                "provider": provider,
-                "registry": config.get("registry") or {},
-                "mcp": config.get("mcp") or {},
-                "case": case,
-                "contract": {
-                    "required_response_fields": ["answer_text", "claims"],
-                    "claims_shape": {
-                        "value": "string | number | null",
-                        "time_period": "string | null",
-                        "flowRef": "string | null",
-                        "filters": "object | null",
-                    },
+    # One provider subprocess per case, several in flight at once. Sequentially
+    # a 500-case manifest takes about 90 minutes, which makes comparing several
+    # models impractical. Each case is independent -- its own subprocess, its
+    # own MCP session -- so the only shared resources are the registry behind
+    # the MCP and the provider's rate limit, both of which answer a throttle
+    # with a retryable status the providers already back off on.
+    provider_concurrency = max(1, int(provider.get("concurrency") or 1))
+    semaphore = asyncio.Semaphore(provider_concurrency)
+    write_lock = asyncio.Lock()
+
+    async def _run_one(case: dict[str, Any]) -> None:
+        nonlocal written
+        payload = {
+            "provider_name": provider_name,
+            "provider": provider,
+            "registry": config.get("registry") or {},
+            "mcp": config.get("mcp") or {},
+            "case": case,
+            "contract": {
+                "required_response_fields": ["answer_text", "claims"],
+                "claims_shape": {
+                    "value": "string | number | null",
+                    "time_period": "string | null",
+                    "flowRef": "string | null",
+                    "filters": "object | null",
                 },
-            }
+            },
+        }
+        async with semaphore:
             provider_output = await _run_command_provider(command=command, env=base_env, payload=payload)
-            result = {
-                "case_id": case["case_id"],
-                "provider_name": provider_name,
-                "require_tool_use": bool(provider.get("require_tool_use")),
-                "required_tool_names": provider.get("required_tool_names"),
-                "max_answer_chars": provider.get("max_answer_chars"),
-                "status": provider_output.get("status", "ok"),
-                "prompt": case.get("prompt"),
-                "provider_output": provider_output,
-            }
+        result = {
+            "case_id": case["case_id"],
+            "provider_name": provider_name,
+            "require_tool_use": bool(provider.get("require_tool_use")),
+            "required_tool_names": provider.get("required_tool_names"),
+            "max_answer_chars": provider.get("max_answer_chars"),
+            "status": provider_output.get("status", "ok"),
+            "prompt": case.get("prompt"),
+            "provider_output": provider_output,
+        }
+        # Written and flushed as each case lands, not batched at the end, so an
+        # interrupted run keeps what it finished and --retry-failed resumes.
+        # Row order follows completion rather than the manifest; every consumer
+        # keys off case_id.
+        async with write_lock:
             handle.write(json.dumps(result, ensure_ascii=True) + "\n")
+            handle.flush()
             written += 1
+
+    with responses_path.open("a", encoding="utf-8") as handle:
+        await asyncio.gather(*(_run_one(case) for case in pending))
     ok_count = len(_jsonl_case_ids(responses_path, only_successful=True))
     return {
         "provider_name": provider_name,
@@ -1238,7 +1273,7 @@ def grade_results(
 
             flow_match = None
             if claims.get("flowRef") is not None:
-                flow_match = str(claims.get("flowRef")).strip() == str(case.get("flowRef")).strip()
+                flow_match = _normalize_flow_ref(claims.get("flowRef")) == _normalize_flow_ref(case.get("flowRef"))
 
             filter_matches: dict[str, bool | None] = {}
             claim_filters = claims.get("filters")
