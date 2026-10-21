@@ -74,12 +74,29 @@ def run_model(
     grades = out_dir / f"grades.{_slug(model)}.jsonl"
     manifest_n = len(_read_jsonl(manifest))
 
-    done = len([r for r in _read_jsonl(responses) if r.get("status") == "ok"])
+    rows = _read_jsonl(responses)
+    done = len([r for r in rows if r.get("status") == "ok"])
+    failed = len(rows) - done
     if force or done < manifest_n:
-        print(f"  running {model} ({done}/{manifest_n} already done)...", flush=True)
-        _run([sys.executable, str(RUNNER), "run-provider",
-              "--config", str(config), "--manifest", str(manifest),
-              "--responses", str(responses)], model)
+        print(f"  running {model} ({done}/{manifest_n} ok, {failed} failed)...", flush=True)
+        command = [sys.executable, str(RUNNER), "run-provider",
+                   "--config", str(config), "--manifest", str(manifest),
+                   "--responses", str(responses)]
+        # The runner treats any case already in the file as done, errored rows
+        # included, so without this a re-run prints "running" and writes
+        # nothing. That happened after a network outage left 408 of 500 cases
+        # failed: the sweep reported it was re-running them and silently
+        # reproduced the same file, and the resulting 16.8% read as the model's
+        # score.
+        if failed:
+            command.append("--retry-failed")
+        _run(command, model)
+        after = [r for r in _read_jsonl(responses) if r.get("status") == "ok"]
+        if len(after) <= done and failed:
+            raise SystemExit(
+                f"{model}: {failed} cases were failed and the re-run added none "
+                f"({done} ok before, {len(after)} after). Investigate before reporting."
+            )
     else:
         print(f"  {model}: responses complete, skipping run", flush=True)
 
