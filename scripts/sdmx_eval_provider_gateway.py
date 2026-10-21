@@ -64,6 +64,14 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+# Gateway statuses worth retrying: the request was never served, so reissuing
+# it is not a second opinion. 429 is rate limiting, 5xx and 408 are the
+# provider being briefly unavailable -- observed as a bare 503 from an
+# open-weight provider mid-run, which failed that case and would have scored
+# against the model.
+_RETRYABLE_GATEWAY_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
+
+
 # ------------------------------------------------------------------ MCP client
 
 
@@ -75,11 +83,14 @@ class McpSession:
     needed are small.
     """
 
-    def __init__(self, url: str, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(self, url: str, timeout: float = DEFAULT_TIMEOUT,
+                 retries: int = 3, backoff: float = 2.0) -> None:
         self.url = url
         self._client = httpx.Client(timeout=timeout)
         self._id = 0
         self._session_id: str | None = None
+        self._retries = max(0, retries)
+        self._backoff = backoff
 
     def __enter__(self) -> "McpSession":
         self._initialize()
@@ -100,12 +111,27 @@ class McpSession:
 
     def _rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         self._id += 1
-        response = self._client.post(
-            self.url,
-            headers=self._headers(),
-            json={"jsonrpc": "2.0", "id": self._id, "method": method,
-                  "params": params or {}},
-        )
+        body = {"jsonrpc": "2.0", "id": self._id, "method": method,
+                "params": params or {}}
+        # Reissue transport failures and transient statuses. A 500-case run
+        # takes over an hour, long enough for a laptop to change networks, and
+        # a single SSL EOF used to kill the case outright: one such episode
+        # destroyed 381 of 500 cases, all of them failing at session
+        # initialize, because the gateway POST had retry and this did not.
+        # Retrying a request that never completed is not a second opinion.
+        response: httpx.Response | None = None
+        for attempt in range(self._retries + 1):
+            try:
+                response = self._client.post(self.url, headers=self._headers(), json=body)
+            except httpx.HTTPError:
+                if attempt == self._retries:
+                    raise
+                time.sleep(self._backoff * (2**attempt))
+                continue
+            if response.status_code not in _RETRYABLE_GATEWAY_STATUS or attempt == self._retries:
+                break
+            time.sleep(self._backoff * (2**attempt))
+        assert response is not None
         if response.status_code >= 400:
             raise RuntimeError(f"MCP {method} -> HTTP {response.status_code}: {response.text[:400]}")
         session_id = response.headers.get("mcp-session-id")
@@ -206,14 +232,6 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
 
 _TERSE_VALUE = re.compile(r"value:\s*([^;\n]+)", re.IGNORECASE)
 _TERSE_PERIOD = re.compile(r"period:\s*([^;\n]+)", re.IGNORECASE)
-
-
-# Gateway statuses worth retrying: the request was never served, so reissuing
-# it is not a second opinion. 429 is rate limiting, 5xx and 408 are the
-# provider being briefly unavailable -- observed as a bare 503 from an
-# open-weight provider mid-run, which failed that case and would have scored
-# against the model.
-_RETRYABLE_GATEWAY_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
 
 
 def _post_with_retry(

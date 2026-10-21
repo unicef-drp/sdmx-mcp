@@ -550,3 +550,72 @@ class TestPlainTextTransientFailures(unittest.TestCase):
 
     def test_plain_prose_is_not_retried(self) -> None:
         self.assertFalse(gateway._was_throttled("value: 4.2"))
+
+
+class _FlakyMcpTransport:
+    """Raises, then returns a scripted sequence of statuses."""
+
+    def __init__(self, failures=0, statuses=None):
+        self.failures = failures
+        self.statuses = list(statuses or [])
+        self.attempts = 0
+
+    def post(self, url, headers=None, json=None):  # noqa: A002
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING]")
+        body = {"jsonrpc": "2.0", "id": self.attempts, "result": {"ok": True}}
+        response = _FakeResponse(body)
+        if self.statuses:
+            response.status_code = self.statuses.pop(0)
+        response.headers = {}
+        return response
+
+
+class TestMcpSessionRetry(unittest.TestCase):
+    """The MCP session must survive a network blip, like the gateway POST does.
+
+    A 500-case run takes over an hour -- long enough for a laptop to change
+    networks. One SSL EOF episode destroyed 381 of 500 cases, every one of them
+    failing at session initialize, because the gateway POST had retry and the
+    MCP client did not. The request never completed, so reissuing it is not a
+    second opinion.
+    """
+
+    def _session(self, transport, **kw):
+        session = gateway.McpSession("https://example.invalid/mcp", **kw)
+        session._client = transport
+        return session
+
+    def test_a_transient_ssl_failure_is_reissued(self) -> None:
+        transport = _FlakyMcpTransport(failures=2)
+        session = self._session(transport, retries=3, backoff=0)
+        self.assertEqual(session._rpc("initialize"), {"ok": True})
+        self.assertEqual(transport.attempts, 3)
+
+    def test_retries_are_bounded_and_then_raise(self) -> None:
+        transport = _FlakyMcpTransport(failures=99)
+        session = self._session(transport, retries=2, backoff=0)
+        with self.assertRaises(httpx.HTTPError):
+            session._rpc("initialize")
+        self.assertEqual(transport.attempts, 3)
+
+    def test_a_transient_status_is_reissued(self) -> None:
+        transport = _FlakyMcpTransport(statuses=[503, 200])
+        session = self._session(transport, retries=3, backoff=0)
+        self.assertEqual(session._rpc("tools/list"), {"ok": True})
+        self.assertEqual(transport.attempts, 2)
+
+    def test_a_real_rejection_is_not_reissued(self) -> None:
+        # A 400 returns the same answer however often it is asked.
+        transport = _FlakyMcpTransport(statuses=[400, 200])
+        session = self._session(transport, retries=3, backoff=0)
+        with self.assertRaises(RuntimeError):
+            session._rpc("tools/call")
+        self.assertEqual(transport.attempts, 1)
+
+    def test_no_retry_when_the_first_attempt_succeeds(self) -> None:
+        transport = _FlakyMcpTransport()
+        session = self._session(transport, retries=3, backoff=0)
+        session._rpc("initialize")
+        self.assertEqual(transport.attempts, 1)
