@@ -169,10 +169,30 @@ def _parse_rpc_body(text: str) -> dict[str, Any]:
     raise RuntimeError(f"Unreadable MCP response: {text[:300]}")
 
 
-def mcp_tools_as_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Describe MCP tools in the OpenAI function-calling shape."""
+def mcp_tools_as_openai(
+    tools: list[dict[str, Any]],
+    deny: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Describe MCP tools in the OpenAI function-calling shape.
+
+    ``deny`` withholds named tools from the model. It exists for the ablation
+    the report's architectural claim needs: strip the curated discovery layer,
+    leave the tools that correspond to native SDMX REST operations, and measure
+    what happens.
+
+    This is a *proxy* for "why not let the model read the REST API itself", and
+    a generous one. The ablated arm still gets structured tool schemas, our
+    validation layer explaining its mistakes, scope enforcement, caching and
+    transport retry, and never has to parse SDMX-JSON or build a URL. A model
+    genuinely working against the raw API has none of that, so the measured
+    drop is a lower bound on what the discovery layer is worth rather than an
+    estimate of it.
+    """
+    deny = deny or set()
     out: list[dict[str, Any]] = []
     for tool in tools:
+        if str(tool.get("name")) in deny:
+            continue
         schema = tool.get("inputSchema") or tool.get("input_schema") or {
             "type": "object", "properties": {}
         }
@@ -201,6 +221,10 @@ def _api_key(provider: dict[str, Any]) -> str:
     return value
 
 
+# A deeply unbalanced tail is malformed output, not a dropped delimiter.
+_MAX_UNCLOSED = 4
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     stripped = (text or "").strip()
     if not stripped:
@@ -226,7 +250,54 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
             if isinstance(parsed, dict):
                 return parsed
         except json.JSONDecodeError:
-            return None
+            pass
+    return _close_json_object(stripped[start:] if start >= 0 else stripped)
+
+
+def _close_json_object(text: str) -> dict[str, Any] | None:
+    """Parse an object that is complete except for its closing delimiters.
+
+    Some models end a well-formed answer one brace short. Discarding it scores
+    a formatting slip as an inability to query a registry: every one of
+    ministral-8b's unparseable responses was an otherwise complete object
+    missing a single '}', which would have cost it roughly nineteen points.
+
+    Deliberately conservative. Only closing delimiters are appended, in the
+    order the unclosed ones require, and the result is accepted only if it
+    parses and carries the fields the contract asks for -- so this cannot
+    invent an answer where the model produced none.
+    """
+    text = (text or "").strip()
+    if not text.startswith("{"):
+        return None
+    stack: list[str] = []
+    in_string = escape = False
+    for char in text:
+        if escape:
+            escape = False
+            continue
+        if in_string and char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char in "{[":
+            stack.append(char)
+        elif char in "}]" and stack:
+            stack.pop()
+    if not stack or len(stack) > _MAX_UNCLOSED:
+        return None
+    suffix = '"' if in_string else ""
+    suffix += "".join("}" if char == "{" else "]" for char in reversed(stack))
+    try:
+        parsed = json.loads(text + suffix)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict) and ("answer_text" in parsed or "claims" in parsed):
+        return parsed
     return None
 
 
@@ -410,17 +481,26 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
     tool_trace: list[dict[str, Any]] = []
+    routes: list[str] = []
     usage = {"input_tokens": 0, "output_tokens": 0}
     cost = 0.0
 
     with McpSession(url) as session:
-        tools = mcp_tools_as_openai(session.list_tools())
+        deny = {str(name) for name in (provider.get("deny_tools") or [])}
+        tools = mcp_tools_as_openai(session.list_tools(), deny)
+        if deny and not tools:
+            raise SystemExit(
+                "provider.deny_tools withheld every tool; the model would have "
+                "nothing to call and the run would measure nothing."
+            )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system + contract},
             {"role": "user", "content": prompt},
         ]
 
         final_text = ""
+        final_finish_reason = ""
+        final_reasoning = ""
         truncated = False
         # A model can keep calling tools until the step ceiling and never write
         # an answer. That is a third harness limit, distinct from truncation
@@ -454,6 +534,12 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
             usage["output_tokens"] += int(use.get("completion_tokens") or 0)
             cost += float((use.get("cost") or 0) or 0)
 
+            meta = (body.get("choices") or [{}])[0].get("message") or {}
+            routing = ((meta.get("provider_metadata") or {}).get("gateway") or {}).get("routing") or {}
+            served_by = str(routing.get("resolvedProvider") or "")
+            if served_by and served_by not in routes:
+                routes.append(served_by)
+
             choice = (body.get("choices") or [{}])[0]
             # "length" means the model ran out of budget mid-thought. That is a
             # harness setting, not a wrong answer, and conflating the two makes
@@ -471,6 +557,14 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
                 final_text = message.get("content") or ""
                 truncated = finish_reason == "length"
                 steps_exhausted = False
+                # Reasoning models can finish normally having written their
+                # answer into the reasoning channel and left content empty.
+                # Captured for diagnosis rather than used: gpt-oss-20b returned
+                # empty content on 115 of 500 cases with no truncation and no
+                # step exhaustion, and whether the answer was in here decides
+                # whether that is our bug or its behaviour.
+                final_finish_reason = finish_reason
+                final_reasoning = str(message.get("reasoning") or "")
                 break
 
             for call in calls:
@@ -525,6 +619,11 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
         "tool_trace": tool_trace,
         "usage": usage,
         "model": model,
+        # Which inference host(s) answered. Several per case is normal: the
+        # gateway routes each step independently, and for an open-weight model
+        # precision, sampling defaults and the tool-call parser all belong to
+        # the host rather than to the weights.
+        "served_by": routes,
         # The gateway reports real cost per request and adds no markup, so this
         # is measured rather than derived from a price table that drifts.
         "estimated_cost_usd": round(cost, 8) if cost else None,
@@ -547,6 +646,10 @@ def run_case(payload: dict[str, Any]) -> dict[str, Any]:
         result["error"] = reason
         result["truncated"] = truncated
         result["steps_exhausted"] = steps_exhausted
+        result["finish_reason"] = final_finish_reason
+        # Only on failure, and capped: enough to tell where the answer went
+        # without turning every error row into a transcript.
+        result["reasoning_tail"] = final_reasoning[-600:]
     return result
 
 

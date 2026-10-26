@@ -619,3 +619,110 @@ class TestMcpSessionRetry(unittest.TestCase):
         session = self._session(transport, retries=3, backoff=0)
         session._rpc("initialize")
         self.assertEqual(transport.attempts, 1)
+
+
+class TestClosingDelimiterRecovery(unittest.TestCase):
+    """An answer one brace short is a formatting slip, not a failed query.
+
+    Measured: every one of ministral-8b's unparseable responses was a complete
+    object missing a single '}'. Discarded, they scored as misses and would
+    have published the model roughly nineteen points below its real accuracy --
+    the same class of error that once reported 77.6% for a model at 96.2%.
+    """
+
+    REAL = (
+        '{"answer_text": "value: null; unavailable.", "claims": {"value": null, '
+        '"time_period": "2020", "flowRef": "UNICEF/GLOBAL_DATAFLOW/1.0", "filters": '
+        '{"REF_AREA": "AZE", "INDICATOR": "CME_TMY5T24", "Sex": "Total"}}'
+    )
+
+    def test_the_real_truncated_response_parses(self) -> None:
+        parsed = gateway._extract_json_object(self.REAL)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["claims"]["time_period"], "2020")
+        self.assertIsNone(parsed["claims"]["value"])
+
+    def test_a_complete_object_is_unaffected(self) -> None:
+        parsed = gateway._extract_json_object('{"answer_text": "value: 5", "claims": {}}')
+        self.assertEqual(parsed["answer_text"], "value: 5")
+
+    def test_an_unterminated_string_is_closed(self) -> None:
+        parsed = gateway._extract_json_object('{"answer_text": "value: 5', )
+        self.assertEqual(parsed["answer_text"], "value: 5")
+
+    def test_prose_is_not_rescued(self) -> None:
+        """Nemo's incoherent output must still be reported as a failure."""
+        self.assertIsNone(gateway._extract_json_object("  رعاية الطفل"))
+        self.assertIsNone(gateway._extract_json_object(" anking the tasks...\""))
+
+    def test_an_object_without_the_contract_fields_is_refused(self) -> None:
+        """Closing braces must not manufacture an answer from unrelated JSON."""
+        self.assertIsNone(gateway._extract_json_object('{"jsonrpc": "2.0", "method": "x"'))
+
+    def test_a_wildly_unbalanced_tail_is_refused(self) -> None:
+        self.assertIsNone(gateway._extract_json_object('{"claims": {"a": {"b": {"c": {"d": {"e": 1'))
+
+
+class TestToolDenylist(unittest.TestCase):
+    """Withholding tools is how the architectural claim gets tested.
+
+    The report argues that the curated discovery layer is what lets a cheap
+    model resolve names to registry codes. Measuring that needs a run with
+    those tools removed and raw structure access left in place -- the
+    "why not let the model read the REST API itself" counterfactual.
+    """
+
+    TOOLS = [
+        {"name": "get_single_observation", "inputSchema": {"type": "object"}},
+        {"name": "find_indicator_candidates", "inputSchema": {"type": "object"}},
+        {"name": "guided_discover", "inputSchema": {"type": "object"}},
+    ]
+
+    def test_no_denylist_passes_everything_through(self) -> None:
+        out = gateway.mcp_tools_as_openai(self.TOOLS)
+        self.assertEqual([t["function"]["name"] for t in out],
+                         ["get_single_observation", "find_indicator_candidates",
+                          "guided_discover"])
+
+    def test_denied_tools_are_withheld(self) -> None:
+        out = gateway.mcp_tools_as_openai(
+            self.TOOLS, {"find_indicator_candidates", "guided_discover"})
+        self.assertEqual([t["function"]["name"] for t in out],
+                         ["get_single_observation"])
+
+    def test_an_unknown_denied_name_is_harmless(self) -> None:
+        out = gateway.mcp_tools_as_openai(self.TOOLS, {"no_such_tool"})
+        self.assertEqual(len(out), 3)
+
+    def test_schemas_survive_filtering(self) -> None:
+        out = gateway.mcp_tools_as_openai(self.TOOLS, {"guided_discover"})
+        self.assertEqual(out[0]["function"]["parameters"], {"type": "object"})
+
+
+class TestResultShape(unittest.TestCase):
+    """Diagnostic fields belong in the result, not in the outgoing request.
+
+    `served_by` was patched into the request body by mistake. The gateway
+    ignored the unknown field, Python accepted the indentation because dict
+    literals tolerate it, the tests passed, and 2,664 cases were collected with
+    no routing data at all. Nothing failed -- the field was simply absent, and
+    absence is exactly the signal this project keeps mistaking for success.
+    """
+
+    def test_served_by_is_a_result_field(self) -> None:
+        import inspect
+        src = inspect.getsource(gateway.run_case)
+        result_pos = src.index('"tool_trace": tool_trace')
+        served_pos = src.index('"served_by"')
+        # The result dict is built after the request loop, so a correctly
+        # placed field sits after the trace key rather than before it.
+        self.assertGreater(served_pos, result_pos)
+
+    def test_request_body_carries_no_diagnostic_fields(self) -> None:
+        import inspect
+        src = inspect.getsource(gateway.run_case)
+        request_block = src[src.index('request: dict[str, Any] = {'):]
+        request_block = request_block[:request_block.index('}')]
+        for field in ('served_by', 'reasoning_tail', 'finish_reason'):
+            self.assertNotIn(field, request_block,
+                             f"{field} must not be sent to the gateway")
