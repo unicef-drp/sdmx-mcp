@@ -14,6 +14,8 @@ not the transport (empty, as before).
 """
 
 import asyncio
+import contextlib
+import inspect
 import unittest
 from unittest.mock import patch
 
@@ -75,14 +77,24 @@ class TestDiscoveryDuringOutage(unittest.TestCase):
             return result
 
         async def go():
-            with patch.object(server, "_cached_dataflows", return_value={}), patch.object(
-                server, "_extract_scoped_dataflows", return_value=SCOPED_FLOWS
-            ), patch.object(
-                server, "_get_flow_structure", side_effect=fake_structure
-            ), patch.object(server, "_annotate_units", return_value=None):
-                return await server._find_indicator_candidates_impl(
-                    query="neonatal", includeUnits=False
-                )
+            # Unit annotation is a newer feature and is absent on branches that
+            # predate it. This test is about outage behaviour, so it adapts
+            # rather than requiring that feature to exist.
+            patches = [
+                patch.object(server, "_cached_dataflows", return_value={}),
+                patch.object(server, "_extract_scoped_dataflows", return_value=SCOPED_FLOWS),
+                patch.object(server, "_get_flow_structure", side_effect=fake_structure),
+            ]
+            if hasattr(server, "_annotate_units"):
+                patches.append(patch.object(server, "_annotate_units", return_value=None))
+            kwargs = {"query": "neonatal"}
+            params = inspect.signature(server._find_indicator_candidates_impl).parameters
+            if "includeUnits" in params:
+                kwargs["includeUnits"] = False
+            with contextlib.ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                return await server._find_indicator_candidates_impl(**kwargs)
 
         return asyncio.run(go())
 
