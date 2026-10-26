@@ -99,3 +99,41 @@ class TestSummarise(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTornFinalLine(unittest.TestCase):
+    """A partial append must not kill a sweep; real corruption still must.
+
+    The runner appends from several workers, so a read immediately after it
+    exits can catch the last line mid-write. That raised a bare
+    JSONDecodeError and ended a sweep after seven models were already
+    measured -- and the file was valid again moments later.
+    """
+
+    def _write(self, text: str) -> Path:
+        path = Path(self.tmp.name) / "responses.jsonl"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_complete_file_reads_fully(self) -> None:
+        path = self._write('{"a": 1}\n{"a": 2}\n')
+        self.assertEqual(len(sweep._read_jsonl(path)), 2)
+
+    def test_torn_final_line_is_skipped(self) -> None:
+        path = self._write('{"a": 1}\n{"a": 2}\n{"a": 3, "b": ')
+        rows = sweep._read_jsonl(path)
+        self.assertEqual([r["a"] for r in rows], [1, 2])
+
+    def test_corruption_mid_file_still_raises(self) -> None:
+        """Lines following a bad one mean it was fully written, so it is real."""
+        path = self._write('{"a": 1}\n{"a": 2, "b": \n{"a": 3}\n')
+        with self.assertRaises(SystemExit) as caught:
+            sweep._read_jsonl(path)
+        self.assertIn("line 2", str(caught.exception))
+
+    def test_missing_file_is_empty(self) -> None:
+        self.assertEqual(sweep._read_jsonl(Path(self.tmp.name) / "nope.jsonl"), [])

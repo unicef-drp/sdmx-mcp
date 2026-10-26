@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -42,13 +43,40 @@ def _slug(model: str) -> str:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read a JSONL file, tolerating a torn final line.
+
+    The runner appends from several workers, so reading immediately after it
+    exits can catch the last line mid-write. That killed a sweep with a bare
+    JSONDecodeError after seven models had already been measured, and the file
+    was perfectly valid moments later.
+
+    A malformed *last* line is therefore skipped as a partial append. A
+    malformed line anywhere else is real corruption and still raises, with the
+    file and line named rather than a raw traceback.
+    """
     if not path.exists():
         return []
+    lines = path.read_text(encoding="utf-8").splitlines()
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for number, line in enumerate(lines, start=1):
         line = line.strip()
-        if line:
+        if not line:
+            continue
+        try:
             rows.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            if number == len(lines):
+                logging.warning(
+                    "%s: ignoring torn final line (%d bytes) -- a partial "
+                    "append from a writer that had not finished flushing.",
+                    path, len(line),
+                )
+                continue
+            raise SystemExit(
+                f"{path} line {number} is not valid JSON ({exc}). This is "
+                "corruption rather than a partial write, because later lines "
+                "follow it. Investigate before reporting any number from it."
+            ) from exc
     return rows
 
 
