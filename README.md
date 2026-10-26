@@ -23,6 +23,10 @@ This project lets an LLM client do a full guided data journey:
 - `scripts/sdmx_eval_model_sweep.py`: runs one manifest across many models and tabulates accuracy against measured cost, per stratum. Resumable.
 - `scripts/sdmx_eval_refresh_ground_truth.py`: re-reads expected values from the live registry. Run it immediately before grading, every time.
 - `scripts/sdmx_eval_normalise_claims.py`: applies claim recovery to response files already collected, so a harness fix can be applied retroactively.
+- `scripts/sdmx_eval_consolidate.py`: gathers runs from several directories into one, refusing to pair grades with responses from a different run.
+- `scripts/sdmx_eval_stats.py`: per-model accuracy, Wilson intervals, measured cost, token profile and tool-error classification.
+- `scripts/sdmx_eval_pooled.py`: per-stratum pass rates and the spread across models — the difficulty gradient.
+- `scripts/sdmx_eval_variance.py`: how far a figure moves across identical repeat runs, and which serving host answered.
 - `scripts/sdmx_eval_config.example.json`: example config for deterministic case generation and provider runs.
 - `scripts/sdmx_eval_provider_anthropic.py`: Anthropic Messages API adapter using Anthropic's MCP connector.
 - `scripts/sdmx_eval_provider_template.py`: stdin/stdout adapter template for wiring any LLM+MCP stack into the eval harness.
@@ -1006,6 +1010,48 @@ what survives.
 `scripts/sdmx_eval_normalise_claims.py` applies the terse-answer claim recovery
 to response files already collected, so a harness improvement can be applied
 retroactively without re-running a model.
+
+### Analysis layer
+
+Four scripts turn graded output into the numbers a report can quote. They take
+a run directory, discover the models in it by scanning rather than from a list,
+and write their JSON into that directory.
+
+```bash
+# Gather runs; later sources supersede earlier ones, so list a retry after the
+# original it replaces.
+python3 scripts/sdmx_eval_consolidate.py tmp/final tmp/sweep tmp/sweep-retried
+
+python3 scripts/sdmx_eval_stats.py    tmp/final     # -> tmp/final/stats.json
+python3 scripts/sdmx_eval_pooled.py   tmp/final     # -> tmp/final/pooled.json
+python3 scripts/sdmx_eval_variance.py tmp/repeats   # -> tmp/repeats/variance.json
+```
+
+`stats.py` reports accuracy with a **Wilson** interval rather than the normal
+approximation, because these proportions sit near 1 where the normal interval
+runs past 100%. It also reports the token profile, since input dominates by
+roughly 35:1 on this workload and a per-token price list therefore misleads
+about cost per task.
+
+`pooled.py` reports the per-stratum spread across models, which is the finding
+worth having: models agree where a query is fully specified and diverge where
+codes must be resolved. **It excludes models averaging under one tool call per
+case**, decided on tool use rather than on score — a model that never gets the
+server to answer records zero on every stratum, which makes every range the
+full 100 points and erases the gradient. Pooled pass rates include every model,
+and the exclusion is reported in the output.
+
+`variance.py` reports the accuracy spread across repeats *and* the share of
+individual cases that change verdict, because a stable headline can sit on top
+of unstable answers. It also tabulates pass rate by serving host where a model
+was served by more than one.
+
+**Two refusals worth knowing about.** All of them stop rather than average when
+a model's grades and responses have different lengths — that pairing reports
+accuracy from one run and cost from another, and it happened once with 500
+graded cases against 100 re-run responses. `consolidate.py` additionally
+refuses a file whose rows contain duplicate `case_id`s, since those would be
+graded twice.
 
 ### Repeat a run before publishing a number
 
