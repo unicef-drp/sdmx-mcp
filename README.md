@@ -20,6 +20,9 @@ This project lets an LLM client do a full guided data journey:
 - `scripts/sdmx_eval_build_cases_from_sweep.py`: stratified agent-eval cases drawn from the sweep's verified ground truth.
 - `scripts/agent_test_rig.py`: direct tool-call harness that simulates an agent workflow.
 - `scripts/sdmx_eval_runner.py`: generic SDMX eval harness for case generation, provider execution, and grading.
+- `scripts/sdmx_eval_model_sweep.py`: runs one manifest across many models and tabulates accuracy against measured cost, per stratum. Resumable.
+- `scripts/sdmx_eval_refresh_ground_truth.py`: re-reads expected values from the live registry. Run it immediately before grading, every time.
+- `scripts/sdmx_eval_normalise_claims.py`: applies claim recovery to response files already collected, so a harness fix can be applied retroactively.
 - `scripts/sdmx_eval_config.example.json`: example config for deterministic case generation and provider runs.
 - `scripts/sdmx_eval_provider_anthropic.py`: Anthropic Messages API adapter using Anthropic's MCP connector.
 - `scripts/sdmx_eval_provider_gateway.py`: Vercel AI Gateway adapter; runs the MCP tool loop locally so any gateway model can be scored on the same manifest.
@@ -161,8 +164,16 @@ Retryable responses carry `httpStatus` and a message that explicitly denies abse
 > transport failure back into "no data". For a user that is the worst outcome: a
 > transient 429 surfacing as a confident "no data for Liechtenstein".
 >
-> This is not fixable server-side; the distinction is already made and correctly
-> labelled. Any client built on this MCP should do **both**:
+> The *data* path labels this correctly. The **discovery** path did not, until
+> October 2026: `find_indicator_candidates` sweeps every scoped flow and skipped
+> the ones it could not read, which is right when one flow of many is broken. In
+> a total registry outage every fetch failed, every failure was skipped, and the
+> tool returned an empty list with `isError: false`. A model asked for "total
+> population" was told, in effect, that the registry holds no such indicator —
+> and abstained. Discovery now raises when nothing was readable *and* the cause
+> was the transport, while still skipping a single unreadable flow.
+>
+> Beyond that, any client built on this MCP should do **both**:
 >
 > 1. **Retry in the client**, with backoff, before the model sees the result.
 >    `scripts/sdmx_eval_provider_anthropic.py` does this via `throttle_retries`
@@ -192,6 +203,25 @@ Override it with either:
 - `SDMX_DEFAULT_LAST_N_OBSERVATIONS`
 
 An example file is included at `query_dimension_policy.example.json`.
+
+> [!IMPORTANT]
+> **Writing this policy is a deployment step, not an optimisation.** Which
+> dimension carries the subject role, which the geography, which the time, and
+> which tokens to ignore when scoring a query, are properties of *your*
+> registry and of the questions your office actually receives. They cannot ship
+> with useful universal defaults, which is why the repository carries an example
+> rather than a working file — and why `main` does not carry one at all.
+>
+> Discovery scoring does not function without it: `_query_tokens` reads the
+> policy to get its stopword list, so an unconfigured deployment fails on the
+> discovery path rather than degrading. In this repository that accounts for 47
+> of the test failures on a branch without one.
+>
+> It is a small piece of work — a single JSON file, an afternoon with somebody
+> who knows the registry's conventions — but it is not optional, and a
+> deployment that skips it will conclude the tooling does not work rather than
+> that it was never configured. Plan it alongside pointing `SDMX_BASE_URL` at
+> your endpoint and declaring which dataflows are in scope.
 
 Example policy:
 
@@ -752,6 +782,18 @@ Important output fields:
 
 The grader relies primarily on those structured claims, not on free-form prose alone.
 
+Diagnostic fields, for attributing a failure rather than guessing at it:
+- `served_by`: the inference host(s) that answered, one per step. For an
+  open-weight model the numerical precision, the sampling defaults and the
+  **tool-call parser** all belong to the host rather than to the weights, so
+  without this a cluster of failures cannot be told apart from a bad route.
+- `truncated`, `steps_exhausted`: harness ceilings hit, each distinct from a
+  wrong answer and from a malformed one.
+- `finish_reason`, `reasoning_tail` (failures only): where the answer went when
+  there is no answer. A reasoning model can finish normally having written its
+  response into a reasoning channel and left `content` empty — worth ruling out
+  before concluding the model produced nothing.
+
 ### Anthropic Adapter
 
 `scripts/sdmx_eval_provider_anthropic.py` calls the Anthropic Messages API and passes your MCP server via the `mcp_servers` request field. It expects:
@@ -789,9 +831,63 @@ retroactively.
 It is deliberately conservative: a value is rewritten only when exactly one
 observation pins it. A period returning several observations, or a fetch that
 errors, leaves the case exactly as it was rather than inventing ground truth —
-a transport failure must never read as "the data is gone". The summary reports
-how many cases were changed, left alone, and how many negative cases have since
-gained data (those are no longer negative cases and need regenerating).
+a transport failure must never read as "the data is gone".
+
+**Three things it does that are easy to miss.**
+
+*Withdrawal flips the expectation, not just the value.* When a series is gone
+the expected value becomes null **and** the case's `caseType` becomes
+`negative` with `expectedBehavior: abstain_no_data`. Nulling the value alone
+left the case contradicting itself — the grader reads the top-level fields — so
+a model that correctly abstained scored `manual_review`, a verdict nobody goes
+back to review. Six withdrawn `PV_CHLD_*` cases sat that way and cost every
+measured model a point. This is applied even when the value was already null,
+so a manifest an earlier pass left half-refreshed gets repaired.
+
+*It retries, because the registry throttles without saying so.* Limits are per
+client address, hard, and carry **no `Retry-After` and no rate-limit headers**,
+so a client cannot pace itself except by guessing. Without backoff, 494 of 500
+cases came back 429 and were reported as "left alone" beneath a summary reading
+`value_changed: 0` — a refresh that checked almost nothing looked exactly like
+one that confirmed everything. The summary now includes
+`left_alone_reasons`, so you can see *why* cases were skipped.
+
+*Every answered case is stamped* `verified_against_registry`, whether or not
+its value moved. The grader needs that to tell "the model abstained and a value
+demonstrably exists" from "the model abstained and nobody checked". A throttled
+case is never stamped.
+
+Summary fields: `value_changed`, `unchanged`, `left_alone`,
+`left_alone_reasons`, `reclassified_to_abstain`, and
+`negative_cases_that_now_have_data` (those are no longer negative cases and
+need regenerating).
+
+### Grading an abstention
+
+A model answering `null` where the manifest expects a value is either a miss or
+a correct refusal against stale ground truth, and the grader cannot tell which
+by itself. It used to defer every such case to `manual_review`; 55 accumulated
+across seven models, and checking them by hand against the registry found 54
+genuine misses and one withdrawn series that refreshing had already handled.
+
+So the rule is narrow: an abstention is a **failure** when the ground truth
+carries `verified_against_registry` from the refresh pass, and still
+`manual_review` when it does not. Failing an abstention against truth that has
+quietly gone stale is the original error, and it is worse than deferring.
+
+### Retry transient failures before grading
+
+A provider error is not a wrong answer, and grading it as one is
+indistinguishable from incompetence in the final table. Measured: a 500-case
+run showed 116 empty responses from one model; a single `--retry-failed` pass
+recovered 70 of them and moved that model from 68.4% to 84.4%. Across nine
+models, 474 outstanding provider errors were pending at one point.
+
+Re-run the same sweep command: each model with errored rows gets
+`--retry-failed`, complete models are skipped, and everything is re-graded.
+Then confirm the grades were actually rewritten — a sweep that runs the retry
+but dies before grading leaves stale verdicts beside improved responses, which
+reads as "the retry did nothing".
 
 ### Gateway Adapter (multi-model)
 
@@ -838,6 +934,99 @@ is not purely a model difference.
 
 Cost is read from the gateway's own per-request `usage.cost` rather than from a
 local price table, since the gateway bills at list price with no markup.
+
+**`provider.deny_tools`** withholds named tools from the model. It exists for
+ablation: strip the curated discovery and resolution tools, leave the ones
+corresponding to native SDMX REST operations (`get_flow_structure`,
+`list_dimensions`, `list_codes`, `get_single_observation`, `query_data`,
+`get_time_series`), and measure what the guided layer is worth. It refuses to
+run if the denylist would leave no tools at all.
+
+Measured on the resolution strata: the best model tested fell from 99.4% to
+54.8% and the next from 97.8% to 2.7%, with tool calls per question rising from
+5.3 to between 35 and 98 and a third to a half of cases exhausting the step
+ceiling. Treat that as a **lower bound** on the discovery layer's value rather
+than an estimate — the ablated arm still receives structured tool schemas, the
+validation layer explaining each malformed request, scope enforcement and
+caching, and never has to build a URL or parse SDMX-JSON. A model working
+against the raw REST interface has none of that.
+
+If you set `deny_tools`, strip tool names out of `provider.system_prompt` too.
+Routing advice naming tools the model cannot see measures prompt/tool mismatch
+rather than the missing layer.
+
+### Model Sweep (many models, one manifest)
+
+`scripts/sdmx_eval_model_sweep.py` runs one manifest across several models and
+tabulates accuracy against measured cost, per stratum. Each model is run and
+graded through the normal runner, so a sweep is exactly equivalent to issuing
+the commands by hand — it only removes the bookkeeping, and every number still
+traces back to the transcript that produced it.
+
+```bash
+python3 scripts/sdmx_eval_model_sweep.py \
+  --config scripts/sdmx_eval_config.unicef_global.gateway.example.json \
+  --manifest tmp/eval/manifest.fresh.jsonl \
+  --out-dir tmp/sweep \
+  --summary-json tmp/sweep/summary.json \
+  --models zai/glm-5.3-flash deepseek/deepseek-v4.1-flash anthropic/claude-haiku-5.5
+```
+
+Models are discovered from the run directory by the downstream analysis rather
+than listed in it, and responses and grades are kept per model.
+
+**It is resumable, and that is load-bearing.** Re-running the same command
+retries each model's errored rows with `--retry-failed`, skips models that are
+already complete, and re-grades. Three behaviours exist because each one cost a
+published-looking number:
+
+- **The runner treats any case already in the file as done, errored rows
+  included.** Without `--retry-failed` a re-run prints "running" and writes
+  nothing. After a network outage left 408 of 500 cases failed, a sweep reported
+  it was re-running them, reproduced the same file, and the resulting **16.8%**
+  read as the model's score. The sweep now raises if a retry adds no cases.
+- **A torn final line is tolerated; corruption is not.** The runner appends from
+  several workers, so reading immediately after it exits can catch the last line
+  mid-write — which once ended a sweep with a bare `JSONDecodeError` after seven
+  models had been measured, on a file that was valid moments later. A malformed
+  *last* line is skipped as a partial append; a malformed line with others after
+  it is real corruption and stops the sweep, naming the file and line.
+- **`--retry-failed` rewrites the responses file atomically.** Records reach
+  1.7MB, so rebuilding in place leaves a long window where the file is half
+  written; one 500-case run came back with a record torn across two lines. The
+  rewrite now writes a sibling and renames.
+
+**Screen before you commit.** Capability at tool use varies far more than price
+does, and the gap does not appear on easy questions. Screening 11 models on a
+74-case manifest cost **$4.52** and separated models that drive the server from
+ones that cannot — one of which never successfully called a tool at all, and
+answered population questions from memory instead. Spend a full run only on
+what survives.
+
+`scripts/sdmx_eval_normalise_claims.py` applies the terse-answer claim recovery
+to response files already collected, so a harness improvement can be applied
+retroactively without re-running a model.
+
+### Repeat a run before publishing a number
+
+A single run is an estimate. Measured over three identical runs of the same 148
+cases: competent models vary by **0.7 to 2.0 points**, and that is a reasonable
+error bar to carry against any single figure. One model varied by **10.1
+points**, with **half its cases returning a different verdict** between
+identical runs — a far more disqualifying property than its headline score, and
+invisible to any single run at any sample size.
+
+Report both the accuracy spread *and* the share of individual cases that change
+verdict. A stable headline can sit on top of unstable answers: one model held a
+1.4-point spread while 4.7% of its cases churned, three times the rate of the
+most stable model measured.
+
+Run-to-run variance tracked model competence rather than open-weight versus
+commercial licensing — a first-party commercial model and the best open-weight
+model returned identical 0.7-point spreads. And when the serving host was
+recorded for every request of the least stable model, all 444 went to the same
+host, so its instability is within-host rather than an artefact of the gateway
+switching between them.
 
 
 ## Connector Setup
