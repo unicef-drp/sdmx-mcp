@@ -4737,15 +4737,31 @@ async def _find_indicator_candidates_impl(
         flow_desc = _coerce_text(df.get("description")) or _coerce_text(df.get("descriptions"))
         flow_metas.append((df_id, agency, version, flow_ref, flow_name, flow_desc))
 
-    async def _fetch_safe(flow_ref: str) -> dict[str, Any] | None:
+    async def _fetch_safe(
+        flow_ref: str,
+    ) -> tuple[dict[str, Any] | None, httpx.HTTPError | None]:
         async with _STRUCTURE_FETCH_SEMAPHORE:
             try:
-                return await _get_flow_structure(flow_ref)
-            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                return await _get_flow_structure(flow_ref), None
+            except httpx.HTTPError as exc:
+                # Remembered rather than discarded: skipping one unreadable flow
+                # among many is right, but when every flow fails the transport
+                # the empty candidate list that follows is a statement about the
+                # registry, not about the data. A model reads it as "no such
+                # indicator exists" and abstains -- which is what a registry
+                # outage did to a whole eval run.
+                logger.debug("Transport failure for flow %s: %s", flow_ref, exc)
+                return None, exc
+            except (ValueError, KeyError) as exc:
                 logger.debug("Skipping flow %s: %s", flow_ref, exc)
-                return None
+                return None, None
 
-    structures = await asyncio.gather(*[_fetch_safe(meta[3]) for meta in flow_metas])
+    fetched = await asyncio.gather(*[_fetch_safe(meta[3]) for meta in flow_metas])
+    structures = [structure for structure, _ in fetched]
+    if flow_metas and not any(s is not None for s in structures):
+        transport_failure = next((exc for _, exc in fetched if exc is not None), None)
+        if transport_failure is not None:
+            raise transport_failure
 
     merged: dict[str, dict[str, Any]] = {}
     for (df_id, agency, version, flow_ref, flow_name, flow_desc), structure in zip(flow_metas, structures):
