@@ -14,12 +14,14 @@ re-running a single model.
 One query per case, bounded concurrency. A case whose value cannot be
 re-confirmed is left exactly as it was rather than guessed at.
 """
-import asyncio, csv, io, json, sys
+import asyncio, collections, csv, io, json, sys
 from pathlib import Path
 import httpx
 
 DEFAULT_BASE = "https://sdmx.data.unicef.org/ws/public/sdmxapi/rest"
 DEFAULT_CONCURRENCY = 8
+RETRIES = 6
+BACKOFF = 2.0
 
 
 def key_for(case):
@@ -38,11 +40,31 @@ async def fetch(client, sem, case, base):
     flow = _rest_flow_ref(case.get("flowRef") or "")
     url = (f"{base}/data/{flow}/{key_for(case)}"
            f"?startPeriod={period}&endPeriod={period}&format=csv&labels=id")
-    async with sem:
+    # The registry throttles by client address, hard and without a Retry-After
+    # header, so the caller has to pace itself blind: 494 of 500 cases came
+    # back 429 and were "left alone", which reads as a clean no-change refresh
+    # while actually having checked nothing. Retry on 429 and 5xx, honouring
+    # Retry-After when the registry does send it.
+    r = None
+    for attempt in range(RETRIES + 1):
+        async with sem:
+            try:
+                r = await client.get(url, timeout=90)
+            except httpx.HTTPError as exc:
+                if attempt == RETRIES:
+                    return case, None, f"transport: {exc}"
+                await asyncio.sleep(BACKOFF * (2**attempt))
+                continue
+        if r.status_code != 429 and r.status_code < 500:
+            break
+        if attempt == RETRIES:
+            break
+        delay = BACKOFF * (2**attempt)
         try:
-            r = await client.get(url, timeout=90)
-        except httpx.HTTPError as exc:
-            return case, None, f"transport: {exc}"
+            delay = max(delay, float(r.headers.get("Retry-After") or 0))
+        except ValueError:
+            pass
+        await asyncio.sleep(delay)
     if r.status_code == 404:
         return case, [], None           # genuinely no data
     if r.status_code >= 400:
@@ -58,7 +80,8 @@ async def run(src: Path, dst: Path, base: str, concurrency: int) -> dict:
     async with httpx.AsyncClient() as client:
         results = await asyncio.gather(*[fetch(client, sem, c, base) for c in cases])
 
-    changed = unchanged = unresolved = flipped = 0
+    changed = unchanged = unresolved = flipped = reclassified = 0
+    reasons: collections.Counter = collections.Counter()
     out = []
     for case, vals, err in results:
         gt = case.get("ground_truth") or {}
@@ -66,7 +89,16 @@ async def run(src: Path, dst: Path, base: str, concurrency: int) -> dict:
         old = exp.get("value")
         if err is not None:
             unresolved += 1
+            reasons[err.split(":")[0][:40]] += 1
             out.append(case); continue
+        # The registry answered, so this case's ground truth is confirmed
+        # against the live registry right now -- whether or not the value
+        # moved. Recorded on every answered case, not only changed ones, so
+        # the grader can tell "the model abstained and a value demonstrably
+        # exists" (a miss) from "the model abstained and we have not checked"
+        # (genuinely unresolved). Without it every such case lands in
+        # manual_review and has to be verified by hand.
+        gt["verified_against_registry"] = True
         # Exactly one observation is required to pin a single value; anything
         # else leaves the case untouched rather than inventing a ground truth.
         if len(vals) == 1:
@@ -90,14 +122,29 @@ async def run(src: Path, dst: Path, base: str, concurrency: int) -> dict:
                 changed += 1
             else:
                 unchanged += 1
+            # The expectation has to follow the ground truth. Rewriting the
+            # value to null while leaving caseType "positive" and
+            # expectedBehavior "return_value" leaves the case contradicting
+            # itself: the grader reads the top-level fields, so a model that
+            # correctly abstained scored manual_review rather than pass, and
+            # six withdrawn PV_CHLD_* cases silently cost every model a point.
+            # Applied even when the value was already null, so a manifest left
+            # half-refreshed by an earlier pass is repaired rather than kept.
+            if case.get("caseType") != "negative":
+                case["caseType"] = "negative"
+                case["expectedBehavior"] = "abstain_no_data"
+                reclassified += 1
         else:
             unresolved += 1
+            reasons[f"ambiguous: {len(vals)} observations"] += 1
         case["ground_truth"] = gt
         out.append(case)
 
     dst.write_text("".join(json.dumps(c, ensure_ascii=False) + "\n" for c in out), encoding="utf-8")
     return {"cases": len(cases), "value_changed": changed, "unchanged": unchanged,
             "left_alone": unresolved, "negative_cases_that_now_have_data": flipped,
+            "reclassified_to_abstain": reclassified,
+            "left_alone_reasons": dict(reasons.most_common(8)),
             "manifest": str(dst)}
 
 

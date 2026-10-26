@@ -141,3 +141,81 @@ class TestRefresh(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExpectationFollowsGroundTruth(unittest.TestCase):
+    """A withdrawn series must also change what the case expects.
+
+    Rewriting ground_truth.expected.value to null while leaving the top-level
+    caseType "positive" and expectedBehavior "return_value" left each case
+    contradicting itself. The grader reads the top-level fields, so a model
+    that correctly abstained scored manual_review rather than pass -- and
+    manual_review is a verdict nobody ever went back to review. Six withdrawn
+    PV_CHLD_* cases quietly cost all seven measured models a point each.
+    """
+
+    def test_a_withdrawn_series_flips_the_expectation(self) -> None:
+        stats, rows = _Harness({"X": ([], None)}).run([_case("74.3")])
+        self.assertEqual(rows[0]["caseType"], "negative")
+        self.assertEqual(rows[0]["expectedBehavior"], "abstain_no_data")
+        self.assertEqual(stats["reclassified_to_abstain"], 1)
+
+    def test_a_half_refreshed_manifest_is_repaired(self) -> None:
+        """The value was nulled by an earlier pass but the expectation was not.
+
+        This is the state the real manifest was found in, so the repair must
+        not depend on the value changing in this pass.
+        """
+        stale = _case(None)
+        stale["caseType"] = "positive"
+        stale["expectedBehavior"] = "return_value"
+        stats, rows = _Harness({"X": ([], None)}).run([stale])
+        self.assertEqual(stats["value_changed"], 0)
+        self.assertEqual(stats["reclassified_to_abstain"], 1)
+        self.assertEqual(rows[0]["caseType"], "negative")
+        self.assertEqual(rows[0]["expectedBehavior"], "abstain_no_data")
+
+    def test_a_case_with_data_keeps_its_expectation(self) -> None:
+        live = _case("5.0")
+        live["expectedBehavior"] = "return_value"
+        stats, rows = _Harness({"X": (["5.0"], None)}).run([live])
+        self.assertEqual(rows[0]["caseType"], "positive")
+        self.assertEqual(rows[0]["expectedBehavior"], "return_value")
+        self.assertEqual(stats["reclassified_to_abstain"], 0)
+
+    def test_throttled_cases_are_reported_not_hidden(self) -> None:
+        """494 of 500 cases came back 429 and the summary said value_changed: 0.
+
+        A refresh that checked nothing must not read like a refresh that
+        confirmed everything, so the reason is surfaced per case.
+        """
+        stats, _ = _Harness({"X": (None, "HTTP 429")}).run([_case("5.0")])
+        self.assertEqual(stats["left_alone"], 1)
+        self.assertEqual(stats["left_alone_reasons"], {"HTTP 429": 1})
+
+
+class TestVerificationIsRecorded(unittest.TestCase):
+    """Every answered case records that the registry confirmed it.
+
+    The grader cannot otherwise distinguish "the model abstained and a value
+    demonstrably exists" from "the model abstained and nobody checked". That
+    gap put 55 cases into manual_review across seven models and cost two
+    rounds of verifying them by hand.
+    """
+
+    def test_an_unchanged_case_is_still_marked_verified(self) -> None:
+        _, rows = _Harness({"X": (["5.0"], None)}).run([_case("5.0")])
+        self.assertIs(rows[0]["ground_truth"]["verified_against_registry"], True)
+
+    def test_a_changed_case_is_marked_verified(self) -> None:
+        _, rows = _Harness({"X": (["9.0"], None)}).run([_case("5.0")])
+        self.assertIs(rows[0]["ground_truth"]["verified_against_registry"], True)
+
+    def test_a_withdrawn_case_is_marked_verified(self) -> None:
+        _, rows = _Harness({"X": ([], None)}).run([_case("5.0")])
+        self.assertIs(rows[0]["ground_truth"]["verified_against_registry"], True)
+
+    def test_an_unreachable_case_is_not_marked_verified(self) -> None:
+        """A 429 must never look like a confirmation."""
+        _, rows = _Harness({"X": (None, "HTTP 429")}).run([_case("5.0")])
+        self.assertNotIn("verified_against_registry", rows[0]["ground_truth"])
