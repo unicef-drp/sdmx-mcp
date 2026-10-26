@@ -221,9 +221,22 @@ def _drop_failed_responses(path: Path) -> int:
     keep = [r for r in rows if str(r.get("status") or "") == "ok"]
     dropped = len(rows) - len(keep)
     if dropped:
-        with path.open("w", encoding="utf-8") as handle:
+        # Written to a sibling and renamed, never truncated in place. Records
+        # here reach 1.7MB, so rebuilding the file directly leaves a long
+        # window in which it is half-written -- and a 500-case run came back
+        # with one record torn across two lines, which cost a sweep that had
+        # already measured seven models. os.replace is atomic on the same
+        # filesystem, so a reader sees either the old file or the new one.
+        #
+        # ensure_ascii matches the append path, so one file cannot end up with
+        # two escaping conventions.
+        temp = path.with_name(path.name + ".rewrite")
+        with temp.open("w", encoding="utf-8") as handle:
             for row in keep:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
     return dropped
 
 
@@ -1324,6 +1337,21 @@ def grade_results(
                 or trace_match is False
                 or any(item is False for item in filter_matches.values())
             ):
+                overall = "fail"
+            elif (
+                claims.get("value") in (None, "")
+                and expected_value is not None
+                and isinstance(expected_truth, dict)
+                and expected_truth.get("verified_against_registry") is True
+            ):
+                # Declining to answer where a value demonstrably exists is a
+                # miss, not an open question. This only fires on ground truth
+                # the refresher confirmed against the live registry in this
+                # pass, because the opposite call -- failing an abstention
+                # against stale truth -- is the error that penalised every
+                # model on six withdrawn PV_CHLD_* series. Of 55 such cases
+                # checked by hand, 54 held a value; the one that did not was
+                # withdrawn, and refreshing had already reclassified it.
                 overall = "fail"
             else:
                 overall = "manual_review"

@@ -9,6 +9,8 @@ that a genuinely wrong answer still fails.
 
 import importlib.util
 import unittest
+import json
+import tempfile
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location(
@@ -164,3 +166,53 @@ class TestTraceMatchRobustness(unittest.TestCase):
         r = self._resp([("get_time_series",
                          {"subject": "Under-five mortality rate", "location": "Côte d'Ivoire"})])
         self.assertIs(runner._trace_hits_expected_series(r, self._case()), True)
+
+
+class TestAtomicResponseRewrite(unittest.TestCase):
+    """--retry-failed must never leave a half-rebuilt responses file.
+
+    The rewrite truncates and rebuilds, with individual records reaching
+    1.7MB. A 500-case file came back with one record torn across two lines,
+    which aborted a sweep that had already measured seven models. The record
+    was recoverable by rejoining the halves, so nothing was lost -- but the
+    window should not exist.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "responses.jsonl"
+
+    def _write(self, rows) -> None:
+        self.path.write_text(
+            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    def test_errored_rows_are_dropped(self) -> None:
+        self._write([{"case_id": "a", "status": "ok"},
+                     {"case_id": "b", "status": "provider_error"}])
+        dropped = runner._drop_failed_responses(self.path)
+        kept = [json.loads(l) for l in self.path.read_text().splitlines() if l.strip()]
+        self.assertEqual(dropped, 1)
+        self.assertEqual([r["case_id"] for r in kept], ["a"])
+
+    def test_no_rewrite_when_nothing_to_drop(self) -> None:
+        self._write([{"case_id": "a", "status": "ok"}])
+        before = self.path.read_text()
+        self.assertEqual(runner._drop_failed_responses(self.path), 0)
+        self.assertEqual(self.path.read_text(), before)
+
+    def test_no_temp_file_is_left_behind(self) -> None:
+        self._write([{"case_id": "a", "status": "ok"},
+                     {"case_id": "b", "status": "provider_error"}])
+        runner._drop_failed_responses(self.path)
+        leftovers = [p.name for p in Path(self.tmp.name).iterdir()
+                     if p.name != "responses.jsonl"]
+        self.assertEqual(leftovers, [])
+
+    def test_non_ascii_survives_the_rewrite(self) -> None:
+        """Escaping must match the append path so one file has one convention."""
+        self._write([{"case_id": "a", "status": "ok", "text": "Côte d'Ivoire 目前"},
+                     {"case_id": "b", "status": "provider_error"}])
+        runner._drop_failed_responses(self.path)
+        kept = [json.loads(l) for l in self.path.read_text().splitlines() if l.strip()]
+        self.assertEqual(kept[0]["text"], "Côte d'Ivoire 目前")
