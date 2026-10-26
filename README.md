@@ -32,6 +32,7 @@ This project lets an LLM client do a full guided data journey:
 - `scripts/sdmx_eval_provider_template.py`: stdin/stdout adapter template for wiring any LLM+MCP stack into the eval harness.
 - `scripts/list_theme_prefixes.py`: helper to inspect dataflow ID prefixes.
 - `theme_prefixes_domain.csv`: optional example prefix-to-domain mapping for grouping. Set `SDMX_THEME_PREFIX_CSV` to use it.
+- `paper/`: source for the written report and the deck, built from one markdown file so the two cannot disagree. See `paper/README.md`.
 
 ## Local Run
 
@@ -217,10 +218,14 @@ An example file is included at `query_dimension_policy.example.json`.
 > with useful universal defaults, which is why the repository carries an example
 > rather than a working file — and why `main` does not carry one at all.
 >
-> Discovery scoring does not function without it: `_query_tokens` reads the
-> policy to get its stopword list, so an unconfigured deployment fails on the
-> discovery path rather than degrading. In this repository that accounts for 47
-> of the test failures on a branch without one.
+> The server does **not** fail without one — it falls back to a built-in
+> default, and that is the problem. The default declares the three roles with
+> **no dimension and no codelist bound to any of them**, and **zero** flow
+> topic hints. So an unconfigured deployment starts, answers, and quietly
+> operates without the resolution layer, which is the part worth the most:
+> withholding those tools in a controlled ablation cost the best model tested
+> 45 accuracy points and the next 95. Nothing errors. You simply get much worse
+> answers than the server is capable of.
 >
 > It is a small piece of work — a single JSON file, an afternoon with somebody
 > who knows the registry's conventions — but it is not optional, and a
