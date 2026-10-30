@@ -592,6 +592,12 @@ Everything below is something we cannot settle alone and someone here can.
 
 > Levels are fairly flat across strata and high everywhere. What matters is the spread. On prescriptive prompts — tool named, codes given — the models sit a couple of points apart. On anything the user has not fully specified they fan out six times wider. Execution is solved; interpretation is where models differ. The practical consequence is uncomfortable: an easy benchmark cannot choose a model for you, and an easy benchmark is exactly what a procurement exercise runs. Note also that difficulty looks like a property of the question, not the model — two unrelated models at similar capability produced identical stratum profiles and failed the same individual cases.
 
+### {{models_tested}} models, ten producers, one manifest
+- layout: models-table
+- section: 5 — Cost
+
+> This is the whole study on one slide. Sixteen models, every major commercial and open-weight producer, the same five hundred questions, the same grader, the same server. Four of them tie at the top. The spread underneath is what matters: from ninety-nine point six percent down to two point six, at prices from ten cents to six dollars per five hundred questions — and the ordering of price tells you almost nothing about the ordering of accuracy. The model at the bottom is the cheapest in the catalogue; it never successfully called a tool and answered from memory instead.
+
 ### The same 500 questions, from {{cheapest_cost}} to {{dearest_cost}}
 - layout: chart-cost
 - section: 5 — Cost
@@ -616,8 +622,20 @@ Everything below is something we cannot settle alone and someone here can.
 
 > Cost, containment, provenance — none of which is about model capability. The server rejected {{validation_errors}} malformed tool calls and explained each one back to the model, which then recovered; a model writing its own REST calls has nothing to refuse it and nothing to correct it. Every answer carries its query log, which is how we repeatedly established that a model was right and our own ground truth stale. And a fourth reason we did not plan: mid-evaluation the registry became entirely unavailable, our discovery layer returned an empty list, and a well-behaved model concluded honestly that the indicator did not exist. Our bug, now fixed — but that is the argument in miniature. A deterministic layer is where the handling for a bad day belongs. The expensive part of this architecture is not the part you have to buy.
 
+### Deploying it: one container, one command
+- layout: deploy
+- section: 8 — Running it yourself
+
+> I want to be concrete about the barrier here, because "build an MCP server" sounds like a project and it is not. The repository has a Dockerfile. The image is two hundred and fifty megabytes, it runs on one shared CPU, and it goes to any platform that takes a container — we use Fly, but Cloud Run, App Service or ECS are the same two commands. What you get is one HTTPS endpoint speaking Streamable HTTP that any MCP client can point at. The deploy that put our current version live took seventy-four seconds, and it runs on every push.
+
+### Configuring it: two files and some environment
+- layout: config
+- section: 8 — Running it yourself
+
+> And this is the part that is actually yours to write, so it is worth seeing how small it is. Two JSON files and a handful of environment variables. The dimension policy says which of your dimensions carries the subject, which the geography, which the time — that is the one with no sensible default, and the one that quietly costs you the resolution layer if you skip it. The discovery policy holds stopwords and topic hints, mapping words your users say to families of flows in your registry. Everything else is environment: your endpoint, which agencies you expose, whether drafts are visible. That is the whole adaptation surface. No fork, no code.
+
 ### The work does not finish
 - layout: close
-- section: 8 — Close
+- section: 9 — Close
 
 > The cheapest competent model changed more than once inside one year. Harness conventions moved under us. The registry restated a series mid-evaluation, throttled us without saying so, and fell over entirely. Every one of those changed a number in this report. So our closing recommendation is deliberately not a model — that would date within months. It is that retesting has to be routine, and cheap enough that you actually do it: reproducible manifests, free ground-truth refresh, responses kept so they can be re-graded without spending again. Model choice is one configuration line. The code is public, and running Experiment A against your own registry costs nothing but time.

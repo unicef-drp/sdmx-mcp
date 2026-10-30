@@ -39,7 +39,7 @@ SCREEN_DIRS = [d for d in (os.environ.get("SDMX_SCREEN_DIRS") or
 FAULTS = [
     ("Claude Haiku 4.5", 'Throttling reported as "no data"; bare decimals inviting rescaling; accented names failing verification', "MCP"),
     ("Claude Haiku 5.5", "93 of 500 correct answers scored as unsettled — it omitted a structured field", "Harness"),
-    ("GPT-5-nano", "Needs ~3,400 output tokens; our 1,200 ceiling failed 46% of cases. Separately, invents lowercase dimension names and two-letter country codes", "Both"),
+    ("GPT-5-nano", "Invents lowercase dimension names and two-letter country codes; our output ceiling produced spurious errors but did not change its score", "Both"),
     ("GPT-5-mini", "Strong on prescriptive prompts, barely half on ambiguous phrasing", "Model"),
     ("Gemini 2.5 Flash Lite", "Invented dataflow names — scope enforcement rejected every one", "Model"),
     ("DeepSeek, GLM, Qwen-235b", "Our JSON mode silently suppressed tool calling in all three", "Harness"),
