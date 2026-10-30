@@ -302,7 +302,54 @@ pres.addSection({ title: "4 — Measuring it" });
 
 pres.addSection({ title: "5 — Cost" });
 
-// --- 5. chart-cost --------------------------------------------------
+// --- 5. models-table ----------------------------------------------
+{
+  const s = pres.addSlide({ masterName: "CONTENT", sectionTitle: slideFor("models-table").opts.section });
+  s.addText(fill(slideFor("models-table").title), { placeholder: "title" });
+
+  // Built from stats.json, never typed. Sixteen rows do not fit one readable
+  // column, so they run in two of eight.
+  const best = Math.max(...S.models.map(m => m.accuracy));
+  const mrows = S.models.map(m => ({
+    name: m.model.split("/")[1] || m.model,
+    acc: m.accuracy,
+    cost: m.cost_per_500,
+    top: m.accuracy === best,
+  }));
+  const half = Math.ceil(mrows.length / 2);
+
+  [mrows.slice(0, half), mrows.slice(half)].forEach((chunk, col) => {
+    const header = [
+      { text: "Model", options: { bold: true, color: THEME.colors.lt1, fill: { color: THEME.colors.dk1 } } },
+      { text: "Acc.", options: { bold: true, color: THEME.colors.lt1, fill: { color: THEME.colors.dk1 }, align: "right" } },
+      { text: "$/500", options: { bold: true, color: THEME.colors.lt1, fill: { color: THEME.colors.dk1 }, align: "right" } },
+    ];
+    const body = chunk.map(r => ([
+      { text: r.name, options: { color: r.top ? THEME.colors.accent2 : THEME.colors.dk1, bold: r.top } },
+      { text: r.acc.toFixed(1) + "%", options: { align: "right", bold: r.top,
+          color: r.top ? THEME.colors.accent5 : (r.acc < 70 ? THEME.colors.accent4 : THEME.colors.dk1) } },
+      { text: "$" + r.cost.toFixed(2), options: { align: "right", color: THEME.colors.dk2 } },
+    ]));
+    s.addTable([header, ...body], {
+      x: 0.6 + col * 6.25, y: 1.3, w: 5.9, colW: [3.5, 1.2, 1.2],
+      fontSize: 12, fontFace: "Calibri",
+      border: { type: "solid", color: "DCE6EC", pt: 1 },
+      fill: { color: "FFFFFF" }, rowH: 0.34, valign: "middle", margin: 0.05,
+    });
+  });
+
+  const tier = S.models.filter(m => m.accuracy === best).sort((a, b) => a.cost_per_500 - b.cost_per_500);
+  s.addText([
+    { text: `${tier.length} models tie at ${best}%`, options: { fontSize: 15, bold: true, color: THEME.colors.accent5 } },
+    { text: `  —  from $${tier[0].cost_per_500.toFixed(2)} to $${tier[tier.length - 1].cost_per_500.toFixed(2)}.  `,
+      options: { fontSize: 15, color: THEME.colors.dk1 } },
+    { text: `${S.totals.cases_graded.toLocaleString()} graded cases, $${S.totals.spend_usd} of model spend.`,
+      options: { fontSize: 15, color: THEME.colors.accent6 } },
+  ], { x: 0.6, y: 6.35, w: 12.1, h: 0.5, isTextBox: true, margin: 0 });
+  s.addNotes(fill(slideFor("models-table").notes));
+}
+
+// --- 6. chart-cost --------------------------------------------------
 {
   const s = pres.addSlide({ masterName: "CHART", sectionTitle: slideFor("chart-cost").opts.section });
   s.addText(slideFor("chart-cost").title, { placeholder: "title" });
@@ -387,24 +434,21 @@ pres.addSection({ title: "5 — Cost" });
 
 pres.addSection({ title: "6 — A moving target" });
 
-// --- 6. faults-table ------------------------------------------------
+// --- 9. faults-table ------------------------------------------------
 {
   const s = pres.addSlide({ masterName: "CONTENT", sectionTitle: slideFor("faults-table").opts.section });
   s.addText(slideFor("faults-table").title, { placeholder: "title" });
 
+  // Parsed from context.json's generated table, so the deck and the document
+  // cannot disagree. This was hardcoded and had drifted: it still listed a
+  // model dropped from the study and a token-ceiling claim since retracted.
+  const faultRows = CTX.table_faults
+    .split("\n")
+    .filter(l => l.startsWith("|") && !/^\|\s*-/.test(l))
+    .map(l => l.split("|").slice(1, -1).map(c => c.trim().replace(/^\*\*|\*\*$/g, "")));
   const rows = [
-    [{ text: "Model", options: { bold: true } },
-     { text: "What it exposed", options: { bold: true } },
-     { text: "Owner", options: { bold: true } }],
-    ["Claude Haiku 4.5", "Throttling reported as “no data”; bare decimals inviting rescaling", "MCP"],
-    ["Claude Haiku 5.5", "93 right answers scored as unsettled — omitted a structured field", "Harness"],
-    ["GPT-5-nano", "Needs ~3,400 output tokens; our 1,200 ceiling failed 46% of cases", "Harness"],
-    ["GPT-5-mini", "Dropped a dimension, then abstained instead of acting on the refusal", "Model"],
-    ["Gemini 2.5 Flash Lite", "Invented dataflow names — scope enforcement caught every one", "Model"],
-    ["DeepSeek, GLM, Qwen-235b", "Our JSON mode silently suppressed tool calling in all three", "Harness"],
-    ["GLM-4.7-flashx", "Passed filters as a string; invented a GENDER dimension", "Model"],
-    ["Qwen-3-235b", "Emitted tool calls as plain text; obeyed a contradictory instruction", "Both"],
-    ["Qwen at high concurrency", "Our server returning tool errors with empty messages", "MCP"],
+    faultRows[0].map(h => ({ text: h, options: { bold: true } })),
+    ...faultRows.slice(1),
   ];
 
   s.addTable(rows, {
@@ -422,7 +466,7 @@ pres.addSection({ title: "6 — A moving target" });
 }
 
 
-// --- 7. four-cards --------------------------------------------------
+// --- 10. four-cards --------------------------------------------------
 {
   const s = pres.addSlide({ masterName: "CONTENT", sectionTitle: slideFor("four-cards").opts.section });
   s.addText(slideFor("four-cards").title, { placeholder: "title" });
@@ -455,7 +499,7 @@ pres.addSection({ title: "6 — A moving target" });
 
 pres.addSection({ title: "7 — Why MCP endures" });
 
-// --- 8. office ------------------------------------------------------
+// --- 11. office ------------------------------------------------------
 {
   const s = pres.addSlide({ masterName: "CONTENT", sectionTitle: slideFor("office").opts.section });
   s.addText(slideFor("office").title, { placeholder: "title" });
@@ -490,9 +534,103 @@ pres.addSection({ title: "7 — Why MCP endures" });
 }
 
 
-pres.addSection({ title: "8 — Close" });
+pres.addSection({ title: "8 — Running it yourself" });
 
-// --- 9. close -------------------------------------------------------
+// --- 10. deploy -----------------------------------------------------
+{
+  const s = pres.addSlide({ masterName: "CONTENT", sectionTitle: slideFor("deploy").opts.section });
+  s.addText(fill(slideFor("deploy").title), { placeholder: "title" });
+
+  const steps = [
+    ["1", "Clone and point it at your registry",
+     "SDMX_BASE_URL=https://your-registry/rest"],
+    ["2", "Deploy the container that is already in the repo",
+     "fly launch   →   fly deploy"],
+    ["3", "Give any MCP client the endpoint",
+     "https://your-app/mcp   (Streamable HTTP)"],
+  ];
+  steps.forEach(([n, title, code], i) => {
+    const y = 1.45 + i * 1.32;
+    s.addShape(pres.ShapeType.ellipse, { x: 0.65, y: y + 0.1, w: 0.52, h: 0.52,
+      fill: { color: THEME.colors.accent1 }, objectName: `step${n}` });
+    s.addText(n, { x: 0.65, y: y + 0.1, w: 0.52, h: 0.52, fontSize: 17, bold: true,
+      color: THEME.colors.lt1, align: "center", valign: "middle", isTextBox: true, margin: 0 });
+    s.addText(title, { x: 1.4, y, w: 7.4, h: 0.45, fontSize: 17, bold: true,
+      color: THEME.colors.dk1, isTextBox: true, margin: 0, valign: "middle" });
+    s.addShape(pres.ShapeType.roundRect, { x: 1.4, y: y + 0.46, w: 7.4, h: 0.5,
+      fill: { color: THEME.colors.dk1 }, rectRadius: 0.05, objectName: `code${n}` });
+    s.addText(code, { x: 1.55, y: y + 0.46, w: 7.1, h: 0.5, fontSize: 13,
+      fontFace: "Courier New", color: "9FD9F0", isTextBox: true, margin: 0, valign: "middle" });
+  });
+
+  statBlock(s, { x: 9.4, y: 1.5, w: 3.3, value: "252 MB", label: "IMAGE, LINUX/AMD64" });
+  statBlock(s, { x: 9.4, y: 3.2, w: 3.3, value: "1 CPU", label: "SHARED, 1 MACHINE", color: THEME.colors.accent2 });
+  statBlock(s, { x: 9.4, y: 4.9, w: 3.3, value: "74 s", label: "LAST DEPLOY", color: THEME.colors.accent5 });
+
+  s.addText("Any platform that takes a container — Fly, Cloud Run, App Service, ECS. No data migration: the server is a read-only client of a registry you already operate.",
+    { x: 0.65, y: 6.3, w: 12.1, h: 0.6, fontSize: 14, color: THEME.colors.dk2, isTextBox: true, margin: 0 });
+  s.addNotes(fill(slideFor("deploy").notes));
+}
+
+// --- 11. config -----------------------------------------------------
+{
+  const s = pres.addSlide({ masterName: "CONTENT", sectionTitle: slideFor("config").opts.section });
+  s.addText(fill(slideFor("config").title), { placeholder: "title" });
+
+  const panels = [
+    ["query_dimension_policy.json", THEME.colors.accent4, "the one with no default",
+`{ "default_query_dimensions": [
+  { "role": "subject",
+    "dimension": "INDICATOR",
+    "codelist": "CL_INDICATOR" },
+  { "role": "geography",
+    "dimension": "REF_AREA" },
+  { "role": "time",
+    "dimension": "TIME_PERIOD" }
+]}`],
+    ["discovery_policy.json", THEME.colors.accent2, "words → flows",
+`{ "query_stopwords": [
+    "data", "latest", "chart" ],
+  "flow_topic_hints": [
+    { "terms": ["stunting",
+                "wasting", "nutrition"],
+      "preferred_flow_markers":
+                ["NUTRITION"] }
+]}`],
+    ["environment", THEME.colors.accent5, "scope and endpoint",
+`SDMX_BASE_URL=https://…/rest
+SDMX_AGENCY_ALLOWLIST=UNICEF,UNPD
+SDMX_EXCLUDE_DRAFT=true
+
+# everything else has a
+# workable default`],
+  ];
+
+  panels.forEach(([name, color, caption, code], i) => {
+    const x = 0.6 + i * 4.15;
+    s.addShape(pres.ShapeType.rect, { x, y: 1.3, w: 3.85, h: 0.06, fill: { color }, objectName: `rule${i}` });
+    s.addText(name, { x, y: 1.45, w: 3.85, h: 0.38, fontSize: 14, bold: true,
+      color: THEME.colors.dk1, fontFace: "Courier New", isTextBox: true, margin: 0 });
+    s.addText(caption, { x, y: 1.82, w: 3.85, h: 0.3, fontSize: 12, italic: true,
+      color: THEME.colors.accent6, isTextBox: true, margin: 0 });
+    s.addShape(pres.ShapeType.roundRect, { x, y: 2.2, w: 3.85, h: 3.5,
+      fill: { color: THEME.colors.lt2 }, line: { color: "DCE6EC", width: 1 },
+      rectRadius: 0.06, objectName: `panel${i}` });
+    s.addText(code, { x: x + 0.15, y: 2.32, w: 3.55, h: 3.3, fontSize: 10.5,
+      fontFace: "Courier New", color: THEME.colors.dk1, isTextBox: true, margin: 0, lineSpacingMultiple: 1.15 });
+  });
+
+  s.addText([
+    { text: "No fork. ", options: { fontSize: 16, bold: true, color: THEME.colors.accent4 } },
+    { text: "Everything registry-specific is configuration, which is the only reason one server can serve many registries — and the only reason a shared project is possible at all.",
+      options: { fontSize: 16, color: THEME.colors.dk1 } },
+  ], { x: 0.6, y: 5.95, w: 12.1, h: 0.9, isTextBox: true, margin: 0 });
+  s.addNotes(fill(slideFor("config").notes));
+}
+
+pres.addSection({ title: "9 — Close" });
+
+// --- 12. close -------------------------------------------------------
 {
   const s = pres.addSlide({ masterName: "SECTION", sectionTitle: slideFor("close").opts.section });
   s.addText(slideFor("close").title, { placeholder: "title" });
