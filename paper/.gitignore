@@ -11,3 +11,6 @@ context.json
 # Only dependency not in the repo: npm install pptxgenjs
 node_modules/
 package-lock.json
+
+# PowerPoint lock files, created when the deck is opened for review.
+~$*
