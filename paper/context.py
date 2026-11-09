@@ -18,6 +18,7 @@ import glob
 import json
 import os
 import re
+import statistics
 from pathlib import Path
 
 DIR = Path(__file__).resolve().parent
@@ -28,6 +29,10 @@ REPO = Path(os.environ.get("SDMX_REPO") or DIR.parent)
 DATA = Path(os.environ.get("SDMX_EVAL_DATA") or DIR)
 ABLATION = Path(os.environ.get("SDMX_EVAL_ABLATION") or (REPO / "tmp/ablation"))
 ROUTED = Path(os.environ.get("SDMX_EVAL_ROUTED") or (REPO / "tmp/variance"))
+# The graded sweep itself, for figures the summary JSON does not carry.
+RUNS = Path(os.environ.get("SDMX_EVAL_RUNS") or (REPO / "tmp/final-16"))
+# What the gateway harness kept of each tool result during the sweep.
+HARNESS_CLIP = 16_000
 PLACEHOLDER = re.compile(r"\{\{([a-z0-9_]+)\}\}")
 
 # Screening runs, used only for the screening-economy figure. Set
@@ -216,6 +221,91 @@ def _routed_keys() -> dict:
     }
 
 
+def _k(chars: float) -> str:
+    return f"{chars / 1000:.1f}k"
+
+
+def _review_keys() -> dict:
+    """How much the grading rule did, and where the characters go.
+
+    Read from the graded sweep rather than the summary JSON. The sizes are of
+    the text each tool returned, not its JSON encoding, which inflates them by
+    about a tenth through escaped quotes.
+    """
+    grade_files = sorted(RUNS.glob("grades.*.jsonl"))
+    if not grade_files:
+        raise SystemExit(f"no graded sweep found under {RUNS}; set SDMX_EVAL_RUNS")
+    passes = rounding = no_year = no_flow = no_flow_traced = to_zero = 0
+    max_gap = 0.0
+    for path in grade_files:
+        for line in path.open():
+            if not line.strip():
+                continue
+            grade = json.loads(line)
+            if grade["overall"] != "pass" or grade["expected"].get("caseType") != "positive":
+                continue
+            passes += 1
+            checks = grade["checks"]
+            no_year += checks.get("time_match") is None
+            if checks.get("flow_match") is None:
+                no_flow += 1
+                no_flow_traced += checks.get("trace_match") is True
+            rounding += "round" in str(grade.get("notes") or "").lower()
+            try:
+                expected = float(grade["expected"]["expected_value"])
+                value = float((grade["actual"].get("claims") or {}).get("value"))
+            except (TypeError, ValueError):
+                continue
+            if value != expected:
+                to_zero += value == 0
+                if expected:
+                    max_gap = max(max_gap, abs(value - expected) / abs(expected))
+    if no_flow != no_flow_traced:
+        raise SystemExit("a pass omitted its dataflow without reaching the expected series")
+
+    sizes: dict[str, list[int]] = {}
+    no_result_tokens: dict[str, list[int]] = {}
+    for path in sorted(RUNS.glob("responses.*.jsonl")):
+        for line in path.open():
+            if not line.strip():
+                continue
+            out = json.loads(line).get("provider_output") or {}
+            trace = out.get("tool_trace") or []
+            name = None
+            for item in trace:
+                if item.get("type") == "mcp_tool_use":
+                    name = item.get("name")
+                elif item.get("type") == "mcp_tool_result":
+                    sizes.setdefault(name, []).append(sum(
+                        len(part.get("text") or "")
+                        for part in item.get("content") or [] if isinstance(part, dict)))
+            tokens = (out.get("usage") or {}).get("input_tokens")
+            if not trace and tokens:
+                no_result_tokens.setdefault(path.name, []).append(tokens)
+    every = [n for values in sizes.values() for n in values]
+    structure = sizes["get_flow_structure"]
+    medians = [statistics.median(v) for v in no_result_tokens.values()]
+    return {
+        "review_passes": f"{passes:,}",
+        "review_rounding": str(rounding),
+        "review_max_gap": f"{max_gap * 100:.2f}%",
+        "review_to_zero": str(to_zero),
+        "review_no_year": str(no_year),
+        "review_no_flow": f"{no_flow:,}",
+        "review_no_flow_pct": f"{100 * no_flow / passes:.0f}%",
+        "review_plan_median": _k(statistics.median(sizes["plan_topic_query"])),
+        "review_guided_median": _k(statistics.median(sizes["guided_discover"])),
+        "review_single_median": f"{statistics.median(sizes['get_single_observation']):,.0f}",
+        "review_over_clip": str(sum(n > HARNESS_CLIP for n in every)),
+        "review_tool_results": f"{len(every):,}",
+        "review_structure_chars": f"{max(structure):,}",
+        "review_structure_big": str(sum(n > 1_000_000 for n in structure)),
+        "review_structure_calls": str(len(structure)),
+        "review_zero_low": f"{min(medians):,.0f}",
+        "review_zero_high": f"{max(medians):,.0f}",
+    }
+
+
 def build():
     stats = json.loads((DATA / "stats.json").read_text())
     pool = json.loads((DATA / "pooled.json").read_text())
@@ -306,6 +396,7 @@ def build():
         **_variance_keys(),
         **_ablation_keys(),
         **_routed_keys(),
+        **_review_keys(),
     }
     (DIR / "context.json").write_text(json.dumps(ctx, indent=2))
     return ctx

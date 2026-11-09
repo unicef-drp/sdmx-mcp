@@ -23,9 +23,9 @@ from pathlib import Path
 # cannot inform how difficulty varies by question type.
 MIN_TOOL_CALLS = 1.0
 ORDER = ["negative", "prescriptive", "natural", "disaggregated", "ambiguous"]
-LABELS = {"negative": "Negative\n(no data exists)",
+LABELS = {"negative": "Negative\n(absent from registry)",
           "prescriptive": "Prescriptive\n(tool + codes given)",
-          "natural": "Natural\n(names only)",
+          "natural": "Named indicator\n(names only)",
           "disaggregated": "Disaggregated\n(one breakdown)",
           "ambiguous": "Ambiguous\n(sibling indicators)"}
 

@@ -34,7 +34,8 @@ node build_deck.js                        # needs `npm install pptxgenjs`
 
 `variance.json` is read from `SDMX_EVAL_DATA` too; `SDMX_EVAL_ABLATION` and
 `SDMX_EVAL_ROUTED` point at the ablation and routed-repeat runs if they are
-somewhere other than `tmp/ablation` and `tmp/variance`.
+somewhere other than `tmp/ablation` and `tmp/variance`. `SDMX_EVAL_RUNS` points
+at the graded sweep itself, by default `tmp/final-16`.
 
 ## Why no figure is typed into the markdown
 
