@@ -7,6 +7,7 @@ import re
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional, TypedDict
@@ -19,6 +20,8 @@ from cachetools import TTLCache
 from dotenv import load_dotenv
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 
 from sdmx_utils import element_text as _element_text, tag_name as _tag_name
 
@@ -126,6 +129,16 @@ def _positive_int_env(name: str, default: int) -> int:
 # payloads (memory, egress, latency).
 MAX_OBS_HARD_CAP = _positive_int_env("SDMX_MAX_OBS_CAP", 100_000)
 
+# Ceiling on the characters one tool result may carry. A single structure call
+# on a large flow returned 1.3 million characters: one client refused it, and
+# our eval harness trimmed it out of sight. Tools with a natural way to shrink
+# (paging, a summary) do so below this; anything else is refused by the guard.
+RESPONSE_CHAR_CAP = _positive_int_env("SDMX_MAX_RESPONSE_CHARS", 50_000)
+
+# Flows checked per question when a caller narrows search to one area. Each is
+# one registry request, and the registry throttles hard.
+AREA_PROBE_FLOW_LIMIT = _positive_int_env("SDMX_AREA_PROBE_FLOW_LIMIT", 3)
+
 # Flows listed per indicator candidate in find_indicator_candidates. 0 disables
 # trimming. These flows share one INDICATOR codelist, so the untrimmed list is
 # the same for every candidate and dominates the payload.
@@ -167,6 +180,27 @@ async def _lifespan(app: FastMCP):  # type: ignore[type-arg]
 
 mcp = FastMCP(MCP_NAME, lifespan=_lifespan)
 
+
+class ResponseSizeGuard(Middleware):
+    """Refuse any tool result still over the cap once its tool has had its say.
+
+    An error rather than a clipped result: a cut-off JSON document or list reads
+    as complete, and a client that keeps it answers from part of the data.
+    """
+
+    async def on_call_tool(self, context, call_next):
+        result = await call_next(context)
+        chars = sum(len(getattr(block, "text", "") or "") for block in result.content)
+        if chars > RESPONSE_CHAR_CAP:
+            raise ToolError(
+                f"The result of {context.message.name} is {chars:,} characters, over the "
+                f"{RESPONSE_CHAR_CAP:,}-character response limit. Narrow it with filters, limit or offset."
+            )
+        return result
+
+
+mcp.add_middleware(ResponseSizeGuard())
+
 DEFAULT_DISCOVERY_STOPWORDS = [
     "about",
     "chart",
@@ -206,6 +240,7 @@ _hierarchical_catalog_cache = TTLCache(maxsize=8, ttl=60 * 60 * 24)  # 24h
 # a long time. Misses are cached too, or an indicator with no data anywhere
 # would be re-probed on every single discovery call.
 _indicator_unit_cache: TTLCache = TTLCache(maxsize=8192, ttl=60 * 60 * 24)  # 24h
+_area_indicator_cache: TTLCache = TTLCache(maxsize=2048, ttl=60 * 60)  # 1h
 
 # Limit concurrent structure fetches to avoid overwhelming SDMX servers.
 _STRUCTURE_FETCH_SEMAPHORE = asyncio.Semaphore(5)
@@ -304,6 +339,8 @@ class ProvenanceDict(TypedDict):
     lastNObservations: int | None
     filters: dict[str, Any]
     appliedDefaults: dict[str, Any]
+    retrievedAt: str
+    serverVersion: str
 
 
 class QueryContextDict(TypedDict):
@@ -1514,6 +1551,23 @@ async def _resolved_flow_details(flowRef: str) -> dict[str, str]:
     }
 
 
+def _retrieval_stamp() -> dict[str, str]:
+    """When this answer was read from the registry, by what, and on what terms.
+
+    Data responses are never cached, so the time is the time of the read. The
+    licence belongs to the deployment rather than the code, and is left out
+    when none is configured: an invented default would be worse than silence.
+    """
+    stamp = {
+        "retrievedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "serverVersion": SERVER_VERSION,
+    }
+    licence = os.getenv("SDMX_DATA_LICENCE", "").strip()
+    if licence:
+        stamp["licence"] = licence
+    return stamp
+
+
 def _query_context(
     *,
     flow_details: dict[str, str],
@@ -1542,6 +1596,7 @@ def _query_context(
             "lastNObservations": lastNObservations,
             "filters": filters or {},
             "appliedDefaults": appliedDefaults or {},
+            **_retrieval_stamp(),
         },
     }
 
@@ -3709,6 +3764,273 @@ async def _execute_query_data(
     return payload
 
 
+def _serialized_chars(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def _page_raw_csv(result: dict[str, Any], *, offset: int = 0, reserve: int = 0) -> dict[str, Any]:
+    """Fit a data response under the cap by cutting raw_csv at whole rows.
+
+    Applied at the tool boundary, never inside _execute_query_data: shaped
+    answers and the compact tools read raw_csv there, and computing a latest
+    value from a page of the rows would return a wrong number confidently.
+    ``reserve`` leaves room for whatever a tool wraps around this result.
+    """
+    raw = result.get("raw_csv")
+    if not isinstance(raw, str):
+        return result
+    offset = max(int(offset or 0), 0)
+    if not offset and _serialized_chars(result) + reserve <= RESPONSE_CHAR_CAP:
+        return result
+    lines = [line for line in raw.splitlines(keepends=True) if line.strip()]
+    if not lines:
+        return result
+    header, rows = lines[0], lines[1:]
+    # Room for the page note as well, which is written after the rows are chosen.
+    remaining = (
+        RESPONSE_CHAR_CAP
+        - reserve
+        - _serialized_chars({key: value for key, value in result.items() if key != "raw_csv"})
+        - _serialized_chars(header)
+        - 500
+    )
+    kept: list[str] = []
+    for row in rows[offset:]:
+        remaining -= _serialized_chars(row) - 2
+        if remaining < 0:
+            break
+        kept.append(row)
+    next_offset = offset + len(kept)
+    more = next_offset < len(rows)
+    notes = dict(result.get("notes") or {})
+    notes["responsePage"] = {
+        "offset": offset,
+        "returnedRows": len(kept),
+        "totalRows": len(rows),
+        "nextOffset": next_offset if more else None,
+        "charCap": RESPONSE_CHAR_CAP,
+    }
+    if more:
+        notes["responsePageGuidance"] = (
+            f"raw_csv holds only rows {offset} to {next_offset - 1} of {len(rows)}. Do not treat it as "
+            f"the whole result. Call query_data with offset={next_offset} for more, or narrow the filters."
+        )
+    return {**result, "raw_csv": "".join([header, *kept]), "notes": notes}
+
+
+def _summarize_structure_section(items: Any, member_keys: tuple[str, ...]) -> Any:
+    if not isinstance(items, list):
+        return items
+    summaries = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        members = next((item[key] for key in member_keys if item.get(key)), [])
+        summaries.append(
+            {
+                "id": item.get("id"),
+                "agencyID": item.get("agencyID"),
+                "version": item.get("version"),
+                "name": _coerce_text(item.get("name")) or _coerce_text(item.get("names")),
+                "memberCount": len(members) if isinstance(members, (list, dict)) else 0,
+            }
+        )
+    return summaries
+
+
+def _cap_flow_structure(payload: dict[str, Any]) -> dict[str, Any]:
+    """Replace a structure's bulkiest sections with summaries when over the cap.
+
+    Works on a copy: the payload is the shared cached structure that every
+    discovery tool reads, and those need the codelists intact.
+    """
+    original_chars = _serialized_chars(payload)
+    data = payload.get("data")
+    if original_chars <= RESPONSE_CHAR_CAP or not isinstance(data, dict):
+        return payload
+    capped = {**payload, "data": dict(data)}
+    omitted: list[str] = []
+    for section, member_keys in (("codelists", ("codes", "code")), ("conceptSchemes", ("concepts", "concept"))):
+        if section in data:
+            capped["data"][section] = _summarize_structure_section(data[section], member_keys)
+            omitted.append(section)
+        if _serialized_chars(capped) <= RESPONSE_CHAR_CAP - 500:
+            break
+    capped["truncation"] = {
+        "truncated": True,
+        "originalChars": original_chars,
+        "charCap": RESPONSE_CHAR_CAP,
+        "summarizedSections": omitted,
+        "guidance": (
+            "Members of the summarized sections were left out to fit the response limit. "
+            "Use list_dimensions for the dimensions, and list_codes with query, limit and offset for a dimension's codes."
+        ),
+    }
+    return capped
+
+
+def _compact_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """One search hit reduced to what the next call needs.
+
+    The per-flow descriptions and repeated flow summaries were most of a search
+    response, and the same flows came back for every candidate.
+    """
+    compact = {
+        key: value
+        for key, value in candidate.items()
+        if key not in {"recommendedFlow", "dataflowsNote"} and value not in ("", None)
+    }
+    if isinstance(candidate.get("dataflows"), list):
+        compact["dataflows"] = [
+            {"flowRef": flow.get("flowRef"), "flowName": flow.get("flowName")}
+            for flow in candidate["dataflows"]
+            if isinstance(flow, dict)
+        ]
+    return compact
+
+
+def _compact_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    compact = {key: value for key, value in plan.items() if key != "prioritizedDimensions"}
+    compact["indicatorCandidates"] = [
+        _compact_candidate(item) for item in plan.get("indicatorCandidates") or [] if isinstance(item, dict)
+    ]
+    return compact
+
+
+def _compact_guided_discover(response: dict[str, Any]) -> dict[str, Any]:
+    compact = {key: value for key, value in response.items() if key != "resolution"}
+    # The chosen indicator and flow are already at the top level of an answer.
+    if response.get("status") == "resolved":
+        compact.pop("plan", None)
+    elif isinstance(response.get("plan"), dict):
+        compact["plan"] = _compact_plan(response["plan"])
+    if isinstance(response.get("selectedIndicator"), dict):
+        compact["selectedIndicator"] = _compact_candidate(response["selectedIndicator"])
+    compact["attemptHistory"] = [
+        {key: value for key, value in attempt.items() if key != "flowSummary"}
+        for attempt in response.get("attemptHistory") or []
+        if isinstance(attempt, dict)
+    ]
+    if not compact["attemptHistory"]:
+        compact.pop("attemptHistory")
+    if isinstance(response.get("result"), dict):
+        wrapper = {key: value for key, value in compact.items() if key != "result"}
+        compact["result"] = _page_raw_csv(response["result"], reserve=_serialized_chars(wrapper) + 100)
+    return compact
+
+
+def _area_code_in_structure(payload: dict[str, Any], dimension_id: str, value: str) -> str | None:
+    """The registry's code for an area given as a code or an exact name."""
+    target = next((d for d in _dimension_metadata(payload) if d.get("id") == dimension_id), None)
+    codelist_id = (target or {}).get("codelist")
+    if not isinstance(codelist_id, str):
+        return None
+    codelists = _codelist_map(payload)
+    codelist = codelists.get(codelist_id) or codelists.get(_codelist_key(codelist_id))
+    if not codelist:
+        return None
+    wanted = value.strip().casefold()
+    codes = _codelist_codes(codelist)
+    for code in codes:
+        if str(code.get("id") or "").casefold() == wanted:
+            return str(code["id"])
+    for code in codes:
+        if str(code.get("name") or "").strip().casefold() == wanted:
+            return str(code["id"])
+    return None
+
+
+# A 404 is not enough. This registry sends 404 and SDMX error code 100 both for
+# "no data" and for a malformed path ("Data provider does not exist"), and
+# reading the second as the first told a model Egypt had no child mortality data.
+_SDMX_NO_DATA = re.compile(r"\bno\s+(data|results?)\b", re.IGNORECASE)
+
+
+async def _indicators_held_for_area(flow_ref: str, ref_area: str) -> set[str] | None:
+    """Indicator codes a flow holds for one area, or None if that can't be known.
+
+    None and an empty set are different answers. Only the registry saying it
+    holds nothing is an empty set; a throttle, an outage or an area we could not
+    identify is None, because "no data" must never stand in for "could not check".
+    """
+    cache_key = (flow_ref, ref_area.strip().casefold())
+    if cache_key in _area_indicator_cache:
+        return _area_indicator_cache[cache_key]
+    try:
+        payload = await _get_flow_structure(flow_ref)
+        order = await _dimension_order_for_flow(flow_ref)
+    except (httpx.HTTPError, ValueError, KeyError):
+        return None
+    geography_policy = _policy_for_role(ROLE_GEOGRAPHY)
+    geography = _dimension_for_policy(payload, geography_policy) if geography_policy else None
+    geography_id = str((geography or {}).get("id") or DIM_REF_AREA)
+    if geography_id not in order or DIM_INDICATOR not in order:
+        return None
+    area = _area_code_in_structure(payload, geography_id, ref_area)
+    if area is None:
+        return None
+    key = ".".join(area if dimension == geography_id else "" for dimension in order)
+    url = f"{_sdmx_base()}/data/{_data_path_for(flow_ref)}/{quote(key, safe='.')}?detail=serieskeysonly&format=csv&labels=id"
+    status, text = await _get_text_with_status(url)
+    if status == 404 and _SDMX_NO_DATA.search(text):
+        held: set[str] = set()
+    elif status >= 400:
+        return None
+    else:
+        rows = _csv_rows(text)
+        if rows and DIM_INDICATOR not in rows[0]:
+            return None
+        held = {str(row[DIM_INDICATOR]) for row in rows if row.get(DIM_INDICATOR)}
+    _area_indicator_cache[cache_key] = held
+    return held
+
+
+def _candidate_flow_refs(candidate: dict[str, Any], flow_ref: str | None) -> list[str]:
+    if flow_ref:
+        return [flow_ref]
+    refs = [str(candidate.get("recommendedFlowRef") or "")]
+    refs += [str(flow.get("flowRef") or "") for flow in candidate.get("dataflows") or [] if isinstance(flow, dict)]
+    return list(dict.fromkeys(ref for ref in refs if ref))
+
+
+async def _annotate_area_availability(
+    candidates: list[dict[str, Any]], ref_area: str, flow_ref: str | None = None
+) -> tuple[str, list[str]]:
+    """Mark each candidate with hasDataForArea, in place.
+
+    Returns ("checked" | "none_held" | "unavailable", the flows read). A
+    candidate is False only when every flow listed for it was read and none
+    held it; otherwise it is left unmarked. Holders are moved to the front.
+    """
+    flows = list(dict.fromkeys(ref for item in candidates for ref in _candidate_flow_refs(item, flow_ref)))
+    checked = flows[:AREA_PROBE_FLOW_LIMIT]
+    if not checked:
+        return "unavailable", []
+    held = await asyncio.gather(*[_indicators_held_for_area(ref, ref_area) for ref in checked])
+    if any(result is None for result in held):
+        return "unavailable", checked
+    by_flow = dict(zip(checked, held))
+    for item in candidates:
+        refs = _candidate_flow_refs(item, flow_ref)
+        code = str(item.get("id") or "")
+        if any(code in by_flow[ref] for ref in refs if ref in by_flow):
+            item["hasDataForArea"] = True
+        elif refs and all(ref in by_flow for ref in refs):
+            item["hasDataForArea"] = False
+    candidates.sort(key=lambda item: item.get("hasDataForArea") is False)
+    if candidates and all(item.get("hasDataForArea") is False for item in candidates):
+        return "none_held", checked
+    return "checked", checked
+
+
+def _no_area_data_guidance(ref_area: str, checked: list[str]) -> str:
+    return (
+        f"None of these indicators has data for {ref_area} in the flows checked ({', '.join(checked)}). "
+        "Report that the registry holds no value there rather than estimating one. This is absence from "
+        "these flows, not proof the statistic was never collected."
+    )
+
+
 def _compact_source(result: dict[str, Any]) -> dict[str, Any]:
     provenance = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
     return {
@@ -3717,6 +4039,11 @@ def _compact_source(result: dict[str, Any]) -> dict[str, Any]:
         "queryURL": provenance.get("queryURL"),
         "filters": provenance.get("filters") or {},
         "appliedDefaults": provenance.get("appliedDefaults") or {},
+        **{
+            field_name: provenance[field_name]
+            for field_name in ("retrievedAt", "serverVersion", "licence")
+            if provenance.get(field_name)
+        },
     }
 
 
@@ -5292,6 +5619,7 @@ async def plan_topic_query(
     flowQuery: str | None = None,
     indicatorLimit: int = 10,
     flowLimit: int = 200,
+    refArea: str | None = None,
 ) -> dict[str, Any]:
     """
     Plan a topical user question into an indicator-first SDMX workflow.
@@ -5302,13 +5630,31 @@ async def plan_topic_query(
     required dimension, and returns ranked indicator candidates before any flow-level query.
     Do not start with search_dataflows for topical questions unless the user explicitly asks
     for a dataset or dataflow by name.
+
+    For a one-country question, pass refArea; if no candidate has data the response says so.
     """
-    return await _plan_topic_query_impl(
+    plan = await _plan_topic_query_impl(
         question=question,
         flowQuery=flowQuery,
         indicatorLimit=indicatorLimit,
         flowLimit=flowLimit,
     )
+    if refArea and refArea.strip():
+        candidates = plan.get("indicatorCandidates") or []
+        outcome, checked = await _annotate_area_availability(candidates, refArea)
+        if outcome == "none_held":
+            return {
+                "status": "no_data_in_checked_flows",
+                "question": plan.get("question"),
+                "refArea": refArea,
+                "checkedFlows": checked,
+                "indicatorCandidates": [
+                    {"id": item.get("id"), "name": item.get("name")} for item in candidates[:3]
+                ],
+                "assistant_guidance": _no_area_data_guidance(refArea, checked),
+            }
+        plan["areaCheck"] = {"refArea": refArea, "outcome": outcome, "checkedFlows": checked}
+    return _compact_plan(plan)
 
 
 @mcp.tool()
@@ -5493,6 +5839,7 @@ async def list_codes(
     query: str | None = None,
     limit: int = 50,
     includeHierarchyHints: bool = True,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """
     List codes for a specific dimension, optionally filtered by a query string.
@@ -5538,6 +5885,7 @@ async def list_codes(
             continue
         hierarchy_edges[hierarchy_ref] = await _get_hierarchical_edges(hierarchy_ref)
     results: list[dict[str, Any]] = []
+    to_skip = max(int(offset or 0), 0)
     for code in codes:
         if not isinstance(code, dict):
             continue
@@ -5569,6 +5917,9 @@ async def list_codes(
         )
         text = f"{code_id} {name} {desc} {hierarchy_text}".lower()
         if q and q not in text:
+            continue
+        if to_skip > 0:
+            to_skip -= 1
             continue
         has_children = bool(codelist_children) or bool(hierarchy_matches)
         structural_evidence_available = includeHierarchyHints and (bool(parent_links) or bool(hierarchy_context))
@@ -5632,6 +5983,7 @@ async def find_indicator_candidates(
     flowQuery: str | None = None,
     flowLimit: int = 200,
     includeUnits: bool = True,
+    refArea: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Rank indicator codes by matching query text against codelist labels/descriptions.
@@ -5646,8 +5998,10 @@ async def find_indicator_candidates(
     when it can be resolved. Use it to choose between siblings whose labels are close:
     a mortality rate reads 'Deaths per 1,000 live births' while the matching count
     reads 'Number of deaths'. Pass includeUnits=false to skip the lookup.
+
+    For a one-country question, pass refArea to mark candidates with hasDataForArea.
     """
-    return await _find_indicator_candidates_impl(
+    candidates = await _find_indicator_candidates_impl(
         query=query,
         flowRef=flowRef,
         limit=limit,
@@ -5655,6 +6009,16 @@ async def find_indicator_candidates(
         flowLimit=flowLimit,
         includeUnits=includeUnits,
     )
+    if refArea and refArea.strip():
+        outcome, checked = await _annotate_area_availability(candidates, refArea, flowRef)
+        if outcome == "none_held":
+            stubs = [
+                {"id": item.get("id"), "name": item.get("name"), "hasDataForArea": False}
+                for item in candidates[:3]
+            ]
+            stubs[0]["assistant_guidance"] = _no_area_data_guidance(refArea, checked)
+            return stubs
+    return [_compact_candidate(item) for item in candidates]
 
 
 @mcp.tool()
@@ -5699,7 +6063,7 @@ async def guided_discover(
     For cost control, prefer this single tool over chaining search_dataflows, expand_ref_area_group,
     list_codes, and resolve_and_query_data after a discovery resource has been attached.
     """
-    return await _guided_discover_impl(
+    response = await _guided_discover_impl(
         question=question,
         discoveryMode=discoveryMode,
         flowQuery=flowQuery,
@@ -5708,14 +6072,15 @@ async def guided_discover(
         labels=labels,
         resultShape=resultShape,
     )
+    return _compact_guided_discover(response)
 
 
 @mcp.tool()
 async def get_flow_structure(flowRef: str) -> dict[str, Any]:
     """
-    Fetch and cache a flow's structure payload (DSD + codelists via configured references mode).
+    Fetch a flow's structure. Large ones summarize codelists; use list_codes for codes.
     """
-    return await _get_flow_structure(flowRef)
+    return _cap_flow_structure(await _get_flow_structure(flowRef))
 
 
 @mcp.tool()
@@ -6236,13 +6601,14 @@ async def query_data(
     lastNObservations: Optional[int] = None,
     resultShape: Optional[str] = None,
     allowUnboundedTime: bool = False,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """
     Query SDMX data with guardrails.
     - Requires a bounded time window unless caller explicitly accepts the risk.
-    - Returns raw SDMX-JSON and a minimal 'query_url' for reproducibility.
+    - Returns CSV rows and the query URL. Long results are cut at whole rows; see notes.responsePage.
     """
-    return await _execute_query_data(
+    result = await _execute_query_data(
         flowRef=flowRef,
         key=key,
         startPeriod=startPeriod,
@@ -6255,6 +6621,7 @@ async def query_data(
         resultShape=resultShape,
         allowUnboundedTime=allowUnboundedTime,
     )
+    return _page_raw_csv(result, offset=offset)
 
 
 @mcp.tool()
@@ -6465,7 +6832,7 @@ async def resolve_and_query_data(
             "status": "resolved",
             "resolutionPath": "direct",
             "validation": validation,
-            "result": result,
+            "result": _page_raw_csv(result, reserve=_serialized_chars(validation) + 100),
         }
 
     single_value_dimensions = []
@@ -6509,7 +6876,7 @@ async def resolve_and_query_data(
             "resolutionPath": "member_fallback",
             "validation": validation,
             "fallback": fallback,
-            "result": result,
+            "result": _page_raw_csv(result, reserve=_serialized_chars([validation, fallback]) + 100),
         }
 
     return {
