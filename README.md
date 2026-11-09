@@ -143,6 +143,9 @@ The generic `main` branch includes `.example.json` versions only. Active policy 
 | `SDMX_ENFORCE_SCOPE` | `false` | Reject an out-of-scope `flowRef` server-side rather than merely discouraging it in a prompt. Enforced at every data and metadata entry point, so it cannot be bypassed by skipping discovery. |
 | `SDMX_DATAFLOW_ID_ALLOW_REGEX` | unset | Restrict the server to matching flows, e.g. `^GLOBAL_DATAFLOW$`. |
 | `SDMX_INDICATOR_FLOW_LIMIT` | `3` | Flows listed per candidate by `find_indicator_candidates`. `0` disables trimming. |
+| `SDMX_MAX_RESPONSE_CHARS` | `50000` | Ceiling on one tool result. Structures summarize their codelists, `query_data` pages at whole rows, and anything else over it is an error. |
+| `SDMX_AREA_PROBE_FLOW_LIMIT` | `3` | Flows read when `refArea` narrows a search to one area. Each is one registry request. |
+| `SDMX_DATA_LICENCE` | unset | Licence text stamped on data responses. Left out when unset. |
 
 Pinning an eval deployment to a single flow is the clearest use of the first two. Scoped to `GLOBAL_DATAFLOW`, one `find_indicator_candidates` call returns ~1,300 tokens instead of ~16,000, recommends the right flow, and an agent cannot wander into a flow that lacks the data.
 
@@ -218,9 +221,9 @@ An example file is included at `query_dimension_policy.example.json`.
 > rather than a working file — and why `main` does not carry one at all.
 >
 > The server does **not** fail without one — it falls back to a built-in
-> default, and that is the problem. The default declares the three roles with
-> **no dimension and no codelist bound to any of them**, and **zero** flow
-> topic hints. So an unconfigured deployment starts, answers, and quietly
+> default, and that is the problem. The default declares the three roles under
+> generic names, with **no codelist or hierarchy named as a source for any of
+> them**, and **zero** flow topic hints. So an unconfigured deployment starts, answers, and quietly
 > operates without the resolution layer, which is the part worth the most:
 > withholding those tools in a controlled ablation cost the best model tested
 > 45 accuracy points and the next 95. Nothing errors. You simply get much worse
