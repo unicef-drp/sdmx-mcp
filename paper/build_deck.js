@@ -158,9 +158,9 @@ function chartBase() {
 }
 
 // --------------------------------------------------------------- helpers
-function statBlock(slide, { x, y, w, value, label, color }) {
+function statBlock(slide, { x, y, w, value, label, color, size }) {
   slide.addText(value, {
-    x, y, w, h: 0.95, fontSize: 48, bold: true, color: color || THEME.colors.accent1,
+    x, y, w, h: 0.95, fontSize: size || 48, bold: true, color: color || THEME.colors.accent1,
     align: "left", isTextBox: true, margin: 0, objectName: `stat-${label}`,
   });
   slide.addText(label, {
@@ -216,7 +216,7 @@ pres.addSection({ title: "2 — The server" });
     fill: { color: THEME.colors.lt2 }, rectRadius: 0.08, objectName: "expB" });
   s.addText("Experiment B — can a model drive it?", { x: 7.15, y: 2.65, w: 5.2, h: 0.4,
     fontSize: 15, bold: true, color: THEME.colors.dk2, isTextBox: true, margin: 0 });
-  statBlock(s, { x: 7.15, y: 3.15, w: 5.2, value: "500", label: "NATURAL-LANGUAGE QUESTIONS, FIVE PROMPT STYLES" });
+  statBlock(s, { x: 7.15, y: 3.15, w: 5.2, value: "500", label: "QUESTIONS IN FIVE PROMPT STYLES" });
   s.addText("Graded against the registry's own value, refreshed at grading time.",
     { x: 7.15, y: 5.25, w: 5.2, h: 0.6, fontSize: 13, color: THEME.colors.dk2, isTextBox: true, margin: 0 });
   s.addNotes(slideFor("two-experiments").notes);
@@ -349,86 +349,39 @@ pres.addSection({ title: "5 — Cost" });
   s.addNotes(fill(slideFor("models-table").notes));
 }
 
-// --- 6. chart-cost --------------------------------------------------
+// --- 6. review ------------------------------------------------------
 {
-  const s = pres.addSlide({ masterName: "CHART", sectionTitle: slideFor("chart-cost").opts.section });
-  s.addText(slideFor("chart-cost").title, { placeholder: "title" });
+  const s = pres.addSlide({ masterName: "CONTENT", sectionTitle: slideFor("review").opts.section });
+  s.addText(slideFor("review").title, { placeholder: "title" });
 
-  const costRows = S.models
-    .map(m => ({ name: m.model.split("/")[1], cost: m.cost_per_500, acc: m.accuracy }))
-    .sort((a, b) => a.cost - b.cost);
+  // Figures here are quoted from Azevedo (2026), a dated external source, so
+  // they are cited rather than computed from the analysis layer.
+  statBlock(s, { x: 0.65, y: 1.3, w: 3.8, value: "1,952 of 1,953", size: 34, label: "VALUES HIS AGENTS REPORTED MATCHED THE WAREHOUSE" });
+  statBlock(s, { x: 4.8, y: 1.3, w: 3.8, value: "5 + 8 of 15", size: 34, label: "METADATA ELEMENTS MET + PARTLY MET, HIGHEST OF 3 SERVERS", color: THEME.colors.accent2 });
+  statBlock(s, { x: 8.95, y: 1.3, w: 3.8, value: "96 sessions", size: 34, label: "FOUND A 1.3M-CHARACTER RESPONSE OUR 8,000 CASES HID", color: THEME.colors.accent4 });
 
-  // The outlier is 21x the cheapest, so one linear axis renders nine models as
-  // identical stubs and a log axis did not survive rendering. Chart the models
-  // that are comparable with each other; the outlier gets its own callout,
-  // which makes the ratio the point rather than hiding it.
-  // Threshold from the data, not a constant: anything past this gets its own
-  // callout so the rest do not render as identical stubs. A fixed $10 silently
-  // stopped separating anything once the dearest model measured $6.
-  const OUTLIER = 3;
-  const cheap = costRows.filter(r => r.cost < OUTLIER);
-  const dear = costRows.filter(r => r.cost >= OUTLIER);
-
-  s.addChart(pres.ChartType.bar, [{
-    name: "USD per 500 questions",
-    labels: cheap.map(r => r.name),
-    values: cheap.map(r => r.cost),
-  }], Object.assign(chartBase(), {
-    x: 0.6, y: 1.35, w: 8.1, h: 4.9,
-    barDir: "bar",
-    chartColors: cheap.map(() => THEME.colors.accent1),
-    showValue: true,
-    dataLabelPosition: "outEnd",
-    dataLabelFormatCode: '$#,##0.00',
-    valAxisMinVal: 0,
-    valAxisMaxVal: Math.ceil(Math.max(...cheap.map(r => r.cost)) * 4) / 4,
-    valAxisTitle: "USD per 500 questions",
-    showValAxisTitle: true,
-    valAxisTitleFontSize: 10,
-    valAxisTitleColor: THEME.colors.accent6,
-    barGapWidthPct: 35,
-  }));
-
-  // Reference price for the callouts: cheapest model at the best measured
-  // accuracy. Using the cheapest model outright invited a comparison against
-  // one that returned almost no answers, so "60x the cheapest" meant nothing.
-  const bestAcc = Math.max(...S.models.map(m => m.accuracy));
-  const refCost = Math.min(...S.models.filter(m => m.accuracy === bestAcc)
-                                      .map(m => m.cost_per_500));
-
-  dear.forEach((r, i) => {
-    const y = 6.42 + i * 0.6;
-    s.addShape(pres.ShapeType.roundRect, { x: 0.6, y, w: 8.1, h: 0.52,
-      fill: { color: "FBEAEC" }, rectRadius: 0.06, objectName: `outlier${i}`, h: 0.52 });
-    s.addText([
-      { text: r.name + "   ", options: { fontSize: 14, bold: true, color: THEME.colors.accent4 } },
-      { text: "$" + r.cost.toFixed(2) + "  —  off this scale, " +
-              (r.cost / refCost).toFixed(1) + "× the cheapest model at " +
-              bestAcc + "%" + (r.acc < bestAcc ? ", and " + (bestAcc - r.acc).toFixed(1) + " points behind it" : ""),
-        options: { fontSize: 13, color: THEME.colors.dk2 } },
-    ], { x: 0.85, y, w: 7.6, h: 0.52, isTextBox: true, margin: 0, valign: "middle" });
+  const rows = [
+    ["What the review found", "What changed in the server"].map(text => ({ text, options: { bold: true } })),
+    ["One structure response ran past 1.3 million characters", "Large responses are capped and paged, and say when they were cut"],
+    ["No retrieval time, server version or licence on a response", "A compact provenance block on data responses"],
+    ["Search is most of the bill", "Search results trimmed to what the next step needs"],
+    ["A question with no data cost 12.6k characters, against 0.6k", "An early answer when a country has nothing for the indicator"],
+  ];
+  s.addTable(rows, {
+    x: 0.6, y: 3.05, w: 12.1, colW: [6.05, 6.05],
+    fontSize: 15, fontFace: "Calibri", color: THEME.colors.dk1,
+    border: { type: "solid", color: "DCE6EC", pt: 1 },
+    fill: { color: "FFFFFF" },
+    rowH: 0.48, valign: "middle",
+    margin: 0.06,
   });
-
-  // Derived, so the panel cannot keep asserting a comparison the data no longer
-  // supports: this previously quoted a model that has since been dropped.
-  const best = Math.max(...S.models.map(m => m.accuracy));
-  const tier = S.models.filter(m => m.accuracy === best)
-                       .sort((a, b) => a.cost_per_500 - b.cost_per_500);
-  const cheapBest = tier[0];
-  const dearest = S.models.reduce((a, b) => (b.cost_per_500 > a.cost_per_500 ? b : a));
-  const ratio = (dearest.cost_per_500 / cheapBest.cost_per_500).toFixed(1);
-  const gap = (cheapBest.accuracy - dearest.accuracy).toFixed(1);
-
-  s.addText([
-    { text: "Price predicts nothing", options: { fontSize: 12, bold: true, color: THEME.colors.accent6, breakLine: true, charSpacing: 0.8, paraSpaceAfter: 8 } },
-    { text: `$${cheapBest.cost_per_500.toFixed(2)} → ${cheapBest.accuracy}%`, options: { fontSize: 19, bold: true, color: THEME.colors.accent1, breakLine: true } },
-    { text: `$${dearest.cost_per_500.toFixed(2)} → ${dearest.accuracy}%`, options: { fontSize: 19, bold: true, color: THEME.colors.accent4, breakLine: true, paraSpaceAfter: 10 } },
-    { text: `${ratio}× the cost, ${gap} points worse.`, options: { fontSize: 15, bold: true, breakLine: true, paraSpaceAfter: 14 } },
-    { text: `${tier.length} of ${S.totals.models} models reach ${best}%, from $${tier[0].cost_per_500.toFixed(2)} to $${tier[tier.length - 1].cost_per_500.toFixed(2)}.`, options: { fontSize: 13, breakLine: true, paraSpaceAfter: 18 } },
-    { text: "100 analyst questions a day, for a year:", options: { fontSize: 14, breakLine: true } },
-    { text: `≈ ${CTX.annual_cost} in model spend`, options: { fontSize: 20, bold: true, color: THEME.colors.accent5 } },
-  ], { placeholder: "body" });
-  s.addNotes(slideFor("chart-cost").notes);
+  s.addText("Every figure in this talk predates these changes. We re-measure before claiming anything.",
+    { x: 0.6, y: 5.95, w: 12.1, h: 0.5, fontSize: 16, bold: true, color: THEME.colors.accent4,
+      isTextBox: true, margin: 0 });
+  s.addText("Azevedo (2026), Metadata, cost and accuracy of official statistics served to AI agents. UNICEF working draft.",
+    { x: 0.6, y: 6.45, w: 12.1, h: 0.35, fontSize: 11, italic: true, color: THEME.colors.accent6,
+      isTextBox: true, margin: 0 });
+  s.addNotes(slideFor("review").notes);
 }
 
 
@@ -580,13 +533,17 @@ pres.addSection({ title: "8 — Running it yourself" });
   const panels = [
     ["query_dimension_policy.json", THEME.colors.accent4, "the one with no default",
 `{ "default_query_dimensions": [
-  { "role": "subject",
-    "dimension": "INDICATOR",
-    "codelist": "CL_INDICATOR" },
-  { "role": "geography",
-    "dimension": "REF_AREA" },
-  { "role": "time",
-    "dimension": "TIME_PERIOD" }
+  { "name": "subject",
+    "role": "subject",
+    "priority": 1,
+    "preferred_sources": [{
+      "type": "codelist",
+      "id": "AGENCY/CL_INDICATOR/1.0"
+    }] },
+  { "name": "location",
+    "role": "geography", ... },
+  { "name": "time",
+    "role": "time", ... }
 ]}`],
     ["discovery_policy.json", THEME.colors.accent2, "words → flows",
 `{ "query_stopwords": [
@@ -639,14 +596,15 @@ pres.addSection({ title: "9 — Close" });
   s.addText([
     { text: "PROVEN", options: { fontSize: 13, bold: true, color: THEME.colors.accent1, breakLine: true, charSpacing: 1 } },
     { text: "Server fidelity at " + CTX.fidelity_pct + " of " + CTX.fidelity_total + " observations", options: { fontSize: 14, color: "FFFFFF", bullet: true, breakLine: true } },
-    { text: CTX.accuracy_band + " accuracy for about a dollar per 500 questions", options: { fontSize: 14, color: "FFFFFF", bullet: true, breakLine: true } },
-    { text: "Models abstain rather than fabricate — " + CTX.negative_rate + " on absent data", options: { fontSize: 14, color: "FFFFFF", bullet: true } },
+    { text: "Up to " + CTX.top_accuracy + " agreement with the registry, for about a dollar per 500 questions", options: { fontSize: 14, color: "FFFFFF", bullet: true, breakLine: true } },
+    { text: "Models report absence when the registry shows it — " + CTX.negative_rate, options: { fontSize: 14, color: "FFFFFF", bullet: true } },
   ], { x: 0.9, y: 4.95, w: 5.6, h: 2.1, isTextBox: true, margin: 0, valign: "top" });
 
   s.addText([
     { text: "NOT PROVEN", options: { fontSize: 13, bold: true, color: THEME.colors.accent3, breakLine: true, charSpacing: 1 } },
     { text: "Non-English registries and non-English users", options: { fontSize: 14, color: "FFFFFF", bullet: true, breakLine: true } },
     { text: "Multi-step analysis across flows or computed rates", options: { fontSize: 14, color: "FFFFFF", bullet: true, breakLine: true } },
+    { text: "Fabrication without tools, and real users' questions", options: { fontSize: 14, color: "FFFFFF", bullet: true, breakLine: true } },
     { text: "Durability — the cheapest competent model changed twice this year", options: { fontSize: 14, color: "FFFFFF", bullet: true } },
   ], { x: 6.9, y: 4.95, w: 5.5, h: 2.1, isTextBox: true, margin: 0, valign: "top" });
   s.addNotes(slideFor("close").notes);
