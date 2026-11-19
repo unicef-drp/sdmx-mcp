@@ -24,9 +24,12 @@ updates:
       - "docker"
     ignore:
       # Skip pre-release Python base-image tags (rc, alpha, beta).
-      # Remove or narrow once Python 3.15 is GA.
       - dependency-name: "python"
         versions: ["*rc*", "*alpha*", "*beta*"]
+      # Patch releases only. A new Python minor version is an upgrade to make
+      # deliberately, once every compiled dependency ships wheels for it.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
